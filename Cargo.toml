@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "ros2-msgs/*",
+    "crates/*",
+]
+resolver = "3"
+exclude = ["vendor/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["agentoflyra"]
+description = "fastlio example for rust"
+
+[workspace.dependencies]
+anyhow = "1.0.103"
+camino = "1.2.3"
+nalgebra = { version = "0.35.0", features = ["sparse"] }

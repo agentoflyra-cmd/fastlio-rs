@@ -1,0 +1,9 @@
+[package]
+name = "fastlio-imu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+camino = { workspace = true }
+fastlio-types = { path = "../fastlio-types" }
+nalgebra = { workspace = true }
