@@ -1,0 +1,9 @@
+[package]
+name = "fastlio-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+approx = "0.5.1"
+nalgebra = { workspace = true }
+
