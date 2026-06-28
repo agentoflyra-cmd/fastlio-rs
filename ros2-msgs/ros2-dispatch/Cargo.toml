@@ -1,0 +1,12 @@
+[package]
+name = "ros2-dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cdr-runtime = { path = "../cdr-runtime" }
+builtin_interfaces = { path = "../builtin_interfaces" }
+geometry_msgs = { path = "../geometry_msgs" }
+livox_ros_driver2 = { path = "../livox_ros_driver2" }
+sensor_msgs = { path = "../sensor_msgs" }
+std_msgs = { path = "../std_msgs" }
