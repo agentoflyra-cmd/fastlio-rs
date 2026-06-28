@@ -1,0 +1,15 @@
+[package]
+name = "fastlio-dataset"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+camino = { workspace = true }
+mcap = "0.25.0"
+memmap2 = "0.9.11"
+fastlio-types = { path = "../fastlio-types" }
+# ros2-msgs = { path = "../../ros2-msgs" }
+livox_ros_driver2 = { path = "../../ros2-msgs/livox_ros_driver2" }
+sensor_msgs = { path = "../../ros2-msgs/sensor_msgs" }
+ros2-dispatch = { path = "../../ros2-msgs/ros2-dispatch" }
