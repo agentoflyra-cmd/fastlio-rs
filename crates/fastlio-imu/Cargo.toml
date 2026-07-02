@@ -7,3 +7,5 @@ edition.workspace = true
 camino = { workspace = true }
 fastlio-types = { path = "../fastlio-types" }
 nalgebra = { workspace = true }
+approx = { workspace = true }
+anyhow = { workspace = true }

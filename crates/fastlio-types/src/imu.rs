@@ -6,7 +6,7 @@ use crate::{Mat4, Vec3};
 ///
 /// Time is expressed in seconds. Angular velocity is in rad/s and acceleration
 /// is in m/s^2. Both vectors are expressed in the IMU frame.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ImuSample {
     // time_stamp: sec
     pub time_stamp_sec: f64,

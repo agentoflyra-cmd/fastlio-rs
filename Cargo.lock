@@ -199,6 +199,8 @@ version = "0.1.0"
 name = "fastlio-imu"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "approx",
  "camino",
  "fastlio-types",
  "nalgebra",
@@ -215,6 +217,10 @@ version = "0.1.0"
 [[package]]
 name = "fastlio-pipeline"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fastlio-types",
+]
 
 [[package]]
 name = "fastlio-pointcloud"

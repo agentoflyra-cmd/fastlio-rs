@@ -4,6 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-approx = "0.5.1"
+approx = { workspace = true }
 nalgebra = { workspace = true }
 
