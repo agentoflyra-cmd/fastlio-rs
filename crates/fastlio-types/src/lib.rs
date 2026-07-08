@@ -8,10 +8,101 @@ pub type Vec4<T> = nalgebra::Vector4<T>;
 pub type Mat3<T> = nalgebra::Matrix3<T>;
 pub type Mat4<T> = nalgebra::Matrix4<T>;
 
+use anyhow::Result;
 pub use ekfstate::*;
 pub use imu::*;
 pub use point_cloud::*;
+use serde::de::Error;
+use serde::{Deserialize, Deserializer};
+use std::fs;
+use std::path::Path;
 pub use time_stamp::*;
+
+fn deserialize_vec3<'de, D, T>(deserializer: D) -> Result<Vec3<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + nalgebra::Scalar,
+{
+    let [x, y, z] = <[T; 3]>::deserialize(deserializer)?;
+    Ok(Vec3::new(x, y, z))
+}
+
+fn deserialize_mat3<'de, D, T>(deserializer: D) -> Result<Mat3<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + nalgebra::Scalar,
+{
+    let values = <[T; 9]>::deserialize(deserializer)?;
+    Ok(Mat3::from_row_slice(&values))
+}
+
+#[derive(Deserialize)]
+pub struct CommonConfig {
+    pub lid_topic: String,
+    pub imu_topic: String,
+    pub time_sync_en: Option<bool>,
+    pub time_offset_lidar_to_imu: Option<f64>,
+}
+
+pub enum LidarType {
+    Avia,
+    Velodyne,
+    Ouster,
+    Mid360,
+}
+
+impl<'de> Deserialize<'de> for LidarType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+
+        match value {
+            1 => Ok(Self::Avia),
+            2 => Ok(Self::Velodyne),
+            3 => Ok(Self::Ouster),
+            4 => Ok(Self::Mid360),
+            _ => Err(D::Error::custom(format!("unsupported lidar type: {value}"))),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PreprocessConfig {
+    pub lidar_type: LidarType,
+    pub scan_line: Option<u8>,
+    #[serde(rename = "blind")]
+    pub blind_zone: f32,
+    pub voxel_size: Option<f32>,
+    pub max_range: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct MappingConfig {
+    pub acc_cov: f64,
+    pub gyr_cov: f64,
+    pub b_acc_cov: f64,
+    pub b_gyr_cov: f64,
+    pub extrinsic_est_en: bool,
+    #[serde(deserialize_with = "deserialize_vec3", rename = "extrinsic_T")]
+    pub extrinsic_t: Vec3<f64>,
+    #[serde(deserialize_with = "deserialize_mat3", rename = "extrinsic_R")]
+    pub extrinsic_r: Mat3<f64>,
+}
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub common: CommonConfig,
+    pub preprocess: PreprocessConfig,
+    pub mapping: MappingConfig,
+}
+
+pub fn read_from_config_path<P: AsRef<Path>>(path: P) -> Result<Config> {
+    let text = fs::read_to_string(path)?;
+    let config = serde_yaml::from_str(&text)?;
+    Ok(config)
+}
 
 #[cfg(test)]
 mod test {

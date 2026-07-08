@@ -16,8 +16,20 @@ pub struct PointXYZI {
 pub type PointCloud = Vec<PointXYZI>;
 
 impl PointXYZI {
+    pub fn to_voxel_key(&self, voxel_size: f32) -> [i32; 3] {
+        [
+            (self.x / voxel_size).floor() as i32,
+            (self.y / voxel_size).floor() as i32,
+            (self.z / voxel_size).floor() as i32,
+        ]
+    }
+
     pub fn to_vec3(&self) -> Vec3<f32> {
         Vec3::new(self.x, self.y, self.z)
+    }
+
+    pub fn to_vec3_f64(&self) -> Vec3<f64> {
+        Vec3::new(self.x as f64, self.y as f64, self.z as f64)
     }
 
     #[inline]
@@ -64,6 +76,10 @@ impl PointXYZI {
         self.z = self.z.clamp(min, max);
         self.intensity = self.intensity.clamp(0.0, f32::MAX);
     }
+
+    pub fn squared_distance(&self) -> f32 {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
 }
 
 /// LiDAR point with scan-relative acquisition time.
@@ -72,6 +88,21 @@ pub struct TimedPoint {
     /// expected non-negative
     pub offset_time_sec: f64,
     pub point: PointXYZI,
+    pub tag: u8,
+    pub line: u8,
+}
+
+impl TimedPoint {
+    pub fn add(&mut self, rhs: &Self) {
+        self.point.x += rhs.point.x;
+        self.point.y += rhs.point.y;
+        self.point.z += rhs.point.z;
+        self.point.intensity += rhs.point.intensity;
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.point.is_valid() && self.offset_time_sec.is_finite()
+    }
 }
 
 /// One LiDAR scan with owned points.
@@ -83,8 +114,22 @@ pub struct TimedPoint {
 pub struct LidarFrame {
     /// Scan start time in seconds, using the dataset time base
     pub base_timestamp_sec: f64,
-    /// Scan end time in seconds, using the dataset time base
-    pub end_timestamp_sec: f64,
+    /// Scan end time in seconds, using the dataset time end
+    end_timestamp_sec: f64,
     /// Owned points in this scan.
     pub points: Vec<TimedPoint>,
+}
+
+impl LidarFrame {
+    pub fn new(base_timestamp_sec: f64, end_timestamp_sec: f64, points: Vec<TimedPoint>) -> Self {
+        Self {
+            base_timestamp_sec,
+            end_timestamp_sec,
+            points,
+        }
+    }
+
+    pub fn end_timestamp_sec(&self) -> f64 {
+        self.end_timestamp_sec
+    }
 }

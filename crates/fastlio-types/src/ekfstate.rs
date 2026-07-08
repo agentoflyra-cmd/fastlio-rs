@@ -25,8 +25,6 @@ pub struct NavState {
 }
 
 pub struct MeasureGroup {
-    pub lidar_beg_time: f64,
-    pub lidar_end_time: f64,
     pub imu: Vec<ImuSample>,
     pub lidar: LidarFrame,
 }

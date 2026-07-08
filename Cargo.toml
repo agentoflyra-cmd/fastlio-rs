@@ -17,3 +17,5 @@ anyhow = "1.0.103"
 camino = "1.2.3"
 nalgebra = { version = "0.35.0", features = ["sparse"] }
 approx = "0.5.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"

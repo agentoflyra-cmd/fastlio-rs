@@ -5,5 +5,7 @@ edition.workspace = true
 
 [dependencies]
 approx = { workspace = true }
+anyhow = { workspace = true }
 nalgebra = { workspace = true }
-
+serde = { workspace = true }
+serde_yaml = { workspace = true }

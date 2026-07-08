@@ -38,14 +38,16 @@ impl SensorEvent {
                                 z: e.z,
                                 intensity: f32::from(e.reflectivity),
                             },
+                            tag: e.tag,
+                            line: e.line,
                         }
                     })
                     .collect();
-                let msg = LidarFrame {
-                    base_timestamp_sec: custom_msg.timebase as f64 / 1e9,
-                    end_timestamp_sec: custom_msg.timebase as f64 / 1e9 + max_offset as f64 / 1e9,
+                let msg = LidarFrame::new(
+                    custom_msg.timebase as f64 / 1e9,
+                    custom_msg.timebase as f64 / 1e9 + max_offset as f64 / 1e9,
                     points,
-                };
+                );
                 Ok(Self::Lidar(msg))
             }
             ros2_dispatch::DecodedMessageBorrowed::SensorMsgsImu(imu) => {
