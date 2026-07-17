@@ -1,5 +1,6 @@
-use fastlio_types::{PointXYZI, Vec3};
+use fastlio_types::{Mat3, PointXYZI, Vec3};
 use kiddo::{KdTree, NearestNeighbour, SquaredEuclidean};
+use std::cmp::Ordering;
 
 /// Local scan-to-map storage with owned world-frame points and a k-d tree index.
 ///
@@ -17,6 +18,45 @@ pub struct LocalMap {
 pub struct NearestPoint {
     pub index: usize,
     pub squared_distance: f64,
+}
+
+/// Tunable checks for local plane fitting.
+#[derive(Debug, Clone, Copy)]
+pub struct PlaneFitConfig {
+    pub min_points: usize,
+    pub min_spread_eigenvalue: f64,
+    pub max_planarity_ratio: f64,
+}
+
+impl Default for PlaneFitConfig {
+    fn default() -> Self {
+        Self {
+            min_points: 3,
+            min_spread_eigenvalue: 1.0e-9,
+            max_planarity_ratio: 0.1,
+        }
+    }
+}
+
+/// Plane fitted to a local map neighbourhood.
+///
+/// The plane is represented in the world/map frame as:
+/// `normal_w.dot(point_w) + offset = 0`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaneFit {
+    pub centroid_w: Vec3<f64>,
+    pub normal_w: Vec3<f64>,
+    pub offset: f64,
+    pub eigenvalues: Vec3<f64>,
+    pub planarity_ratio: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaneFitError {
+    NotEnoughPoints { actual: usize, required: usize },
+    NonFinitePoint { index: usize },
+    DegenerateNeighbourhood,
+    NotPlanar,
 }
 
 impl LocalMap {
@@ -74,6 +114,20 @@ impl LocalMap {
         self.rebuild_index();
     }
 
+    pub fn fit_plane_from_nearest(
+        &self,
+        query_w: Vec3<f64>,
+        count: usize,
+        config: PlaneFitConfig,
+    ) -> Result<PlaneFit, PlaneFitError> {
+        let neighbours = self.nearest_n(query_w, count);
+        let points: Vec<_> = neighbours
+            .iter()
+            .map(|neighbour| &self.points[neighbour.index])
+            .collect();
+        fit_plane(points.as_slice(), config)
+    }
+
     fn rebuild_index(&mut self) {
         self.index = build_index(&self.points);
     }
@@ -105,6 +159,73 @@ fn squared_distance(point: &PointXYZI, query_w: &Vec3<f64>) -> f64 {
     let dy = point.y as f64 - query_w.y;
     let dz = point.z as f64 - query_w.z;
     dx * dx + dy * dy + dz * dz
+}
+
+pub fn fit_plane(points: &[&PointXYZI], config: PlaneFitConfig) -> Result<PlaneFit, PlaneFitError> {
+    let required = config.min_points.max(3);
+    if points.len() < required {
+        return Err(PlaneFitError::NotEnoughPoints {
+            actual: points.len(),
+            required,
+        });
+    }
+
+    let mut centroid_w = Vec3::zeros();
+    for (idx, point) in points.iter().enumerate() {
+        if !point.is_valid() {
+            return Err(PlaneFitError::NonFinitePoint { index: idx });
+        }
+        centroid_w += point.to_vec3_f64();
+    }
+    centroid_w /= points.len() as f64;
+
+    let mut covariance = Mat3::<f64>::zeros();
+    for point in points {
+        let delta = point.to_vec3_f64() - centroid_w;
+        covariance += delta * delta.transpose();
+    }
+    covariance /= points.len() as f64;
+
+    let eigen = covariance.symmetric_eigen();
+    let mut eigen_pairs = [
+        (
+            eigen.eigenvalues[0],
+            eigen.eigenvectors.column(0).into_owned(),
+        ),
+        (
+            eigen.eigenvalues[1],
+            eigen.eigenvectors.column(1).into_owned(),
+        ),
+        (
+            eigen.eigenvalues[2],
+            eigen.eigenvectors.column(2).into_owned(),
+        ),
+    ];
+    eigen_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+
+    let smallest = eigen_pairs[0].0.max(0.0);
+    let middle = eigen_pairs[1].0.max(0.0);
+    let largest = eigen_pairs[2].0.max(0.0);
+
+    if middle <= config.min_spread_eigenvalue || largest <= config.min_spread_eigenvalue {
+        return Err(PlaneFitError::DegenerateNeighbourhood);
+    }
+
+    let planarity_ratio = smallest / middle;
+    if planarity_ratio > config.max_planarity_ratio {
+        return Err(PlaneFitError::NotPlanar);
+    }
+
+    let normal_w = eigen_pairs[0].1.normalize();
+    let offset = -normal_w.dot(&centroid_w);
+
+    Ok(PlaneFit {
+        centroid_w,
+        normal_w,
+        offset,
+        eigenvalues: Vec3::new(smallest, middle, largest),
+        planarity_ratio,
+    })
 }
 
 #[cfg(test)]
@@ -191,5 +312,107 @@ mod tests {
 
         assert!(map.is_empty());
         assert!(map.nearest_n(Vec3::zeros(), 1).is_empty());
+    }
+
+    #[test]
+    fn fit_plane_accepts_perfect_horizontal_plane() {
+        let points = [
+            point(-1.0, -1.0, 2.0),
+            point(1.0, -1.0, 2.0),
+            point(-1.0, 1.0, 2.0),
+            point(1.0, 1.0, 2.0),
+            point(0.0, 0.0, 2.0),
+        ];
+        let refs: Vec<_> = points.iter().collect();
+
+        let plane = fit_plane(&refs, PlaneFitConfig::default()).unwrap();
+
+        assert!(plane.normal_w.z.abs() > 1.0 - 1.0e-9);
+        assert!((plane.offset.abs() - 2.0).abs() < 1.0e-9);
+        assert!(plane.planarity_ratio < 1.0e-9);
+        for point in &points {
+            let residual = plane.normal_w.dot(&point.to_vec3_f64()) + plane.offset;
+            assert!(residual.abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn fit_plane_rejects_not_enough_points() {
+        let points = [point(0.0, 0.0, 0.0), point(1.0, 0.0, 0.0)];
+        let refs: Vec<_> = points.iter().collect();
+
+        let err = fit_plane(&refs, PlaneFitConfig::default()).unwrap_err();
+
+        assert_eq!(
+            err,
+            PlaneFitError::NotEnoughPoints {
+                actual: 2,
+                required: 3
+            }
+        );
+    }
+
+    #[test]
+    fn fit_plane_rejects_collinear_points() {
+        let points = [
+            point(0.0, 0.0, 0.0),
+            point(1.0, 0.0, 0.0),
+            point(2.0, 0.0, 0.0),
+            point(3.0, 0.0, 0.0),
+        ];
+        let refs: Vec<_> = points.iter().collect();
+
+        let err = fit_plane(&refs, PlaneFitConfig::default()).unwrap_err();
+
+        assert_eq!(err, PlaneFitError::DegenerateNeighbourhood);
+    }
+
+    #[test]
+    fn fit_plane_rejects_non_finite_point() {
+        let points = [
+            point(0.0, 0.0, 0.0),
+            point(1.0, 0.0, 0.0),
+            point(f32::NAN, 1.0, 0.0),
+        ];
+        let refs: Vec<_> = points.iter().collect();
+
+        let err = fit_plane(&refs, PlaneFitConfig::default()).unwrap_err();
+
+        assert_eq!(err, PlaneFitError::NonFinitePoint { index: 2 });
+    }
+
+    #[test]
+    fn fit_plane_rejects_non_planar_neighbourhood() {
+        let points = [
+            point(1.0, 0.0, 0.0),
+            point(-1.0, 0.0, 0.0),
+            point(0.0, 1.0, 0.0),
+            point(0.0, -1.0, 0.0),
+            point(0.0, 0.0, 1.0),
+            point(0.0, 0.0, -1.0),
+        ];
+        let refs: Vec<_> = points.iter().collect();
+
+        let err = fit_plane(&refs, PlaneFitConfig::default()).unwrap_err();
+
+        assert_eq!(err, PlaneFitError::NotPlanar);
+    }
+
+    #[test]
+    fn fit_plane_from_nearest_uses_local_map_neighbourhood() {
+        let map = LocalMap::from_points(vec![
+            point(0.0, 0.0, 1.0),
+            point(1.0, 0.0, 1.0),
+            point(0.0, 1.0, 1.0),
+            point(1.0, 1.0, 1.0),
+            point(100.0, 100.0, 100.0),
+        ]);
+
+        let plane = map
+            .fit_plane_from_nearest(Vec3::new(0.5, 0.5, 1.0), 4, PlaneFitConfig::default())
+            .unwrap();
+
+        assert!(plane.normal_w.z.abs() > 1.0 - 1.0e-9);
+        assert!((plane.offset.abs() - 1.0).abs() < 1.0e-9);
     }
 }
