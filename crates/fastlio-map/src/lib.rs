@@ -59,6 +59,54 @@ pub enum PlaneFitError {
     NotPlanar,
 }
 
+/// Configuration for scan-to-map point-to-plane observation construction.
+#[derive(Debug, Clone, Copy)]
+pub struct PointToPlaneConfig {
+    pub nearest_count: usize,
+    pub max_neighbour_distance: f64,
+    pub max_absolute_residual: f64,
+    pub plane: PlaneFitConfig,
+}
+
+impl Default for PointToPlaneConfig {
+    fn default() -> Self {
+        Self {
+            nearest_count: 5,
+            max_neighbour_distance: 1.0,
+            max_absolute_residual: 0.2,
+            plane: PlaneFitConfig::default(),
+        }
+    }
+}
+
+/// One accepted point-to-plane observation in the world/map frame.
+///
+/// Residual sign convention:
+/// `residual = plane.normal_w.dot(scan_point_w) + plane.offset`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointToPlaneObservation {
+    pub scan_point_w: Vec3<f64>,
+    pub plane: PlaneFit,
+    pub residual: f64,
+    pub weight: f64,
+    pub neighbour_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PointToPlaneError {
+    NonFiniteScanPoint,
+    InvalidConfig,
+    NeighbourTooFar {
+        squared_distance: f64,
+        max_squared_distance: f64,
+    },
+    PlaneFit(PlaneFitError),
+    ResidualTooLarge {
+        residual: f64,
+        max_absolute_residual: f64,
+    },
+}
+
 impl LocalMap {
     pub fn new() -> Self {
         Self::from_points(Vec::new())
@@ -126,6 +174,76 @@ impl LocalMap {
             .map(|neighbour| &self.points[neighbour.index])
             .collect();
         fit_plane(points.as_slice(), config)
+    }
+
+    pub fn point_to_plane_observation(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+    ) -> Result<PointToPlaneObservation, PointToPlaneError> {
+        if !scan_point_w.x.is_finite() || !scan_point_w.y.is_finite() || !scan_point_w.z.is_finite()
+        {
+            return Err(PointToPlaneError::NonFiniteScanPoint);
+        }
+        if config.nearest_count == 0
+            || !config.max_neighbour_distance.is_finite()
+            || config.max_neighbour_distance < 0.0
+            || !config.max_absolute_residual.is_finite()
+            || config.max_absolute_residual < 0.0
+        {
+            return Err(PointToPlaneError::InvalidConfig);
+        }
+
+        let neighbours = self.nearest_n(scan_point_w, config.nearest_count);
+        if neighbours.len() < config.plane.min_points.max(3) {
+            return Err(PointToPlaneError::PlaneFit(
+                PlaneFitError::NotEnoughPoints {
+                    actual: neighbours.len(),
+                    required: config.plane.min_points.max(3),
+                },
+            ));
+        }
+
+        let max_squared_distance = config.max_neighbour_distance * config.max_neighbour_distance;
+        let farthest_squared_distance = neighbours
+            .last()
+            .map(|neighbour| neighbour.squared_distance)
+            .unwrap_or(f64::INFINITY);
+        if farthest_squared_distance > max_squared_distance {
+            return Err(PointToPlaneError::NeighbourTooFar {
+                squared_distance: farthest_squared_distance,
+                max_squared_distance,
+            });
+        }
+
+        let plane_points: Vec<_> = neighbours
+            .iter()
+            .map(|neighbour| &self.points[neighbour.index])
+            .collect();
+        let plane = fit_plane(plane_points.as_slice(), config.plane)
+            .map_err(PointToPlaneError::PlaneFit)?;
+        let residual = plane.normal_w.dot(&scan_point_w) + plane.offset;
+
+        if residual.abs() > config.max_absolute_residual {
+            return Err(PointToPlaneError::ResidualTooLarge {
+                residual,
+                max_absolute_residual: config.max_absolute_residual,
+            });
+        }
+
+        let weight = point_to_plane_weight(residual, plane.planarity_ratio, &config);
+        let neighbour_indices = neighbours
+            .into_iter()
+            .map(|neighbour| neighbour.index)
+            .collect();
+
+        Ok(PointToPlaneObservation {
+            scan_point_w,
+            plane,
+            residual,
+            weight,
+            neighbour_indices,
+        })
     }
 
     fn rebuild_index(&mut self) {
@@ -226,6 +344,21 @@ pub fn fit_plane(points: &[&PointXYZI], config: PlaneFitConfig) -> Result<PlaneF
         eigenvalues: Vec3::new(smallest, middle, largest),
         planarity_ratio,
     })
+}
+
+fn point_to_plane_weight(residual: f64, planarity_ratio: f64, config: &PointToPlaneConfig) -> f64 {
+    let residual_score = if config.max_absolute_residual <= 0.0 {
+        1.0
+    } else {
+        1.0 - residual.abs() / config.max_absolute_residual
+    };
+    let planarity_score = if config.plane.max_planarity_ratio <= 0.0 {
+        1.0
+    } else {
+        1.0 - planarity_ratio / config.plane.max_planarity_ratio
+    };
+
+    residual_score.clamp(0.0, 1.0) * planarity_score.clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -414,5 +547,119 @@ mod tests {
 
         assert!(plane.normal_w.z.abs() > 1.0 - 1.0e-9);
         assert!((plane.offset.abs() - 1.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn point_to_plane_observation_accepts_point_near_plane() {
+        let map = LocalMap::from_points(vec![
+            point(-1.0, -1.0, 2.0),
+            point(1.0, -1.0, 2.0),
+            point(-1.0, 1.0, 2.0),
+            point(1.0, 1.0, 2.0),
+            point(0.0, 0.0, 2.0),
+        ]);
+        let config = PointToPlaneConfig {
+            nearest_count: 5,
+            max_neighbour_distance: 3.0,
+            max_absolute_residual: 0.2,
+            plane: PlaneFitConfig::default(),
+        };
+
+        let observation = map
+            .point_to_plane_observation(Vec3::new(0.25, -0.25, 2.05), config)
+            .unwrap();
+
+        assert_eq!(observation.neighbour_indices.len(), 5);
+        assert!((observation.residual.abs() - 0.05).abs() < 1.0e-6);
+        assert!(observation.weight > 0.0);
+        assert!(observation.weight <= 1.0);
+    }
+
+    #[test]
+    fn point_to_plane_observation_rejects_large_residual() {
+        let map = LocalMap::from_points(vec![
+            point(-1.0, -1.0, 0.0),
+            point(1.0, -1.0, 0.0),
+            point(-1.0, 1.0, 0.0),
+            point(1.0, 1.0, 0.0),
+            point(0.0, 0.0, 0.0),
+        ]);
+        let config = PointToPlaneConfig {
+            max_neighbour_distance: 3.0,
+            max_absolute_residual: 0.1,
+            ..PointToPlaneConfig::default()
+        };
+
+        let err = map
+            .point_to_plane_observation(Vec3::new(0.0, 0.0, 0.5), config)
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            PointToPlaneError::ResidualTooLarge {
+                max_absolute_residual: 0.1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn point_to_plane_observation_rejects_far_neighbourhood() {
+        let map = LocalMap::from_points(vec![
+            point(10.0, 10.0, 0.0),
+            point(11.0, 10.0, 0.0),
+            point(10.0, 11.0, 0.0),
+            point(11.0, 11.0, 0.0),
+            point(10.5, 10.5, 0.0),
+        ]);
+        let config = PointToPlaneConfig {
+            max_neighbour_distance: 1.0,
+            max_absolute_residual: 1.0,
+            ..PointToPlaneConfig::default()
+        };
+
+        let err = map
+            .point_to_plane_observation(Vec3::zeros(), config)
+            .unwrap_err();
+
+        assert!(matches!(err, PointToPlaneError::NeighbourTooFar { .. }));
+    }
+
+    #[test]
+    fn point_to_plane_observation_propagates_plane_degeneracy() {
+        let map = LocalMap::from_points(vec![
+            point(0.0, 0.0, 0.0),
+            point(1.0, 0.0, 0.0),
+            point(2.0, 0.0, 0.0),
+            point(3.0, 0.0, 0.0),
+            point(4.0, 0.0, 0.0),
+        ]);
+        let config = PointToPlaneConfig {
+            max_neighbour_distance: 10.0,
+            max_absolute_residual: 1.0,
+            ..PointToPlaneConfig::default()
+        };
+
+        let err = map
+            .point_to_plane_observation(Vec3::new(0.5, 0.0, 0.0), config)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            PointToPlaneError::PlaneFit(PlaneFitError::DegenerateNeighbourhood)
+        );
+    }
+
+    #[test]
+    fn point_to_plane_observation_rejects_non_finite_scan_point() {
+        let map = LocalMap::new();
+        let err = map
+            .point_to_plane_observation(
+                Vec3::new(f64::NAN, 0.0, 0.0),
+                PointToPlaneConfig::default(),
+            )
+            .unwrap_err();
+
+        assert_eq!(err, PointToPlaneError::NonFiniteScanPoint);
     }
 }
