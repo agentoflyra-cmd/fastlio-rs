@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -28,6 +29,7 @@ fn main() -> Result<()> {
     let config = read_from_config_path(&args.config_path)
         .with_context(|| format!("failed to read config `{}`", args.config_path))?;
     let mut replay = OfflineReplay::new(config)?;
+    replay.live_stream = start_live_viewer(&args.viewer)?;
     let stats = run_spsc_replay(&args, &mut replay)
         .with_context(|| format!("failed to replay MCAP `{}`", args.bag_path))?;
 
@@ -66,7 +68,7 @@ impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--open-playground|--playground <path>]",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
@@ -110,7 +112,13 @@ impl ReplayArgs {
 
 enum ReplayViewer {
     None,
-    Playground { executable: Utf8PathBuf },
+    OpenAfter {
+        executable: Utf8PathBuf,
+    },
+    LivePlayground {
+        executable: Utf8PathBuf,
+        listen_addr: String,
+    },
 }
 
 impl ReplayViewer {
@@ -124,18 +132,54 @@ impl ReplayViewer {
                     idx += 1;
                 }
                 "--open-playground" => {
-                    viewer = ReplayViewer::Playground {
+                    viewer = ReplayViewer::OpenAfter {
                         executable: default_playground_executable(),
                     };
                     idx += 1;
+                }
+                "--live-playground" => {
+                    viewer = ReplayViewer::LivePlayground {
+                        executable: default_playground_executable(),
+                        listen_addr: default_live_addr(),
+                    };
+                    idx += 1;
+                }
+                "--live-addr" => {
+                    let Some(addr) = args.get(idx + 1) else {
+                        bail!("--live-addr requires an address");
+                    };
+                    match &mut viewer {
+                        ReplayViewer::LivePlayground { listen_addr, .. } => {
+                            *listen_addr = addr.clone();
+                        }
+                        _ => {
+                            viewer = ReplayViewer::LivePlayground {
+                                executable: default_playground_executable(),
+                                listen_addr: addr.clone(),
+                            };
+                        }
+                    }
+                    idx += 2;
                 }
                 "--playground" => {
                     let Some(path) = args.get(idx + 1) else {
                         bail!("--playground requires an executable path");
                     };
-                    viewer = ReplayViewer::Playground {
-                        executable: Utf8PathBuf::from(path),
-                    };
+                    let executable = Utf8PathBuf::from(path);
+                    match &mut viewer {
+                        ReplayViewer::LivePlayground {
+                            executable: current,
+                            ..
+                        }
+                        | ReplayViewer::OpenAfter {
+                            executable: current,
+                        } => {
+                            *current = executable;
+                        }
+                        ReplayViewer::None => {
+                            viewer = ReplayViewer::OpenAfter { executable };
+                        }
+                    }
                     idx += 2;
                 }
                 other => bail!("unknown replay option `{other}`"),
@@ -146,18 +190,22 @@ impl ReplayViewer {
 }
 
 fn default_playground_executable() -> Utf8PathBuf {
-    let release = Utf8PathBuf::from("/home/lyra/playground/target/release/playground");
+    let release = Utf8PathBuf::from("target/release/fastlio-playground");
     if release.exists() {
         release
     } else {
-        Utf8PathBuf::from("/home/lyra/playground/target/debug/playground")
+        Utf8PathBuf::from("target/debug/fastlio-playground")
     }
+}
+
+fn default_live_addr() -> String {
+    "127.0.0.1:9876".to_string()
 }
 
 fn open_viewer(viewer: &ReplayViewer, map_path: &Utf8Path) -> Result<()> {
     match viewer {
         ReplayViewer::None => Ok(()),
-        ReplayViewer::Playground { executable } => {
+        ReplayViewer::OpenAfter { executable } => {
             if !Path::new(executable.as_str()).exists() {
                 bail!(
                     "playground executable `{}` does not exist; build it first or pass --playground <path>",
@@ -170,6 +218,85 @@ fn open_viewer(viewer: &ReplayViewer, map_path: &Utf8Path) -> Result<()> {
                 .with_context(|| format!("failed to launch playground viewer `{executable}`"))?;
             Ok(())
         }
+        ReplayViewer::LivePlayground { .. } => Ok(()),
+    }
+}
+
+fn start_live_viewer(viewer: &ReplayViewer) -> Result<Option<LivePointStream>> {
+    let ReplayViewer::LivePlayground {
+        executable,
+        listen_addr,
+    } = viewer
+    else {
+        return Ok(None);
+    };
+    if !Path::new(executable.as_str()).exists() {
+        bail!(
+            "playground executable `{}` does not exist; build it first or pass --playground <path>",
+            executable
+        );
+    }
+    Command::new(executable.as_str())
+        .arg("--listen")
+        .arg(listen_addr)
+        .spawn()
+        .with_context(|| format!("failed to launch live playground viewer `{executable}`"))?;
+
+    let mut last_err = None;
+    for _ in 0..100 {
+        match TcpStream::connect(listen_addr) {
+            Ok(stream) => {
+                stream
+                    .set_nodelay(true)
+                    .context("failed to set TCP_NODELAY on live stream")?;
+                return Ok(Some(LivePointStream::new(stream)));
+            }
+            Err(err) => {
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "failed to connect to live playground at `{}`: {}",
+        listen_addr,
+        last_err
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown connection error".to_string())
+    ))
+}
+
+struct LivePointStream {
+    writer: BufWriter<TcpStream>,
+    sent_map_points: usize,
+}
+
+impl LivePointStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            writer: BufWriter::new(stream),
+            sent_map_points: 0,
+        }
+    }
+
+    fn send_map_delta(&mut self, points: &[PointXYZI]) -> Result<()> {
+        if points.len() < self.sent_map_points {
+            writeln!(self.writer, "clear")?;
+            self.sent_map_points = 0;
+        }
+
+        for point in &points[self.sent_map_points..] {
+            writeln!(
+                self.writer,
+                "point {:.6} {:.6} {:.6} {:.6}",
+                point.x, point.y, point.z, point.intensity
+            )?;
+        }
+        writeln!(self.writer, "flush")?;
+        self.writer.flush()?;
+        self.sent_map_points = points.len();
+        Ok(())
     }
 }
 
@@ -279,6 +406,7 @@ struct OfflineReplay {
     bootstrap_frames: usize,
     failed_groups: usize,
     max_pending_lidar: usize,
+    live_stream: Option<LivePointStream>,
     first_imu_time_sec: Option<f64>,
     last_imu_time_sec: Option<f64>,
     first_lidar_time_sec: Option<f64>,
@@ -339,6 +467,7 @@ impl OfflineReplay {
             bootstrap_frames: 0,
             failed_groups: 0,
             max_pending_lidar: 0,
+            live_stream: None,
             first_imu_time_sec: None,
             last_imu_time_sec: None,
             first_lidar_time_sec: None,
@@ -384,6 +513,12 @@ impl OfflineReplay {
                     PipelineMode::Tracking => self.tracking_frames += 1,
                 }
                 self.push_trajectory_row(timestamp_sec, report.mode, report.effective_observations);
+                if let Some(live_stream) = &mut self.live_stream
+                    && let Err(err) = live_stream.send_map_delta(self.pipeline.local_map.points())
+                {
+                    eprintln!("live viewer stream failed at {timestamp_sec:.6}: {err:#}");
+                    self.live_stream = None;
+                }
             }
             Err(err) => {
                 self.failed_groups += 1;
@@ -619,10 +754,33 @@ mod tests {
         let parsed = ReplayArgs::parse(args(&["--playground", "/tmp/viewer"])).unwrap();
 
         match parsed.viewer {
-            ReplayViewer::Playground { executable } => {
+            ReplayViewer::OpenAfter { executable } => {
                 assert_eq!(executable, Utf8PathBuf::from("/tmp/viewer"));
             }
-            ReplayViewer::None => panic!("expected playground viewer"),
+            _ => panic!("expected playground viewer"),
+        }
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_live_playground_viewer() {
+        let parsed = ReplayArgs::parse(args(&[
+            "--live-playground",
+            "--live-addr",
+            "127.0.0.1:9999",
+            "--playground",
+            "/tmp/live-viewer",
+        ]))
+        .unwrap();
+
+        match parsed.viewer {
+            ReplayViewer::LivePlayground {
+                executable,
+                listen_addr,
+            } => {
+                assert_eq!(executable, Utf8PathBuf::from("/tmp/live-viewer"));
+                assert_eq!(listen_addr, "127.0.0.1:9999");
+            }
+            _ => panic!("expected live playground viewer"),
         }
     }
 

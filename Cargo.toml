@@ -2,6 +2,7 @@
 members = [
     "ros2-msgs/*",
     "crates/*",
+    "app/playground",
     "app/replay",
 ]
 resolver = "3"
