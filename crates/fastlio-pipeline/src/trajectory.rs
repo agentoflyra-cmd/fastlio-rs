@@ -1,6 +1,8 @@
 use fastlio_types::{Pose3, Vec3};
 use nalgebra::UnitQuaternion;
 
+const TIME_EPS_SEC: f64 = 5.0e-6;
+
 pub struct MotionSegment {
     /// Absolute timestamp sec of this interval's beginning.
     pub begin_time: f64,
@@ -47,7 +49,7 @@ impl MotionSegment {
     }
 
     pub fn contains(&self, time: f64) -> bool {
-        self.begin_time <= time && time <= self.end_time
+        self.begin_time <= time + TIME_EPS_SEC && time <= self.end_time + TIME_EPS_SEC
     }
 
     pub fn propagate_to(&self, time: f64) -> Pose3 {

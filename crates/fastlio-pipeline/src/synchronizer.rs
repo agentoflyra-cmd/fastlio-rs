@@ -2,6 +2,8 @@ use anyhow::Result;
 use fastlio_types::{ImuSample, LidarFrame, MeasureGroup};
 use std::collections::VecDeque;
 
+const TIME_EPS_SEC: f64 = 5.0e-6;
+
 #[derive(Default)]
 pub struct MeasurementSynchronizer {
     pub imu_queue: VecDeque<ImuSample>,
@@ -38,8 +40,8 @@ impl MeasurementSynchronizer {
         let Some(last) = self.imu_queue.back() else {
             return false;
         };
-        first.time_stamp_sec <= lidar.base_timestamp_sec
-            && last.time_stamp_sec >= lidar.end_timestamp_sec()
+        first.time_stamp_sec <= lidar.base_timestamp_sec + TIME_EPS_SEC
+            && last.time_stamp_sec + TIME_EPS_SEC >= lidar.end_timestamp_sec()
     }
 
     fn try_build_group(&mut self) -> Result<Option<MeasureGroup>> {
@@ -49,7 +51,7 @@ impl MeasurementSynchronizer {
             };
 
             if let Some(first_imu) = self.imu_queue.front()
-                && first_imu.time_stamp_sec > lidar.base_timestamp_sec
+                && first_imu.time_stamp_sec > lidar.base_timestamp_sec + TIME_EPS_SEC
             {
                 self.first_lidar_drop_without_begin_imu
                     .get_or_insert(LidarDropWithoutBeginImu {
@@ -74,13 +76,14 @@ impl MeasurementSynchronizer {
 
         let mut start_idx = 0;
         while start_idx + 1 < self.imu_queue.len()
-            && self.imu_queue[start_idx + 1].time_stamp_sec < lidar.base_timestamp_sec
+            && self.imu_queue[start_idx + 1].time_stamp_sec
+                < lidar.base_timestamp_sec - TIME_EPS_SEC
         {
             start_idx += 1;
         }
         let mut end_idx = 0;
         while end_idx < self.imu_queue.len()
-            && self.imu_queue[end_idx].time_stamp_sec < lidar.end_timestamp_sec()
+            && self.imu_queue[end_idx].time_stamp_sec < lidar.end_timestamp_sec() - TIME_EPS_SEC
         {
             end_idx += 1;
         }
@@ -93,12 +96,13 @@ impl MeasurementSynchronizer {
 
         let end_idx = end_idx - start_idx;
         let imu: Vec<ImuSample> = self.imu_queue.range(..=end_idx).cloned().collect();
-        let retain_idx =
-            if end_idx > 0 && self.imu_queue[end_idx].time_stamp_sec > lidar.end_timestamp_sec() {
-                end_idx - 1
-            } else {
-                end_idx
-            };
+        let retain_idx = if end_idx > 0
+            && self.imu_queue[end_idx].time_stamp_sec > lidar.end_timestamp_sec() + TIME_EPS_SEC
+        {
+            end_idx - 1
+        } else {
+            end_idx
+        };
         self.imu_queue.drain(..retain_idx);
         let measure_group = MeasureGroup { imu, lidar };
         Ok(Some(measure_group))
@@ -405,6 +409,18 @@ mod test {
         assert_eq!(sync.dropped_lidar_without_begin_imu, 0);
         assert!(group.imu.first().unwrap().time_stamp_sec <= 0.10);
         assert!(group.imu.last().unwrap().time_stamp_sec >= 0.20);
+    }
+
+    #[test]
+    fn microsecond_begin_gap_is_tolerated() {
+        let mut sync = MeasurementSynchronizer::new();
+        sync.pend_lidar(lidar(10.0, 10.1)).unwrap();
+        sync.pend_imu(imu(10.0 + 2.0e-6)).unwrap();
+        let group = sync.pend_imu(imu(10.1)).unwrap().unwrap();
+
+        assert_eq!(sync.dropped_lidar_without_begin_imu, 0);
+        assert_eq!(group.lidar.base_timestamp_sec, 10.0);
+        assert!(group.imu.first().unwrap().time_stamp_sec > group.lidar.base_timestamp_sec);
     }
 
     #[test]
