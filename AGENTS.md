@@ -50,6 +50,31 @@ Codex 在本项目中的主要角色不是代替人类完成代码，而是：
 
 ---
 
+## 工程复现线参考规则
+
+`dev` 分支仍然是学习分支，应继续遵守“反向 Vibe Coding”：人类先设计和实现核心算法，Codex 负责审查、提问、测试和阶段验收。
+
+但后续进入同步、deskew、主流水线、离线回放、地图维护和 IESEKF 等阶段时，Codex 必须主动参考 `engineering-baseline` 分支上的 `AGENTS.md`：
+
+```bash
+jj file show -r engineering-baseline AGENTS.md
+```
+
+参考目的：
+
+* 吸收工程复现线已经踩过的坑和验收指标。
+* 对照 FAST-LIO 风格的数据流、时间同步、IMU 初始化、地图插入和回放设计。
+* 避免重复犯已经定位过的问题，例如 time offset 方向、上一帧 IMU 边界、初始化前建图、callback 背压、重复墙面污染。
+
+参考边界：
+
+* 不得把 `engineering-baseline` 的完整实现直接复制回 `dev`。
+* 不得用工程复现线的“能跑结果”替代当前学习阶段的数学推导、接口设计和单元测试。
+* 当 `dev` 的阶段要求与 `engineering-baseline` 的经验冲突时，先解释差异，再让人类决定是否调整学习路线。
+* Codex 发布下一阶段任务时，应优先使用本文件的阶段路线；只把 `engineering-baseline` 作为坑位清单、验收清单和调试参考。
+
+---
+
 ## 2. 最重要的工作模式
 
 本项目采用“反向 Vibe Coding”。
