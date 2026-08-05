@@ -89,14 +89,17 @@ impl MeasurementSynchronizer {
             return Ok(None);
         }
 
-        // let imu: Vec<_> = self.imu_queue.range(start_idx..=end_idx).cloned().collect();
         self.imu_queue.drain(..start_idx);
 
         let end_idx = end_idx - start_idx;
-        let end_imu = self.imu_queue[end_idx].clone();
-        let mut imu: Vec<ImuSample> = self.imu_queue.drain(..end_idx).collect();
-
-        imu.push(end_imu);
+        let imu: Vec<ImuSample> = self.imu_queue.range(..=end_idx).cloned().collect();
+        let retain_idx =
+            if end_idx > 0 && self.imu_queue[end_idx].time_stamp_sec > lidar.end_timestamp_sec() {
+                end_idx - 1
+            } else {
+                end_idx
+            };
+        self.imu_queue.drain(..retain_idx);
         let measure_group = MeasureGroup { imu, lidar };
         Ok(Some(measure_group))
     }
@@ -385,6 +388,23 @@ mod test {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].lidar.base_timestamp_sec, 0.0);
         assert_eq!(groups[1].lidar.base_timestamp_sec, 1.0);
+    }
+
+    #[test]
+    fn adjacent_lidar_frames_keep_left_imu_boundary() {
+        let mut sync = MeasurementSynchronizer::new();
+        sync.pend_imu(imu(0.00)).unwrap();
+        sync.pend_imu(imu(0.05)).unwrap();
+        sync.pend_imu(imu(0.105)).unwrap();
+        sync.pend_lidar(lidar(0.00, 0.10)).unwrap().unwrap();
+
+        sync.pend_imu(imu(0.15)).unwrap();
+        sync.pend_imu(imu(0.205)).unwrap();
+        let group = sync.pend_lidar(lidar(0.10, 0.20)).unwrap().unwrap();
+
+        assert_eq!(sync.dropped_lidar_without_begin_imu, 0);
+        assert!(group.imu.first().unwrap().time_stamp_sec <= 0.10);
+        assert!(group.imu.last().unwrap().time_stamp_sec >= 0.20);
     }
 
     #[test]
