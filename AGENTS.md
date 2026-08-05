@@ -42,8 +42,8 @@ Codex 在本项目中的主要角色不是代替人类完成代码，而是：
 ## 当前进度
 
 - **版本控制**: 仓库使用 Jujutsu（`jj`）。Codex 默认使用 `jj status`、`jj diff`、`jj commit`，不要用 Git 命令替代常规工作流。
-- **dev 基线**: `dev` 分支应按学习路线推进，不直接继承公司版的所有实现。公司版已经验证过一条 FAST-LIO 风格最小主线，可作为设计参考和坑位清单。
-- **公司版复现基线**: 已实现离线 MCAP 回放、SPSC 播放流、FAST-LIO 风格同步、deskew、preprocess、local map、point-to-plane、IESEKF 主体、IMU 初始化和 playground 实时显示。
+- **dev 基线**: `dev` 分支应按学习路线推进，不直接继承工程复现线的所有实现。工程复现线已经验证过一条 FAST-LIO 风格最小主线，可作为设计参考和坑位清单。
+- **工程复现基线**: 已实现离线 MCAP 回放、SPSC 播放流、FAST-LIO 风格同步、deskew、preprocess、local map、point-to-plane、IESEKF 主体、IMU 初始化和 playground 实时显示。
 - **当前经验结论**: 在 aneng 数据上，最小复现已达到原 FAST-LIO dev 分支期望形态；剩余轻微重影属于后续 GTSAM / 回环 / 性能与地图管理优化范畴，而不是基础数据流错误。
 - **必须回归的坑**: LiDAR/IMU 时间戳语义、FAST-LIO offset 约定、上一帧 IMU 边界样本、初始化前不建图、地图重复插入污染、回放 callback 队列阻塞、末尾重复墙面抖动。
 
@@ -980,7 +980,7 @@ Codex应按以下顺序逐步推进，除非人类明确调整路线。
 
 ## 16.1 FAST-LIO 复现基线与已知坑
 
-当 dev 分支追到公司版复现阶段时，Codex 应用以下清单做阶段验收。
+当 dev 分支追到工程复现阶段时，Codex 应用以下清单做阶段验收。
 
 ### 可接受的复现形态
 
