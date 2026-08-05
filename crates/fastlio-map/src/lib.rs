@@ -102,6 +102,18 @@ pub struct PointToPlaneObservation {
     pub neighbour_indices: Vec<usize>,
 }
 
+/// Lightweight point-to-plane match for the scan-to-map hot path.
+///
+/// Unlike [`PointToPlaneObservation`], this omits debug-only neighbour indexes
+/// and the repeated scan point, so callers can build estimator factors without
+/// extra per-point allocations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointToPlaneMatch {
+    pub plane: PlaneFit,
+    pub residual: f64,
+    pub weight: f64,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PointToPlaneError {
     NonFiniteScanPoint,
@@ -212,11 +224,7 @@ impl LocalMap {
         config: PlaneFitConfig,
     ) -> Result<PlaneFit, PlaneFitError> {
         let neighbours = self.nearest_n(query_w, count);
-        let points: Vec<_> = neighbours
-            .iter()
-            .map(|neighbour| &self.points[neighbour.index])
-            .collect();
-        fit_plane(points.as_slice(), config)
+        self.fit_plane_from_neighbours(&neighbours, config)
     }
 
     pub fn point_to_plane_observation(
@@ -224,6 +232,36 @@ impl LocalMap {
         scan_point_w: Vec3<f64>,
         config: PointToPlaneConfig,
     ) -> Result<PointToPlaneObservation, PointToPlaneError> {
+        let (matched, neighbours) =
+            self.point_to_plane_match_with_neighbours(scan_point_w, config)?;
+        let neighbour_indices = neighbours
+            .into_iter()
+            .map(|neighbour| neighbour.index)
+            .collect();
+
+        Ok(PointToPlaneObservation {
+            scan_point_w,
+            plane: matched.plane,
+            residual: matched.residual,
+            weight: matched.weight,
+            neighbour_indices,
+        })
+    }
+
+    pub fn point_to_plane_match(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+    ) -> Result<PointToPlaneMatch, PointToPlaneError> {
+        self.point_to_plane_match_with_neighbours(scan_point_w, config)
+            .map(|(matched, _)| matched)
+    }
+
+    fn point_to_plane_match_with_neighbours(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+    ) -> Result<(PointToPlaneMatch, Vec<NearestPoint>), PointToPlaneError> {
         if !scan_point_w.x.is_finite() || !scan_point_w.y.is_finite() || !scan_point_w.z.is_finite()
         {
             return Err(PointToPlaneError::NonFiniteScanPoint);
@@ -259,11 +297,8 @@ impl LocalMap {
             });
         }
 
-        let plane_points: Vec<_> = neighbours
-            .iter()
-            .map(|neighbour| &self.points[neighbour.index])
-            .collect();
-        let plane = fit_plane(plane_points.as_slice(), config.plane)
+        let plane = self
+            .fit_plane_from_neighbours(&neighbours, config.plane)
             .map_err(PointToPlaneError::PlaneFit)?;
         let residual = plane.normal_w.dot(&scan_point_w) + plane.offset;
 
@@ -275,18 +310,15 @@ impl LocalMap {
         }
 
         let weight = point_to_plane_weight(residual, plane.planarity_ratio, &config);
-        let neighbour_indices = neighbours
-            .into_iter()
-            .map(|neighbour| neighbour.index)
-            .collect();
 
-        Ok(PointToPlaneObservation {
-            scan_point_w,
-            plane,
-            residual,
-            weight,
-            neighbour_indices,
-        })
+        Ok((
+            PointToPlaneMatch {
+                plane,
+                residual,
+                weight,
+            },
+            neighbours,
+        ))
     }
 
     fn rebuild_index(&mut self) {
@@ -347,6 +379,18 @@ impl LocalMap {
             return false;
         };
         filter.has_near_duplicate(&self.points, point, min_squared_distance)
+    }
+
+    fn fit_plane_from_neighbours(
+        &self,
+        neighbours: &[NearestPoint],
+        config: PlaneFitConfig,
+    ) -> Result<PlaneFit, PlaneFitError> {
+        fit_plane_from_indices(
+            &self.points,
+            neighbours.iter().map(|neighbour| neighbour.index),
+            config,
+        )
     }
 }
 
@@ -448,29 +492,50 @@ fn voxel_key(point: &PointXYZI, voxel_size: f64) -> [i32; 3] {
 }
 
 pub fn fit_plane(points: &[&PointXYZI], config: PlaneFitConfig) -> Result<PlaneFit, PlaneFitError> {
+    fit_plane_from_points(points.iter().copied(), points.len(), config)
+}
+
+fn fit_plane_from_indices(
+    map_points: &[PointXYZI],
+    point_indices: impl Iterator<Item = usize> + Clone,
+    config: PlaneFitConfig,
+) -> Result<PlaneFit, PlaneFitError> {
+    let count = point_indices.clone().count();
+    fit_plane_from_points(
+        point_indices.map(|point_index| &map_points[point_index]),
+        count,
+        config,
+    )
+}
+
+fn fit_plane_from_points<'a>(
+    points: impl Iterator<Item = &'a PointXYZI> + Clone,
+    point_count: usize,
+    config: PlaneFitConfig,
+) -> Result<PlaneFit, PlaneFitError> {
     let required = config.min_points.max(3);
-    if points.len() < required {
+    if point_count < required {
         return Err(PlaneFitError::NotEnoughPoints {
-            actual: points.len(),
+            actual: point_count,
             required,
         });
     }
 
     let mut centroid_w = Vec3::zeros();
-    for (idx, point) in points.iter().enumerate() {
+    for (idx, point) in points.clone().enumerate() {
         if !point.is_valid() {
             return Err(PlaneFitError::NonFinitePoint { index: idx });
         }
         centroid_w += point.to_vec3_f64();
     }
-    centroid_w /= points.len() as f64;
+    centroid_w /= point_count as f64;
 
     let mut covariance = Mat3::<f64>::zeros();
     for point in points {
         let delta = point.to_vec3_f64() - centroid_w;
         covariance += delta * delta.transpose();
     }
-    covariance /= points.len() as f64;
+    covariance /= point_count as f64;
 
     let eigen = covariance.symmetric_eigen();
     let mut eigen_pairs = [

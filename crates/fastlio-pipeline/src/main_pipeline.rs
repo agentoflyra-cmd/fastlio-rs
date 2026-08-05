@@ -373,12 +373,12 @@ fn build_iesekf_factors(
             let timed_point = timed_point.1;
             let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
             let point_w = filter.state.orientation * point_i + filter.state.position;
-            let observation = local_map.point_to_plane_observation(point_w, config).ok()?;
+            let matched = local_map.point_to_plane_match(point_w, config).ok()?;
 
             Some(IesekfPointToPlaneFactor {
                 point_i,
-                plane_w: observation.plane,
-                weight: observation.weight,
+                plane_w: matched.plane,
+                weight: matched.weight,
             })
         })
         .collect()
