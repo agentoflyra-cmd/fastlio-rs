@@ -4,3 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fastlio-types = { path = "../fastlio-types" }
+anyhow = { workspace = true }
+hashbrown = { workspace = true }
+smallvec = { workspace = true }
+slotmap = { workspace = true }
