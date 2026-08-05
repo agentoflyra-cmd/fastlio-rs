@@ -5,7 +5,7 @@ use crate::Vec3;
 /// Coordinates are expressed in the LiDAR frame unless stated otherwise.
 /// Coordinates are meters. Intensity is sensor-specific but must be finite and
 /// non-negative for valid points.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PointXYZI {
     pub x: f32,
     pub y: f32,
@@ -16,6 +16,13 @@ pub struct PointXYZI {
 pub type PointCloud = Vec<PointXYZI>;
 
 impl PointXYZI {
+    pub fn add(&mut self, rhs: &Self) {
+        self.x += rhs.x;
+        self.y += rhs.y;
+        self.z += rhs.z;
+        self.intensity += rhs.intensity;
+    }
+
     pub fn to_voxel_key(&self, voxel_size: f32) -> [i32; 3] {
         [
             (self.x / voxel_size).floor() as i32,

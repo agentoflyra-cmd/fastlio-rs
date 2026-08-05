@@ -69,6 +69,59 @@ impl<'de> Deserialize<'de> for LidarType {
 }
 
 #[derive(Deserialize)]
+#[serde(default)]
+pub struct SurfelMapConfig {
+    pub voxel_size: f32,
+    pub search_radius: i32,
+}
+
+impl Default for SurfelMapConfig {
+    fn default() -> Self {
+        Self {
+            voxel_size: 0.4,
+            search_radius: 2,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct SurfelConfig {
+    pub max_plane_distance: f32,
+    pub max_planarity_ratio: f32,
+    pub min_plane_spread_eigenvalue: f32,
+    #[serde(default = "default_covariance_eigenvalue_floor")]
+    pub covariance_eigenvalue_floor: f32,
+    pub min_linearity: f32,
+    pub min_line_spread_eigenvalue: f32,
+    pub min_scattering: f32,
+    pub min_mature_surfel_count: usize,
+    pub max_mahalanobis_distance: f32,
+    pub growing_radius: f32,
+}
+
+impl Default for SurfelConfig {
+    fn default() -> Self {
+        Self {
+            max_plane_distance: 0.08,
+            max_planarity_ratio: 0.10,
+            min_plane_spread_eigenvalue: 0.025,
+            covariance_eigenvalue_floor: default_covariance_eigenvalue_floor(),
+            min_linearity: 0.70,
+            min_line_spread_eigenvalue: 0.0025,
+            min_scattering: 0.60,
+            min_mature_surfel_count: 8,
+            max_mahalanobis_distance: 2.0,
+            growing_radius: 0.2,
+        }
+    }
+}
+
+fn default_covariance_eigenvalue_floor() -> f32 {
+    1e-6
+}
+
+#[derive(Deserialize)]
 pub struct PreprocessConfig {
     pub lidar_type: LidarType,
     pub scan_line: Option<u8>,
@@ -96,6 +149,10 @@ pub struct Config {
     pub common: CommonConfig,
     pub preprocess: PreprocessConfig,
     pub mapping: MappingConfig,
+    #[serde(default)]
+    pub surfel_config: Option<SurfelConfig>,
+    #[serde(default)]
+    pub surfel_map_config: Option<SurfelMapConfig>,
 }
 
 pub fn read_from_config_path<P: AsRef<Path>>(path: P) -> Result<Config> {

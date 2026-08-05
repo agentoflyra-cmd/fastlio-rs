@@ -22,7 +22,17 @@ mapping:
     extrinsic_R: [ 1, 0, 0,
                    0, 1, 0,
                    0, 0, 1]
+surfel_map_config:
+    voxel_size: 0.4
+    search_radius: 0
 
+surfel_config:
+    growing_radius: 0.8
+    min_mature_surfel_count: 16
+    max_planarity_ratio: 0.10
+    min_plane_spread_eigenvalue: 0.001
+    max_mahalanobis_distance: 2.0
+                   
 # publish:
     # path_en:  false
     # scan_publish_en:  true       # false: close all the point cloud output

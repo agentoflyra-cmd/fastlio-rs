@@ -76,7 +76,9 @@ impl SensorEvent {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadStats {
     pub total_messages: usize,
+    pub lidar_messages: usize,
     pub emitted_events: usize,
+    pub emitted_lidar_events: usize,
     pub skipped_missing_schema: usize,
     pub skipped_unsupported_schema: usize,
     pub skipped_unsupported_topic: usize,
@@ -111,6 +113,9 @@ where
         let message = message?;
         let current = message.log_time;
         stats.total_messages += 1;
+        if &message.channel.topic == "/livox/lidar" {
+            stats.lidar_messages += 1;
+        }
 
         if !is_supported_topic(&message.channel.topic) {
             stats.skipped_unsupported_topic += 1;
@@ -134,6 +139,10 @@ where
                     message.channel.topic, schema.name
                 )
             })?;
+        match &sensor_source {
+            SensorEvent::Lidar(_) => stats.emitted_lidar_events += 1,
+            SensorEvent::Imu(_) => (),
+        }
         if let Some(last_publish_timestamp) = stats.last_timestamp_sec
             && last_publish_timestamp > current
         {

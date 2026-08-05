@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 fastlio-types = { path = "../fastlio-types" }
+fastlio-map = { path = "../fastlio-map" }
