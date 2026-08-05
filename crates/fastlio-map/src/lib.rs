@@ -5,6 +5,7 @@ use kiddo::{
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
 
 type MapKdTree =
     KdTree<f64, u32, DonnellyCyclicSimdFull<4>, VecOfArrays<f64, u32, 3, 4096>, 3, 4096>;
@@ -125,6 +126,13 @@ pub struct PointToPlaneMatch {
     pub plane: PlaneFit,
     pub residual: f64,
     pub weight: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PointToPlaneMatchTimings {
+    pub nearest: Duration,
+    pub plane_fit: Duration,
+    pub residual: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -307,8 +315,23 @@ impl LocalMap {
         config: PointToPlaneConfig,
         scratch: &mut LocalMapQueryScratch,
     ) -> Result<PointToPlaneMatch, PointToPlaneError> {
-        self.point_to_plane_match_raw(scan_point_w, config, scratch)
+        self.point_to_plane_match_raw_attempt(scan_point_w, config, scratch)
+            .0
             .map(|(matched, _)| matched)
+    }
+
+    pub fn point_to_plane_match_attempt_with_scratch(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+        scratch: &mut LocalMapQueryScratch,
+    ) -> (
+        Result<PointToPlaneMatch, PointToPlaneError>,
+        PointToPlaneMatchTimings,
+    ) {
+        let (result, timings) =
+            self.point_to_plane_match_raw_attempt(scan_point_w, config, scratch);
+        (result.map(|(matched, _)| matched), timings)
     }
 
     fn point_to_plane_match_with_neighbours(
@@ -317,8 +340,9 @@ impl LocalMap {
         config: PointToPlaneConfig,
     ) -> Result<(PointToPlaneMatch, Vec<NearestPoint>), PointToPlaneError> {
         let mut scratch = self.create_query_scratch();
-        let (matched, neighbours) =
-            self.point_to_plane_match_raw(scan_point_w, config, &mut scratch)?;
+        let (matched, neighbours) = self
+            .point_to_plane_match_raw_attempt(scan_point_w, config, &mut scratch)
+            .0?;
         Ok((
             matched,
             neighbours
@@ -328,15 +352,19 @@ impl LocalMap {
         ))
     }
 
-    fn point_to_plane_match_raw(
+    fn point_to_plane_match_raw_attempt(
         &self,
         scan_point_w: Vec3<f64>,
         config: PointToPlaneConfig,
         scratch: &mut LocalMapQueryScratch,
-    ) -> Result<(PointToPlaneMatch, Vec<KiddoNearestPoint>), PointToPlaneError> {
+    ) -> (
+        Result<(PointToPlaneMatch, Vec<KiddoNearestPoint>), PointToPlaneError>,
+        PointToPlaneMatchTimings,
+    ) {
+        let mut timings = PointToPlaneMatchTimings::default();
         if !scan_point_w.x.is_finite() || !scan_point_w.y.is_finite() || !scan_point_w.z.is_finite()
         {
-            return Err(PointToPlaneError::NonFiniteScanPoint);
+            return (Err(PointToPlaneError::NonFiniteScanPoint), timings);
         }
         if config.nearest_count == 0
             || !config.max_neighbour_distance.is_finite()
@@ -344,18 +372,23 @@ impl LocalMap {
             || !config.max_absolute_residual.is_finite()
             || config.max_absolute_residual < 0.0
         {
-            return Err(PointToPlaneError::InvalidConfig);
+            return (Err(PointToPlaneError::InvalidConfig), timings);
         }
 
+        let nearest_start = Instant::now();
         let neighbours =
             self.nearest_n_raw_with_scratch(scan_point_w, config.nearest_count, scratch);
+        timings.nearest = nearest_start.elapsed();
         if neighbours.len() < config.plane.min_points.max(3) {
-            return Err(PointToPlaneError::PlaneFit(
-                PlaneFitError::NotEnoughPoints {
-                    actual: neighbours.len(),
-                    required: config.plane.min_points.max(3),
-                },
-            ));
+            return (
+                Err(PointToPlaneError::PlaneFit(
+                    PlaneFitError::NotEnoughPoints {
+                        actual: neighbours.len(),
+                        required: config.plane.min_points.max(3),
+                    },
+                )),
+                timings,
+            );
         }
 
         let max_squared_distance = config.max_neighbour_distance * config.max_neighbour_distance;
@@ -364,34 +397,52 @@ impl LocalMap {
             .map(|neighbour| neighbour.distance)
             .unwrap_or(f64::INFINITY);
         if farthest_squared_distance > max_squared_distance {
-            return Err(PointToPlaneError::NeighbourTooFar {
-                squared_distance: farthest_squared_distance,
-                max_squared_distance,
-            });
+            return (
+                Err(PointToPlaneError::NeighbourTooFar {
+                    squared_distance: farthest_squared_distance,
+                    max_squared_distance,
+                }),
+                timings,
+            );
         }
 
+        let plane_fit_start = Instant::now();
         let plane = self
             .fit_plane_from_kiddo_neighbours(&neighbours, config.plane)
-            .map_err(PointToPlaneError::PlaneFit)?;
+            .map_err(PointToPlaneError::PlaneFit);
+        timings.plane_fit = plane_fit_start.elapsed();
+        let Ok(plane) = plane else {
+            return (Err(plane.unwrap_err()), timings);
+        };
+
+        let residual_start = Instant::now();
         let residual = plane.normal_w.dot(&scan_point_w) + plane.offset;
 
         if residual.abs() > config.max_absolute_residual {
-            return Err(PointToPlaneError::ResidualTooLarge {
-                residual,
-                max_absolute_residual: config.max_absolute_residual,
-            });
+            timings.residual = residual_start.elapsed();
+            return (
+                Err(PointToPlaneError::ResidualTooLarge {
+                    residual,
+                    max_absolute_residual: config.max_absolute_residual,
+                }),
+                timings,
+            );
         }
 
         let weight = point_to_plane_weight(residual, plane.planarity_ratio, &config);
+        timings.residual = residual_start.elapsed();
 
-        Ok((
-            PointToPlaneMatch {
-                plane,
-                residual,
-                weight,
-            },
-            neighbours,
-        ))
+        (
+            Ok((
+                PointToPlaneMatch {
+                    plane,
+                    residual,
+                    weight,
+                },
+                neighbours,
+            )),
+            timings,
+        )
     }
 
     fn rebuild_index(&mut self) {

@@ -693,12 +693,12 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
     );
     writeln!(
         writer,
-        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,update_ms,map_insert_ms,map_crop_ms"
+        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,association_nearest_ms,association_plane_fit_ms,association_residual_ms,association_factor_build_ms,update_ms,map_insert_ms,map_crop_ms"
     )?;
     for row in latency {
         writeln!(
             writer,
-            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
             row.frame_index,
             row.timestamp_sec,
             row.mode,
@@ -714,6 +714,10 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
             duration_ms(row.pipeline.deskew),
             duration_ms(row.pipeline.preprocess),
             duration_ms(row.pipeline.association),
+            duration_ms(row.pipeline.association_nearest),
+            duration_ms(row.pipeline.association_plane_fit),
+            duration_ms(row.pipeline.association_residual),
+            duration_ms(row.pipeline.association_factor_build),
             duration_ms(row.pipeline.update),
             duration_ms(row.pipeline.map_insert),
             duration_ms(row.pipeline.map_crop),
@@ -962,6 +966,38 @@ fn write_latency_summary(writer: &mut impl Write, replay: &OfflineReplay) -> Res
             .latency
             .iter()
             .map(|row| duration_ms(row.pipeline.association)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_association_nearest_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.association_nearest)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_association_plane_fit_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.association_plane_fit)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_association_residual_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.association_residual)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_association_factor_build_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.association_factor_build)),
     )?;
     write_latency_metric(
         writer,

@@ -54,6 +54,10 @@ pub struct PipelineStageTimings {
     pub deskew: Duration,
     pub preprocess: Duration,
     pub association: Duration,
+    pub association_nearest: Duration,
+    pub association_plane_fit: Duration,
+    pub association_residual: Duration,
+    pub association_factor_build: Duration,
     pub update: Duration,
     pub map_insert: Duration,
     pub map_crop: Duration,
@@ -221,8 +225,9 @@ impl FastLioPipeline {
 
         let association_start = Instant::now();
         let mut factors = Vec::new();
+        let mut association_breakdown = AssociationTimings::default();
         if !self.local_map.is_empty() {
-            factors = build_iesekf_factors(
+            let factor_build = build_iesekf_factors(
                 &self.filter,
                 &self.local_map,
                 &self.extrinsic,
@@ -230,6 +235,8 @@ impl FastLioPipeline {
                 self.config.point_to_plane,
                 self.config.max_factor_points,
             );
+            factors = factor_build.factors;
+            association_breakdown = factor_build.timings;
         }
         let effective_observations = factors.len();
         let association_duration = association_start.elapsed();
@@ -287,6 +294,10 @@ impl FastLioPipeline {
                 deskew: deskew_duration,
                 preprocess: preprocess_duration,
                 association: association_duration,
+                association_nearest: association_breakdown.nearest,
+                association_plane_fit: association_breakdown.plane_fit,
+                association_residual: association_breakdown.residual,
+                association_factor_build: association_breakdown.factor_build,
                 update: update_duration,
                 map_insert: map_insert_duration,
                 map_crop: map_crop_duration,
@@ -353,6 +364,20 @@ fn predict_through_imu(
     Ok((state, covariance))
 }
 
+#[derive(Debug, Clone, Default)]
+struct IesekfFactorBuild {
+    factors: Vec<IesekfPointToPlaneFactor>,
+    timings: AssociationTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AssociationTimings {
+    nearest: Duration,
+    plane_fit: Duration,
+    residual: Duration,
+    factor_build: Duration,
+}
+
 fn build_iesekf_factors(
     filter: &Iesekf,
     local_map: &LocalMap,
@@ -360,31 +385,46 @@ fn build_iesekf_factors(
     preprocessed: &LidarFrame,
     config: PointToPlaneConfig,
     max_factor_points: Option<usize>,
-) -> Vec<IesekfPointToPlaneFactor> {
+) -> IesekfFactorBuild {
     let total_points = preprocessed.points.len();
     let mut query_scratch = local_map.create_query_scratch();
-    preprocessed
+    let mut build = IesekfFactorBuild::default();
+    for timed_point in preprocessed
         .points
         .iter()
         .enumerate()
         .filter(move |(point_index, _)| {
             should_sample_point(*point_index, total_points, max_factor_points)
         })
-        .filter_map(|timed_point| {
-            let timed_point = timed_point.1;
-            let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
-            let point_w = filter.state.orientation * point_i + filter.state.position;
-            let matched = local_map
-                .point_to_plane_match_with_scratch(point_w, config, &mut query_scratch)
-                .ok()?;
+    {
+        let factor_start = Instant::now();
+        let timed_point = timed_point.1;
+        let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
+        let point_w = filter.state.orientation * point_i + filter.state.position;
+        build.timings.factor_build += factor_start.elapsed();
 
-            Some(IesekfPointToPlaneFactor {
-                point_i,
-                plane_w: matched.plane,
-                weight: matched.weight,
-            })
-        })
-        .collect()
+        let (matched, match_timings) = local_map.point_to_plane_match_attempt_with_scratch(
+            point_w,
+            config,
+            &mut query_scratch,
+        );
+        build.timings.nearest += match_timings.nearest;
+        build.timings.plane_fit += match_timings.plane_fit;
+        build.timings.residual += match_timings.residual;
+
+        let Ok(matched) = matched else {
+            continue;
+        };
+
+        let factor_start = Instant::now();
+        build.factors.push(IesekfPointToPlaneFactor {
+            point_i,
+            plane_w: matched.plane,
+            weight: matched.weight,
+        });
+        build.timings.factor_build += factor_start.elapsed();
+    }
+    build
 }
 
 fn transform_lidar_frame_to_world_points<'a>(
