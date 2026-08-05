@@ -1,6 +1,8 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +38,7 @@ fn main() -> Result<()> {
     write_trajectory_csv(&trajectory_path, &replay.trajectory)?;
     write_ascii_pcd(&map_path, replay.pipeline.local_map.points())?;
     write_summary(&summary_path, stats, &replay)?;
+    open_viewer(&args.viewer, &map_path)?;
 
     println!("replay complete");
     println!("  processed frames: {}", replay.processed_frames);
@@ -56,36 +59,43 @@ struct ReplayArgs {
     output_dir: Utf8PathBuf,
     playback_rate: f64,
     channel_capacity: usize,
+    viewer: ReplayViewer,
 }
 
 impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
-        if !(4..=6).contains(&args.len()) {
+        if args.len() < 4 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity]",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--open-playground|--playground <path>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
-        let playback_rate = if let Some(rate) = args.get(4) {
-            rate.parse::<f64>()
-                .with_context(|| format!("invalid playback_rate `{rate}`"))?
-        } else {
-            0.0
-        };
+        let mut next_arg = 4;
+        let playback_rate =
+            if let Some(rate) = args.get(next_arg).filter(|arg| !arg.starts_with("--")) {
+                next_arg += 1;
+                rate.parse::<f64>()
+                    .with_context(|| format!("invalid playback_rate `{rate}`"))?
+            } else {
+                0.0
+            };
         if playback_rate < 0.0 || !playback_rate.is_finite() {
             bail!("playback_rate must be finite and non-negative");
         }
 
-        let channel_capacity = if let Some(capacity) = args.get(5) {
-            capacity
-                .parse::<usize>()
-                .with_context(|| format!("invalid channel_capacity `{capacity}`"))?
-        } else {
-            1024
-        };
+        let channel_capacity =
+            if let Some(capacity) = args.get(next_arg).filter(|arg| !arg.starts_with("--")) {
+                next_arg += 1;
+                capacity
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid channel_capacity `{capacity}`"))?
+            } else {
+                1024
+            };
         if channel_capacity == 0 {
             bail!("channel_capacity must be positive");
         }
+        let viewer = ReplayViewer::parse(&args[next_arg..])?;
 
         Ok(Self {
             bag_path: Utf8PathBuf::from(&args[1]),
@@ -93,7 +103,73 @@ impl ReplayArgs {
             output_dir: Utf8PathBuf::from(&args[3]),
             playback_rate,
             channel_capacity,
+            viewer,
         })
+    }
+}
+
+enum ReplayViewer {
+    None,
+    Playground { executable: Utf8PathBuf },
+}
+
+impl ReplayViewer {
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut viewer = ReplayViewer::None;
+        let mut idx = 0;
+        while idx < args.len() {
+            match args[idx].as_str() {
+                "--no-viewer" => {
+                    viewer = ReplayViewer::None;
+                    idx += 1;
+                }
+                "--open-playground" => {
+                    viewer = ReplayViewer::Playground {
+                        executable: default_playground_executable(),
+                    };
+                    idx += 1;
+                }
+                "--playground" => {
+                    let Some(path) = args.get(idx + 1) else {
+                        bail!("--playground requires an executable path");
+                    };
+                    viewer = ReplayViewer::Playground {
+                        executable: Utf8PathBuf::from(path),
+                    };
+                    idx += 2;
+                }
+                other => bail!("unknown replay option `{other}`"),
+            }
+        }
+        Ok(viewer)
+    }
+}
+
+fn default_playground_executable() -> Utf8PathBuf {
+    let release = Utf8PathBuf::from("/home/lyra/playground/target/release/playground");
+    if release.exists() {
+        release
+    } else {
+        Utf8PathBuf::from("/home/lyra/playground/target/debug/playground")
+    }
+}
+
+fn open_viewer(viewer: &ReplayViewer, map_path: &Utf8Path) -> Result<()> {
+    match viewer {
+        ReplayViewer::None => Ok(()),
+        ReplayViewer::Playground { executable } => {
+            if !Path::new(executable.as_str()).exists() {
+                bail!(
+                    "playground executable `{}` does not exist; build it first or pass --playground <path>",
+                    executable
+                );
+            }
+            Command::new(executable.as_str())
+                .arg(map_path.as_str())
+                .spawn()
+                .with_context(|| format!("failed to launch playground viewer `{executable}`"))?;
+            Ok(())
+        }
     }
 }
 
@@ -493,7 +569,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- map output is a single ASCII PCD; no incremental map shards or rerun visualization yet"
+        "- map output is a single ASCII PCD; pass --open-playground to launch /home/lyra/playground on that PCD after replay"
     )?;
     writeln!(
         writer,
@@ -504,4 +580,54 @@ fn write_summary(
 
 fn format_optional_f64(value: Option<f64>) -> String {
     value.map_or_else(|| "none".to_string(), |value| format!("{value:.9}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "fastlio-replay".to_string(),
+            "bag.mcap".to_string(),
+            "config.yaml".to_string(),
+            "output".to_string(),
+        ];
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        args
+    }
+
+    #[test]
+    fn parse_replay_args_defaults_to_unlimited_no_viewer() {
+        let parsed = ReplayArgs::parse(args(&[])).unwrap();
+
+        assert_eq!(parsed.playback_rate, 0.0);
+        assert_eq!(parsed.channel_capacity, 1024);
+        assert!(matches!(parsed.viewer, ReplayViewer::None));
+    }
+
+    #[test]
+    fn parse_replay_args_keeps_positional_rate_and_capacity() {
+        let parsed = ReplayArgs::parse(args(&["2.5", "64"])).unwrap();
+
+        assert_eq!(parsed.playback_rate, 2.5);
+        assert_eq!(parsed.channel_capacity, 64);
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_playground_viewer() {
+        let parsed = ReplayArgs::parse(args(&["--playground", "/tmp/viewer"])).unwrap();
+
+        match parsed.viewer {
+            ReplayViewer::Playground { executable } => {
+                assert_eq!(executable, Utf8PathBuf::from("/tmp/viewer"));
+            }
+            ReplayViewer::None => panic!("expected playground viewer"),
+        }
+    }
+
+    #[test]
+    fn parse_replay_args_rejects_unknown_option() {
+        assert!(ReplayArgs::parse(args(&["--rerun"])).is_err());
+    }
 }
