@@ -248,7 +248,7 @@ impl FastLioPipeline {
 
         let map_insert_start = Instant::now();
         if self.config.insert_scan_points {
-            let map_points = transform_lidar_frame_to_world(
+            let map_points = transform_lidar_frame_to_world_points(
                 &preprocessed,
                 &self.extrinsic,
                 self.filter.state.orientation,
@@ -384,13 +384,13 @@ fn build_iesekf_factors(
         .collect()
 }
 
-fn transform_lidar_frame_to_world(
-    lidar: &LidarFrame,
-    extrinsic: &LidarImuExtrinsic,
+fn transform_lidar_frame_to_world_points<'a>(
+    lidar: &'a LidarFrame,
+    extrinsic: &'a LidarImuExtrinsic,
     rotation_wi: nalgebra::UnitQuaternion<f64>,
     position_wi: Vec3<f64>,
     max_map_insert_points: Option<usize>,
-) -> Vec<PointXYZI> {
+) -> impl Iterator<Item = PointXYZI> + 'a {
     let total_points = lidar.points.len();
     lidar
         .points
@@ -399,7 +399,7 @@ fn transform_lidar_frame_to_world(
         .filter(move |(point_index, _)| {
             should_sample_point(*point_index, total_points, max_map_insert_points)
         })
-        .map(|timed_point| {
+        .map(move |timed_point| {
             let timed_point = timed_point.1;
             let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
             let point_w = rotation_wi * point_i + position_wi;
@@ -410,7 +410,6 @@ fn transform_lidar_frame_to_world(
                 intensity: timed_point.point.intensity,
             }
         })
-        .collect()
 }
 
 fn should_sample_point(point_index: usize, total_points: usize, max_points: Option<usize>) -> bool {

@@ -1,6 +1,7 @@
 use fastlio_types::{Mat3, PointXYZI, Vec3};
 use kiddo::{DonnellyCyclicSimdFull, KdTree, QueryResultItem, SquaredEuclidean, VecOfArrays};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 type MapKdTree =
@@ -14,6 +15,12 @@ type MapKdTree =
 pub struct LocalMap {
     points: Vec<PointXYZI>,
     index: MapKdTree,
+    duplicate_filter: Option<MapDuplicateFilter>,
+}
+
+struct MapDuplicateFilter {
+    voxel_size: f64,
+    buckets: HashMap<[i32; 3], Vec<usize>>,
 }
 
 /// A nearest-neighbour hit returned by [`LocalMap`].
@@ -117,7 +124,11 @@ impl LocalMap {
 
     pub fn from_points(points: Vec<PointXYZI>) -> Self {
         let index = build_index(&points);
-        Self { points, index }
+        Self {
+            points,
+            index,
+            duplicate_filter: None,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -155,12 +166,8 @@ impl LocalMap {
             if !point.is_valid() {
                 continue;
             }
-            let query_w = point.to_vec3_f64();
-            let is_near_existing = self
-                .nearest_n(query_w, 1)
-                .first()
-                .is_some_and(|nearest| nearest.squared_distance < min_squared_distance);
-            if !is_near_existing {
+            self.ensure_duplicate_filter(min_distance_m);
+            if !self.has_near_duplicate(&point, min_squared_distance) {
                 self.insert_point(point);
             }
         }
@@ -184,6 +191,7 @@ impl LocalMap {
         if radius_m < 0.0 || !radius_m.is_finite() {
             self.points.clear();
             self.rebuild_index();
+            self.rebuild_duplicate_filter();
             return;
         }
 
@@ -193,6 +201,7 @@ impl LocalMap {
             .retain(|point| squared_distance(point, &center_w) <= radius_squared);
         if self.points.len() != old_len {
             self.rebuild_index();
+            self.rebuild_duplicate_filter();
         }
     }
 
@@ -284,7 +293,7 @@ impl LocalMap {
         self.index = build_index(&self.points);
     }
 
-    fn insert_point(&mut self, point: PointXYZI) {
+    fn insert_point(&mut self, point: PointXYZI) -> Option<usize> {
         let point_index = self.points.len();
         if self
             .index
@@ -295,7 +304,98 @@ impl LocalMap {
             .is_ok()
         {
             self.points.push(point);
+            self.insert_duplicate_filter_entry(point_index);
+            Some(point_index)
+        } else {
+            None
         }
+    }
+
+    fn ensure_duplicate_filter(&mut self, voxel_size: f64) {
+        let needs_rebuild = self
+            .duplicate_filter
+            .as_ref()
+            .is_none_or(|filter| filter.voxel_size != voxel_size);
+        if needs_rebuild {
+            self.duplicate_filter = Some(MapDuplicateFilter::build(&self.points, voxel_size));
+        }
+    }
+
+    fn rebuild_duplicate_filter(&mut self) {
+        let Some(voxel_size) = self
+            .duplicate_filter
+            .as_ref()
+            .map(|duplicate_filter| duplicate_filter.voxel_size)
+        else {
+            return;
+        };
+        self.duplicate_filter = Some(MapDuplicateFilter::build(&self.points, voxel_size));
+    }
+
+    fn insert_duplicate_filter_entry(&mut self, point_index: usize) {
+        let Some(filter) = &mut self.duplicate_filter else {
+            return;
+        };
+        let point = &self.points[point_index];
+        if point.is_valid() {
+            filter.insert(point, point_index);
+        }
+    }
+
+    fn has_near_duplicate(&self, point: &PointXYZI, min_squared_distance: f64) -> bool {
+        let Some(filter) = &self.duplicate_filter else {
+            return false;
+        };
+        filter.has_near_duplicate(&self.points, point, min_squared_distance)
+    }
+}
+
+impl MapDuplicateFilter {
+    fn build(points: &[PointXYZI], voxel_size: f64) -> Self {
+        let mut filter = Self {
+            voxel_size,
+            buckets: HashMap::with_capacity(points.len()),
+        };
+        for (point_index, point) in points.iter().enumerate() {
+            if point.is_valid() {
+                filter.insert(point, point_index);
+            }
+        }
+        filter
+    }
+
+    fn insert(&mut self, point: &PointXYZI, point_index: usize) {
+        self.buckets
+            .entry(voxel_key(point, self.voxel_size))
+            .or_default()
+            .push(point_index);
+    }
+
+    fn has_near_duplicate(
+        &self,
+        map_points: &[PointXYZI],
+        point: &PointXYZI,
+        min_squared_distance: f64,
+    ) -> bool {
+        let center = voxel_key(point, self.voxel_size);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let key = [center[0] + dx, center[1] + dy, center[2] + dz];
+                    let Some(candidates) = self.buckets.get(&key) else {
+                        continue;
+                    };
+                    for &candidate_index in candidates {
+                        if squared_distance_points(&map_points[candidate_index], point)
+                            < min_squared_distance
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -330,6 +430,21 @@ fn squared_distance(point: &PointXYZI, query_w: &Vec3<f64>) -> f64 {
     let dy = point.y as f64 - query_w.y;
     let dz = point.z as f64 - query_w.z;
     dx * dx + dy * dy + dz * dz
+}
+
+fn squared_distance_points(a: &PointXYZI, b: &PointXYZI) -> f64 {
+    let dx = a.x as f64 - b.x as f64;
+    let dy = a.y as f64 - b.y as f64;
+    let dz = a.z as f64 - b.z as f64;
+    dx * dx + dy * dy + dz * dz
+}
+
+fn voxel_key(point: &PointXYZI, voxel_size: f64) -> [i32; 3] {
+    [
+        (point.x as f64 / voxel_size).floor() as i32,
+        (point.y as f64 / voxel_size).floor() as i32,
+        (point.z as f64 / voxel_size).floor() as i32,
+    ]
 }
 
 pub fn fit_plane(points: &[&PointXYZI], config: PlaneFitConfig) -> Result<PlaneFit, PlaneFitError> {
@@ -530,6 +645,18 @@ mod tests {
 
         assert!(map.is_empty());
         assert!(map.nearest_n(Vec3::zeros(), 1).is_empty());
+    }
+
+    #[test]
+    fn duplicate_filter_stays_consistent_after_clearing_crop() {
+        let mut map = LocalMap::from_points(vec![point(0.0, 0.0, 0.0)]);
+        map.insert_points_with_min_distance(vec![point(0.2, 0.0, 0.0)], 0.1);
+
+        map.crop_by_center_radius(Vec3::zeros(), -1.0);
+        map.insert_points_with_min_distance(vec![point(0.0, 0.0, 0.0)], 0.1);
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.points()[0].x, 0.0);
     }
 
     #[test]
