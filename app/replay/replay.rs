@@ -499,6 +499,7 @@ impl OfflineReplay {
             insert_scan_points: true,
             max_factor_points: Some(2_000),
             max_map_insert_points: Some(5_000),
+            map_insert_min_distance: Some(0.10),
             initialization_groups: 10,
         };
 
@@ -782,7 +783,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- replay limits scan-to-map association to 2000 deterministic scan samples and map insertion to 5000 deterministic scan samples per frame"
+        "- replay limits scan-to-map association to 2000 deterministic scan samples and map insertion to 5000 deterministic scan samples per frame, then rejects map points within 0.10m of existing map points"
     )?;
     writeln!(
         writer,

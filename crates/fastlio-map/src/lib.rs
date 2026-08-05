@@ -137,16 +137,31 @@ impl LocalMap {
         I: IntoIterator<Item = PointXYZI>,
     {
         for point in points {
-            let point_index = self.points.len();
-            if self
-                .index
-                .add(
-                    &[point.x as f64, point.y as f64, point.z as f64],
-                    point_index as u32,
-                )
-                .is_ok()
-            {
-                self.points.push(point);
+            self.insert_point(point);
+        }
+    }
+
+    pub fn insert_points_with_min_distance<I>(&mut self, points: I, min_distance_m: f64)
+    where
+        I: IntoIterator<Item = PointXYZI>,
+    {
+        if !min_distance_m.is_finite() || min_distance_m <= 0.0 {
+            self.insert_points(points);
+            return;
+        }
+
+        let min_squared_distance = min_distance_m * min_distance_m;
+        for point in points {
+            if !point.is_valid() {
+                continue;
+            }
+            let query_w = point.to_vec3_f64();
+            let is_near_existing = self
+                .nearest_n(query_w, 1)
+                .first()
+                .is_some_and(|nearest| nearest.squared_distance < min_squared_distance);
+            if !is_near_existing {
+                self.insert_point(point);
             }
         }
     }
@@ -267,6 +282,20 @@ impl LocalMap {
 
     fn rebuild_index(&mut self) {
         self.index = build_index(&self.points);
+    }
+
+    fn insert_point(&mut self, point: PointXYZI) {
+        let point_index = self.points.len();
+        if self
+            .index
+            .add(
+                &[point.x as f64, point.y as f64, point.z as f64],
+                point_index as u32,
+            )
+            .is_ok()
+        {
+            self.points.push(point);
+        }
     }
 }
 
@@ -442,6 +471,25 @@ mod tests {
 
         assert_eq!(map.len(), 2);
         assert_eq!(hits[0].index, 1);
+    }
+
+    #[test]
+    fn insert_points_with_min_distance_skips_near_duplicates() {
+        let mut map = LocalMap::new();
+
+        map.insert_points_with_min_distance(
+            vec![
+                point(0.0, 0.0, 0.0),
+                point(0.05, 0.0, 0.0),
+                point(0.2, 0.0, 0.0),
+            ],
+            0.1,
+        );
+
+        assert_eq!(map.len(), 2);
+        let hits = map.nearest_n(Vec3::new(0.05, 0.0, 0.0), 2);
+        assert_eq!(hits[0].index, 0);
+        assert_eq!(hits[1].index, 1);
     }
 
     #[test]

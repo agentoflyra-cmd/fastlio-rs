@@ -28,6 +28,7 @@ pub struct PipelineConfig {
     pub insert_scan_points: bool,
     pub max_factor_points: Option<usize>,
     pub max_map_insert_points: Option<usize>,
+    pub map_insert_min_distance: Option<f64>,
     pub initialization_groups: usize,
 }
 
@@ -209,7 +210,12 @@ impl FastLioPipeline {
                 self.filter.state.position,
                 self.config.max_map_insert_points,
             );
-            self.local_map.insert_points(map_points);
+            if let Some(min_distance) = self.config.map_insert_min_distance {
+                self.local_map
+                    .insert_points_with_min_distance(map_points, min_distance);
+            } else {
+                self.local_map.insert_points(map_points);
+            }
         }
 
         if let Some(radius) = self.config.map_crop_radius {
@@ -429,6 +435,7 @@ mod tests {
             insert_scan_points: true,
             max_factor_points: None,
             max_map_insert_points: None,
+            map_insert_min_distance: None,
             initialization_groups: 0,
         }
     }
