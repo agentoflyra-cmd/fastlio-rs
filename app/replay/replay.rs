@@ -26,8 +26,11 @@ fn main() -> Result<()> {
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("failed to create output dir `{}`", args.output_dir))?;
 
-    let config = read_from_config_path(&args.config_path)
+    let mut config = read_from_config_path(&args.config_path)
         .with_context(|| format!("failed to read config `{}`", args.config_path))?;
+    if let Some(offset_sec) = args.time_offset_lidar_to_imu_override {
+        config.common.time_offset_lidar_to_imu = Some(offset_sec);
+    }
     let mut replay = OfflineReplay::new(config)?;
     replay.live_stream = start_live_viewer(&args.viewer)?;
     let stats = run_spsc_replay(&args, &mut replay)
@@ -61,6 +64,7 @@ struct ReplayArgs {
     output_dir: Utf8PathBuf,
     playback_rate: f64,
     channel_capacity: usize,
+    time_offset_lidar_to_imu_override: Option<f64>,
     viewer: ReplayViewer,
 }
 
@@ -68,7 +72,7 @@ impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--time-offset-lidar-to-imu <sec>] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
@@ -97,7 +101,9 @@ impl ReplayArgs {
         if channel_capacity == 0 {
             bail!("channel_capacity must be positive");
         }
-        let viewer = ReplayViewer::parse(&args[next_arg..])?;
+        let (viewer_args, time_offset_lidar_to_imu_override) =
+            parse_replay_options(&args[next_arg..])?;
+        let viewer = ReplayViewer::parse(&viewer_args)?;
 
         Ok(Self {
             bag_path: Utf8PathBuf::from(&args[1]),
@@ -105,9 +111,39 @@ impl ReplayArgs {
             output_dir: Utf8PathBuf::from(&args[3]),
             playback_rate,
             channel_capacity,
+            time_offset_lidar_to_imu_override,
             viewer,
         })
     }
+}
+
+fn parse_replay_options(args: &[String]) -> Result<(Vec<String>, Option<f64>)> {
+    let mut viewer_args = Vec::new();
+    let mut time_offset_lidar_to_imu_override = None;
+    let mut idx = 0;
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--time-offset-lidar-to-imu" => {
+                let Some(value) = args.get(idx + 1) else {
+                    bail!("--time-offset-lidar-to-imu requires a seconds value");
+                };
+                let offset_sec = value
+                    .parse::<f64>()
+                    .with_context(|| format!("invalid --time-offset-lidar-to-imu `{value}`"))?;
+                if !offset_sec.is_finite() {
+                    bail!("--time-offset-lidar-to-imu must be finite");
+                }
+                time_offset_lidar_to_imu_override = Some(offset_sec);
+                idx += 2;
+            }
+            _ => {
+                viewer_args.push(args[idx].clone());
+                idx += 1;
+            }
+        }
+    }
+
+    Ok((viewer_args, time_offset_lidar_to_imu_override))
 }
 
 enum ReplayViewer {
@@ -400,6 +436,9 @@ struct TrajectoryRow {
 struct OfflineReplay {
     synchronizer: MeasurementSynchronizer,
     pipeline: FastLioPipeline,
+    /// LiDAR absolute timestamps are shifted into the IMU clock domain as:
+    /// `t_lidar_in_imu = t_lidar_raw + time_offset_lidar_to_imu_sec`.
+    time_offset_lidar_to_imu_sec: f64,
     trajectory: Vec<TrajectoryRow>,
     processed_frames: usize,
     tracking_frames: usize,
@@ -409,12 +448,18 @@ struct OfflineReplay {
     live_stream: Option<LivePointStream>,
     first_imu_time_sec: Option<f64>,
     last_imu_time_sec: Option<f64>,
+    first_lidar_raw_time_sec: Option<f64>,
+    last_lidar_raw_time_sec: Option<f64>,
     first_lidar_time_sec: Option<f64>,
     last_lidar_time_sec: Option<f64>,
 }
 
 impl OfflineReplay {
     fn new(config: Config) -> Result<Self> {
+        let time_offset_lidar_to_imu_sec = config.common.time_offset_lidar_to_imu.unwrap_or(0.0);
+        if !time_offset_lidar_to_imu_sec.is_finite() {
+            bail!("common.time_offset_lidar_to_imu must be finite when present");
+        }
         let imu_integrator = ImuIntegrator::init(
             config.mapping.gyr_cov,
             config.mapping.acc_cov,
@@ -461,6 +506,7 @@ impl OfflineReplay {
                 extrinsic,
                 pipeline_config,
             ),
+            time_offset_lidar_to_imu_sec,
             trajectory: Vec::new(),
             processed_frames: 0,
             tracking_frames: 0,
@@ -470,6 +516,8 @@ impl OfflineReplay {
             live_stream: None,
             first_imu_time_sec: None,
             last_imu_time_sec: None,
+            first_lidar_raw_time_sec: None,
+            last_lidar_raw_time_sec: None,
             first_lidar_time_sec: None,
             last_lidar_time_sec: None,
         })
@@ -482,7 +530,11 @@ impl OfflineReplay {
                 self.last_imu_time_sec = Some(imu.time_stamp_sec);
                 self.synchronizer.pend_imu(imu)?
             }
-            SensorEvent::Lidar(lidar) => {
+            SensorEvent::Lidar(mut lidar) => {
+                self.first_lidar_raw_time_sec
+                    .get_or_insert(lidar.base_timestamp_sec);
+                self.last_lidar_raw_time_sec = Some(lidar.base_timestamp_sec);
+                lidar.shift_timestamp_sec(self.time_offset_lidar_to_imu_sec);
                 self.first_lidar_time_sec
                     .get_or_insert(lidar.base_timestamp_sec);
                 self.last_lidar_time_sec = Some(lidar.base_timestamp_sec);
@@ -647,6 +699,15 @@ fn write_summary(
     writeln!(writer, "max_pending_lidar={}", replay.max_pending_lidar)?;
     writeln!(
         writer,
+        "time_offset_lidar_to_imu_sec={:.9}",
+        replay.time_offset_lidar_to_imu_sec
+    )?;
+    writeln!(
+        writer,
+        "time_offset_convention=t_lidar_in_imu=t_lidar_raw+time_offset_lidar_to_imu_sec"
+    )?;
+    writeln!(
+        writer,
         "first_imu_time_sec={}",
         format_optional_f64(replay.first_imu_time_sec)
     )?;
@@ -654,6 +715,16 @@ fn write_summary(
         writer,
         "last_imu_time_sec={}",
         format_optional_f64(replay.last_imu_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "first_lidar_raw_time_sec={}",
+        format_optional_f64(replay.first_lidar_raw_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "last_lidar_raw_time_sec={}",
+        format_optional_f64(replay.last_lidar_raw_time_sec)
     )?;
     writeln!(
         writer,
@@ -700,6 +771,10 @@ fn write_summary(
     )?;
     writeln!(
         writer,
+        "- LiDAR-IMU clock offset is applied as a fixed scan timestamp shift; no automatic offset calibration yet"
+    )?;
+    writeln!(
+        writer,
         "- initial state is fixed identity pose with gravity [0,0,-9.81]; no IMU initialization window yet"
     )?;
     writeln!(
@@ -738,6 +813,7 @@ mod tests {
 
         assert_eq!(parsed.playback_rate, 0.0);
         assert_eq!(parsed.channel_capacity, 1024);
+        assert_eq!(parsed.time_offset_lidar_to_imu_override, None);
         assert!(matches!(parsed.viewer, ReplayViewer::None));
     }
 
@@ -747,6 +823,39 @@ mod tests {
 
         assert_eq!(parsed.playback_rate, 2.5);
         assert_eq!(parsed.channel_capacity, 64);
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_time_offset_override() {
+        let parsed = ReplayArgs::parse(args(&["--time-offset-lidar-to-imu", "0.0095"])).unwrap();
+
+        assert_eq!(parsed.time_offset_lidar_to_imu_override, Some(0.0095));
+        assert!(matches!(parsed.viewer, ReplayViewer::None));
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_time_offset_with_viewer_options() {
+        let parsed = ReplayArgs::parse(args(&[
+            "--live-playground",
+            "--time-offset-lidar-to-imu",
+            "-0.002",
+            "--playground",
+            "/tmp/live-viewer",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.time_offset_lidar_to_imu_override, Some(-0.002));
+        match parsed.viewer {
+            ReplayViewer::LivePlayground { executable, .. } => {
+                assert_eq!(executable, Utf8PathBuf::from("/tmp/live-viewer"));
+            }
+            _ => panic!("expected live playground viewer"),
+        }
+    }
+
+    #[test]
+    fn parse_replay_args_rejects_non_finite_time_offset() {
+        assert!(ReplayArgs::parse(args(&["--time-offset-lidar-to-imu", "NaN"])).is_err());
     }
 
     #[test]

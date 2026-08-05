@@ -132,4 +132,45 @@ impl LidarFrame {
     pub fn end_timestamp_sec(&self) -> f64 {
         self.end_timestamp_sec
     }
+
+    /// Shifts the scan start and end timestamps by `offset_sec`.
+    ///
+    /// Point-level `offset_time_sec` values are scan-relative and are not
+    /// changed. Use this when adapting a LiDAR message timestamp into another
+    /// clock domain before synchronization or deskew.
+    pub fn shift_timestamp_sec(&mut self, offset_sec: f64) {
+        self.base_timestamp_sec += offset_sec;
+        self.end_timestamp_sec += offset_sec;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LidarFrame, PointXYZI, TimedPoint};
+
+    #[test]
+    fn lidar_frame_shift_time_preserves_offsets_and_duration() {
+        let mut frame = LidarFrame::new(
+            10.0,
+            10.2,
+            vec![TimedPoint {
+                offset_time_sec: 0.15,
+                point: PointXYZI {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                    intensity: 4.0,
+                },
+                tag: 0,
+                line: 0,
+            }],
+        );
+
+        frame.shift_timestamp_sec(0.01);
+
+        assert!((frame.base_timestamp_sec - 10.01).abs() < 1.0e-12);
+        assert!((frame.end_timestamp_sec() - 10.21).abs() < 1.0e-12);
+        assert_eq!(frame.points[0].offset_time_sec, 0.15);
+        assert!((frame.end_timestamp_sec() - frame.base_timestamp_sec - 0.2).abs() < 1.0e-12);
+    }
 }
