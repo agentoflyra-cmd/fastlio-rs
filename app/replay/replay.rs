@@ -436,8 +436,8 @@ struct TrajectoryRow {
 struct OfflineReplay {
     synchronizer: MeasurementSynchronizer,
     pipeline: FastLioPipeline,
-    /// LiDAR absolute timestamps are shifted into the IMU clock domain as:
-    /// `t_lidar_in_imu = t_lidar_raw + time_offset_lidar_to_imu_sec`.
+    /// IMU absolute timestamps are shifted into the LiDAR clock domain as:
+    /// `t_imu_for_sync = t_imu_raw - time_offset_lidar_to_imu_sec`.
     time_offset_lidar_to_imu_sec: f64,
     trajectory: Vec<TrajectoryRow>,
     processed_frames: usize,
@@ -446,6 +446,8 @@ struct OfflineReplay {
     failed_groups: usize,
     max_pending_lidar: usize,
     live_stream: Option<LivePointStream>,
+    first_imu_raw_time_sec: Option<f64>,
+    last_imu_raw_time_sec: Option<f64>,
     first_imu_time_sec: Option<f64>,
     last_imu_time_sec: Option<f64>,
     first_lidar_raw_time_sec: Option<f64>,
@@ -514,6 +516,8 @@ impl OfflineReplay {
             failed_groups: 0,
             max_pending_lidar: 0,
             live_stream: None,
+            first_imu_raw_time_sec: None,
+            last_imu_raw_time_sec: None,
             first_imu_time_sec: None,
             last_imu_time_sec: None,
             first_lidar_raw_time_sec: None,
@@ -525,16 +529,19 @@ impl OfflineReplay {
 
     fn on_event(&mut self, event: SensorEvent) -> Result<()> {
         let group = match event {
-            SensorEvent::Imu(imu) => {
+            SensorEvent::Imu(mut imu) => {
+                self.first_imu_raw_time_sec
+                    .get_or_insert(imu.time_stamp_sec);
+                self.last_imu_raw_time_sec = Some(imu.time_stamp_sec);
+                imu.time_stamp_sec -= self.time_offset_lidar_to_imu_sec;
                 self.first_imu_time_sec.get_or_insert(imu.time_stamp_sec);
                 self.last_imu_time_sec = Some(imu.time_stamp_sec);
                 self.synchronizer.pend_imu(imu)?
             }
-            SensorEvent::Lidar(mut lidar) => {
+            SensorEvent::Lidar(lidar) => {
                 self.first_lidar_raw_time_sec
                     .get_or_insert(lidar.base_timestamp_sec);
                 self.last_lidar_raw_time_sec = Some(lidar.base_timestamp_sec);
-                lidar.shift_timestamp_sec(self.time_offset_lidar_to_imu_sec);
                 self.first_lidar_time_sec
                     .get_or_insert(lidar.base_timestamp_sec);
                 self.last_lidar_time_sec = Some(lidar.base_timestamp_sec);
@@ -704,7 +711,17 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "time_offset_convention=t_lidar_in_imu=t_lidar_raw+time_offset_lidar_to_imu_sec"
+        "time_offset_convention=t_imu_for_sync=t_imu_raw-time_offset_lidar_to_imu_sec"
+    )?;
+    writeln!(
+        writer,
+        "first_imu_raw_time_sec={}",
+        format_optional_f64(replay.first_imu_raw_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "last_imu_raw_time_sec={}",
+        format_optional_f64(replay.last_imu_raw_time_sec)
     )?;
     writeln!(
         writer,
@@ -738,17 +755,17 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "dropped_lidar_without_begin_imu={}",
-        replay.synchronizer.dropped_lidar_without_begin_imu
+        "dropped_lidar_before_first_imu={}",
+        replay.synchronizer.dropped_lidar_before_first_imu
     )?;
-    if let Some(drop) = replay.synchronizer.first_lidar_drop_without_begin_imu {
+    if let Some(drop) = replay.synchronizer.first_lidar_drop_before_first_imu {
         writeln!(
             writer,
-            "first_lidar_drop_without_begin_imu={:.9},{:.9},{:.9}",
+            "first_lidar_drop_before_first_imu={:.9},{:.9},{:.9}",
             drop.lidar_base_time_sec, drop.lidar_end_time_sec, drop.first_imu_time_sec
         )?;
     } else {
-        writeln!(writer, "first_lidar_drop_without_begin_imu=none")?;
+        writeln!(writer, "first_lidar_drop_before_first_imu=none")?;
     }
     writeln!(writer, "map_points={}", replay.pipeline.local_map.len())?;
     writeln!(writer)?;
@@ -763,7 +780,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- pending LiDAR frames are queued in MeasurementSynchronizer; no frame dropping policy yet"
+        "- MeasurementSynchronizer follows FAST-LIO-style packaging: wait for IMU coverage at LiDAR end time and let the pipeline prepend the previous frame tail IMU"
     )?;
     writeln!(
         writer,
@@ -771,7 +788,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- LiDAR-IMU clock offset is applied as a fixed scan timestamp shift; no automatic offset calibration yet"
+        "- LiDAR-IMU clock offset follows FAST-LIO semantics by shifting IMU timestamps; no automatic offset calibration yet"
     )?;
     writeln!(
         writer,

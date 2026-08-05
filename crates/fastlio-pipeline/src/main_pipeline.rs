@@ -6,7 +6,7 @@ use fastlio_imu::ImuIntegrator;
 use fastlio_map::{LocalMap, PointToPlaneConfig};
 use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
-    LidarFrame, LidarImuExtrinsic, MeasureGroup, PointXYZI, PreprocessConfig, Vec3,
+    ImuSample, LidarFrame, LidarImuExtrinsic, MeasureGroup, PointXYZI, PreprocessConfig, Vec3,
 };
 
 use crate::deskew::{build_motion_segments, deskew};
@@ -59,6 +59,7 @@ pub struct FastLioPipeline {
     pub imu_integrator: ImuIntegrator,
     pub extrinsic: LidarImuExtrinsic,
     pub config: PipelineConfig,
+    last_imu_for_deskew: Option<ImuSample>,
 }
 
 impl FastLioPipeline {
@@ -75,6 +76,7 @@ impl FastLioPipeline {
             imu_integrator,
             extrinsic,
             config,
+            last_imu_for_deskew: None,
         }
     }
 
@@ -82,6 +84,33 @@ impl FastLioPipeline {
         &mut self,
         mut measure_group: MeasureGroup,
     ) -> Result<PipelineFrameReport> {
+        let current_tail_imu = measure_group.imu.last().cloned();
+        if let Some(last_imu) = self.last_imu_for_deskew.clone()
+            && measure_group
+                .imu
+                .first()
+                .is_none_or(|first| first.time_stamp_sec > last_imu.time_stamp_sec)
+        {
+            measure_group.imu.insert(0, last_imu);
+        }
+        if let Some(current_tail_imu) = current_tail_imu {
+            self.last_imu_for_deskew = Some(current_tail_imu);
+        }
+        if let Some(first_imu) = measure_group.imu.first().cloned()
+            && first_imu.time_stamp_sec > measure_group.lidar.base_timestamp_sec
+        {
+            let mut begin_imu = first_imu;
+            begin_imu.time_stamp_sec = measure_group.lidar.base_timestamp_sec;
+            measure_group.imu.insert(0, begin_imu);
+        }
+        if let Some(last_imu) = measure_group.imu.last().cloned()
+            && last_imu.time_stamp_sec < measure_group.lidar.end_timestamp_sec()
+        {
+            let mut end_imu = last_imu;
+            end_imu.time_stamp_sec = measure_group.lidar.end_timestamp_sec();
+            measure_group.imu.push(end_imu);
+        }
+
         let map_points_before = self.local_map.len();
         let predicted_start_state = self.filter.state.clone();
         let segments = build_motion_segments(
