@@ -362,6 +362,7 @@ fn build_iesekf_factors(
     max_factor_points: Option<usize>,
 ) -> Vec<IesekfPointToPlaneFactor> {
     let total_points = preprocessed.points.len();
+    let mut query_scratch = local_map.create_query_scratch();
     preprocessed
         .points
         .iter()
@@ -373,7 +374,9 @@ fn build_iesekf_factors(
             let timed_point = timed_point.1;
             let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
             let point_w = filter.state.orientation * point_i + filter.state.position;
-            let matched = local_map.point_to_plane_match(point_w, config).ok()?;
+            let matched = local_map
+                .point_to_plane_match_with_scratch(point_w, config, &mut query_scratch)
+                .ok()?;
 
             Some(IesekfPointToPlaneFactor {
                 point_i,

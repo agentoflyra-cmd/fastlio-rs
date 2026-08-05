@@ -1,11 +1,15 @@
 use fastlio_types::{Mat3, PointXYZI, Vec3};
-use kiddo::{DonnellyCyclicSimdFull, KdTree, QueryResultItem, SquaredEuclidean, VecOfArrays};
+use kiddo::{
+    DonnellyCyclicSimdFull, KdTree, QueryResultItem, QueryScratch, SquaredEuclidean, VecOfArrays,
+};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 type MapKdTree =
     KdTree<f64, u32, DonnellyCyclicSimdFull<4>, VecOfArrays<f64, u32, 3, 4096>, 3, 4096>;
+type MapQueryScratch = QueryScratch<DonnellyCyclicSimdFull<4>, f64>;
+type KiddoNearestPoint = QueryResultItem<(), u32, f64>;
 
 /// Local scan-to-map storage with owned world-frame points and a k-d tree index.
 ///
@@ -28,6 +32,15 @@ struct MapDuplicateFilter {
 pub struct NearestPoint {
     pub index: usize,
     pub squared_distance: f64,
+}
+
+/// Reusable scratch storage for repeated local-map nearest-neighbour queries.
+///
+/// Create one scratch value per thread or per sequential association pass, then
+/// pass it to the `*_with_scratch` query methods to avoid repeated k-d tree
+/// traversal scratch setup.
+pub struct LocalMapQueryScratch {
+    inner: MapQueryScratch,
 }
 
 /// Tunable checks for local plane fitting.
@@ -185,7 +198,39 @@ impl LocalMap {
         }
     }
 
+    pub fn create_query_scratch(&self) -> LocalMapQueryScratch {
+        LocalMapQueryScratch {
+            inner: self.index.create_scratch::<SquaredEuclidean<f64>>(),
+        }
+    }
+
     pub fn nearest_n(&self, query_w: Vec3<f64>, count: usize) -> Vec<NearestPoint> {
+        if count == 0 || self.points.is_empty() {
+            return Vec::new();
+        }
+
+        let mut scratch = self.create_query_scratch();
+        self.nearest_n_with_scratch(query_w, count, &mut scratch)
+    }
+
+    pub fn nearest_n_with_scratch(
+        &self,
+        query_w: Vec3<f64>,
+        count: usize,
+        scratch: &mut LocalMapQueryScratch,
+    ) -> Vec<NearestPoint> {
+        self.nearest_n_raw_with_scratch(query_w, count, scratch)
+            .into_iter()
+            .map(nearest_point_from_kiddo)
+            .collect()
+    }
+
+    fn nearest_n_raw_with_scratch(
+        &self,
+        query_w: Vec3<f64>,
+        count: usize,
+        scratch: &mut LocalMapQueryScratch,
+    ) -> Vec<KiddoNearestPoint> {
         if count == 0 || self.points.is_empty() {
             return Vec::new();
         }
@@ -193,10 +238,8 @@ impl LocalMap {
         self.index
             .query(&[query_w.x, query_w.y, query_w.z])
             .nearest_n::<SquaredEuclidean<f64>>(NonZeroUsize::new(count).unwrap())
+            .with_scratch(&mut scratch.inner)
             .execute()
-            .into_iter()
-            .map(nearest_point_from_kiddo)
-            .collect()
     }
 
     pub fn crop_by_center_radius(&mut self, center_w: Vec3<f64>, radius_m: f64) {
@@ -223,8 +266,9 @@ impl LocalMap {
         count: usize,
         config: PlaneFitConfig,
     ) -> Result<PlaneFit, PlaneFitError> {
-        let neighbours = self.nearest_n(query_w, count);
-        self.fit_plane_from_neighbours(&neighbours, config)
+        let mut scratch = self.create_query_scratch();
+        let neighbours = self.nearest_n_raw_with_scratch(query_w, count, &mut scratch);
+        self.fit_plane_from_kiddo_neighbours(&neighbours, config)
     }
 
     pub fn point_to_plane_observation(
@@ -253,7 +297,17 @@ impl LocalMap {
         scan_point_w: Vec3<f64>,
         config: PointToPlaneConfig,
     ) -> Result<PointToPlaneMatch, PointToPlaneError> {
-        self.point_to_plane_match_with_neighbours(scan_point_w, config)
+        let mut scratch = self.create_query_scratch();
+        self.point_to_plane_match_with_scratch(scan_point_w, config, &mut scratch)
+    }
+
+    pub fn point_to_plane_match_with_scratch(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+        scratch: &mut LocalMapQueryScratch,
+    ) -> Result<PointToPlaneMatch, PointToPlaneError> {
+        self.point_to_plane_match_raw(scan_point_w, config, scratch)
             .map(|(matched, _)| matched)
     }
 
@@ -262,6 +316,24 @@ impl LocalMap {
         scan_point_w: Vec3<f64>,
         config: PointToPlaneConfig,
     ) -> Result<(PointToPlaneMatch, Vec<NearestPoint>), PointToPlaneError> {
+        let mut scratch = self.create_query_scratch();
+        let (matched, neighbours) =
+            self.point_to_plane_match_raw(scan_point_w, config, &mut scratch)?;
+        Ok((
+            matched,
+            neighbours
+                .into_iter()
+                .map(nearest_point_from_kiddo)
+                .collect(),
+        ))
+    }
+
+    fn point_to_plane_match_raw(
+        &self,
+        scan_point_w: Vec3<f64>,
+        config: PointToPlaneConfig,
+        scratch: &mut LocalMapQueryScratch,
+    ) -> Result<(PointToPlaneMatch, Vec<KiddoNearestPoint>), PointToPlaneError> {
         if !scan_point_w.x.is_finite() || !scan_point_w.y.is_finite() || !scan_point_w.z.is_finite()
         {
             return Err(PointToPlaneError::NonFiniteScanPoint);
@@ -275,7 +347,8 @@ impl LocalMap {
             return Err(PointToPlaneError::InvalidConfig);
         }
 
-        let neighbours = self.nearest_n(scan_point_w, config.nearest_count);
+        let neighbours =
+            self.nearest_n_raw_with_scratch(scan_point_w, config.nearest_count, scratch);
         if neighbours.len() < config.plane.min_points.max(3) {
             return Err(PointToPlaneError::PlaneFit(
                 PlaneFitError::NotEnoughPoints {
@@ -288,7 +361,7 @@ impl LocalMap {
         let max_squared_distance = config.max_neighbour_distance * config.max_neighbour_distance;
         let farthest_squared_distance = neighbours
             .last()
-            .map(|neighbour| neighbour.squared_distance)
+            .map(|neighbour| neighbour.distance)
             .unwrap_or(f64::INFINITY);
         if farthest_squared_distance > max_squared_distance {
             return Err(PointToPlaneError::NeighbourTooFar {
@@ -298,7 +371,7 @@ impl LocalMap {
         }
 
         let plane = self
-            .fit_plane_from_neighbours(&neighbours, config.plane)
+            .fit_plane_from_kiddo_neighbours(&neighbours, config.plane)
             .map_err(PointToPlaneError::PlaneFit)?;
         let residual = plane.normal_w.dot(&scan_point_w) + plane.offset;
 
@@ -381,14 +454,14 @@ impl LocalMap {
         filter.has_near_duplicate(&self.points, point, min_squared_distance)
     }
 
-    fn fit_plane_from_neighbours(
+    fn fit_plane_from_kiddo_neighbours(
         &self,
-        neighbours: &[NearestPoint],
+        neighbours: &[KiddoNearestPoint],
         config: PlaneFitConfig,
     ) -> Result<PlaneFit, PlaneFitError> {
         fit_plane_from_indices(
             &self.points,
-            neighbours.iter().map(|neighbour| neighbour.index),
+            neighbours.iter().map(|neighbour| neighbour.item as usize),
             config,
         )
     }
@@ -633,6 +706,21 @@ mod tests {
     }
 
     #[test]
+    fn nearest_n_with_scratch_matches_default_query() {
+        let map = LocalMap::from_points(vec![
+            point(10.0, 0.0, 0.0),
+            point(1.0, 0.0, 0.0),
+            point(3.0, 0.0, 0.0),
+        ]);
+        let mut scratch = map.create_query_scratch();
+
+        let expected = map.nearest_n(Vec3::zeros(), 3);
+        let actual = map.nearest_n_with_scratch(Vec3::zeros(), 3, &mut scratch);
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn nearest_n_clamps_to_map_size() {
         let map = LocalMap::from_points(vec![point(1.0, 0.0, 0.0)]);
 
@@ -850,6 +938,33 @@ mod tests {
         assert!((observation.residual.abs() - 0.05).abs() < 1.0e-6);
         assert!(observation.weight > 0.0);
         assert!(observation.weight <= 1.0);
+    }
+
+    #[test]
+    fn point_to_plane_match_with_scratch_matches_default_query() {
+        let map = LocalMap::from_points(vec![
+            point(-1.0, -1.0, 2.0),
+            point(1.0, -1.0, 2.0),
+            point(-1.0, 1.0, 2.0),
+            point(1.0, 1.0, 2.0),
+            point(0.0, 0.0, 2.0),
+        ]);
+        let config = PointToPlaneConfig {
+            nearest_count: 5,
+            max_neighbour_distance: 3.0,
+            max_absolute_residual: 0.2,
+            plane: PlaneFitConfig::default(),
+        };
+        let mut scratch = map.create_query_scratch();
+
+        let expected = map
+            .point_to_plane_match(Vec3::new(0.25, -0.25, 2.05), config)
+            .unwrap();
+        let actual = map
+            .point_to_plane_match_with_scratch(Vec3::new(0.25, -0.25, 2.05), config, &mut scratch)
+            .unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
