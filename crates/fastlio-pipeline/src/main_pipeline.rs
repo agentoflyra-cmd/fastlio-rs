@@ -25,6 +25,8 @@ pub struct PipelineConfig {
     pub min_effective_observations: usize,
     pub map_crop_radius: Option<f64>,
     pub insert_scan_points: bool,
+    pub max_factor_points: Option<usize>,
+    pub max_map_insert_points: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -114,6 +116,7 @@ impl FastLioPipeline {
                 &self.extrinsic,
                 &preprocessed,
                 self.config.point_to_plane,
+                self.config.max_factor_points,
             );
         }
         let effective_observations = factors.len();
@@ -134,6 +137,7 @@ impl FastLioPipeline {
                 &self.extrinsic,
                 self.filter.state.orientation,
                 self.filter.state.position,
+                self.config.max_map_insert_points,
             );
             self.local_map.insert_points(map_points);
         }
@@ -176,11 +180,18 @@ fn build_iesekf_factors(
     extrinsic: &LidarImuExtrinsic,
     preprocessed: &LidarFrame,
     config: PointToPlaneConfig,
+    max_factor_points: Option<usize>,
 ) -> Vec<IesekfPointToPlaneFactor> {
+    let total_points = preprocessed.points.len();
     preprocessed
         .points
         .iter()
+        .enumerate()
+        .filter(move |(point_index, _)| {
+            should_sample_point(*point_index, total_points, max_factor_points)
+        })
         .filter_map(|timed_point| {
+            let timed_point = timed_point.1;
             let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
             let point_w = filter.state.orientation * point_i + filter.state.position;
             let observation = local_map.point_to_plane_observation(point_w, config).ok()?;
@@ -199,11 +210,18 @@ fn transform_lidar_frame_to_world(
     extrinsic: &LidarImuExtrinsic,
     rotation_wi: nalgebra::UnitQuaternion<f64>,
     position_wi: Vec3<f64>,
+    max_map_insert_points: Option<usize>,
 ) -> Vec<PointXYZI> {
+    let total_points = lidar.points.len();
     lidar
         .points
         .iter()
+        .enumerate()
+        .filter(move |(point_index, _)| {
+            should_sample_point(*point_index, total_points, max_map_insert_points)
+        })
         .map(|timed_point| {
+            let timed_point = timed_point.1;
             let point_i = extrinsic.transform_point(&timed_point.point.to_vec3_f64());
             let point_w = rotation_wi * point_i + position_wi;
             PointXYZI {
@@ -214,6 +232,17 @@ fn transform_lidar_frame_to_world(
             }
         })
         .collect()
+}
+
+fn should_sample_point(point_index: usize, total_points: usize, max_points: Option<usize>) -> bool {
+    let Some(max_points) = max_points else {
+        return true;
+    };
+    if max_points == 0 {
+        return false;
+    }
+    let step = total_points.div_ceil(max_points).max(1);
+    point_index.is_multiple_of(step)
 }
 
 #[cfg(test)]
@@ -282,7 +311,26 @@ mod tests {
             min_effective_observations,
             map_crop_radius: None,
             insert_scan_points: true,
+            max_factor_points: None,
+            max_map_insert_points: None,
         }
+    }
+
+    #[test]
+    fn point_sampling_respects_none_zero_and_finite_limits() {
+        let all: Vec<_> = (0..5)
+            .filter(|idx| should_sample_point(*idx, 5, None))
+            .collect();
+        let none: Vec<_> = (0..5)
+            .filter(|idx| should_sample_point(*idx, 5, Some(0)))
+            .collect();
+        let limited: Vec<_> = (0..10)
+            .filter(|idx| should_sample_point(*idx, 10, Some(3)))
+            .collect();
+
+        assert_eq!(all, vec![0, 1, 2, 3, 4]);
+        assert!(none.is_empty());
+        assert_eq!(limited, vec![0, 4, 8]);
     }
 
     fn pipeline(initial_position: Vec3<f64>, local_map: LocalMap) -> FastLioPipeline {

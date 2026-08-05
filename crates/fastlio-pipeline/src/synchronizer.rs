@@ -5,18 +5,29 @@ use std::collections::VecDeque;
 #[derive(Default)]
 pub struct MeasurementSynchronizer {
     pub imu_queue: VecDeque<ImuSample>,
-    pub pending_lidar: Option<LidarFrame>,
+    pub pending_lidar: VecDeque<LidarFrame>,
     pub last_imu_time_sec: Option<f64>,
     pub last_lidar_time_sec: Option<f64>,
+    pub dropped_lidar_without_begin_imu: usize,
+    pub first_lidar_drop_without_begin_imu: Option<LidarDropWithoutBeginImu>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LidarDropWithoutBeginImu {
+    pub lidar_base_time_sec: f64,
+    pub lidar_end_time_sec: f64,
+    pub first_imu_time_sec: f64,
 }
 
 impl MeasurementSynchronizer {
     pub fn new() -> Self {
         Self {
             imu_queue: VecDeque::new(),
-            pending_lidar: None,
+            pending_lidar: VecDeque::new(),
             last_imu_time_sec: None,
             last_lidar_time_sec: None,
+            dropped_lidar_without_begin_imu: 0,
+            first_lidar_drop_without_begin_imu: None,
         }
     }
 
@@ -32,14 +43,34 @@ impl MeasurementSynchronizer {
     }
 
     fn try_build_group(&mut self) -> Result<Option<MeasureGroup>> {
-        let Some(lidar) = self.pending_lidar.as_ref() else {
-            return Ok(None);
-        };
-        if !self.imus_covers_lidar(lidar) {
-            return Ok(None);
+        loop {
+            let Some(lidar) = self.pending_lidar.front() else {
+                return Ok(None);
+            };
+
+            if let Some(first_imu) = self.imu_queue.front()
+                && first_imu.time_stamp_sec > lidar.base_timestamp_sec
+            {
+                self.first_lidar_drop_without_begin_imu
+                    .get_or_insert(LidarDropWithoutBeginImu {
+                        lidar_base_time_sec: lidar.base_timestamp_sec,
+                        lidar_end_time_sec: lidar.end_timestamp_sec(),
+                        first_imu_time_sec: first_imu.time_stamp_sec,
+                    });
+                self.pending_lidar.pop_front();
+                self.dropped_lidar_without_begin_imu += 1;
+                continue;
+            }
+
+            if !self.imus_covers_lidar(lidar) {
+                return Ok(None);
+            }
+
+            break;
         }
-        // lidar frame must exist here, so unwrap is safe here.
-        let lidar = self.pending_lidar.take().unwrap();
+
+        // Front LiDAR frame exists and is covered, so pop_front() is safe here.
+        let lidar = self.pending_lidar.pop_front().unwrap();
 
         let mut start_idx = 0;
         while start_idx + 1 < self.imu_queue.len()
@@ -70,6 +101,14 @@ impl MeasurementSynchronizer {
         Ok(Some(measure_group))
     }
 
+    pub fn drain_ready(&mut self) -> Result<Vec<MeasureGroup>> {
+        let mut groups = Vec::new();
+        while let Some(group) = self.try_build_group()? {
+            groups.push(group);
+        }
+        Ok(groups)
+    }
+
     pub fn pend_imu(&mut self, imu: ImuSample) -> Result<Option<MeasureGroup>> {
         if let Some(last_time_sec) = self.last_imu_time_sec
             && imu.time_stamp_sec < last_time_sec
@@ -86,9 +125,6 @@ impl MeasurementSynchronizer {
     }
 
     pub fn pend_lidar(&mut self, lidar: LidarFrame) -> Result<Option<MeasureGroup>> {
-        if self.pending_lidar.is_some() {
-            anyhow::bail!("last lidar frame not ready to be processed.");
-        }
         if lidar.end_timestamp_sec() < lidar.base_timestamp_sec {
             anyhow::bail!("lidar time begin > end");
         }
@@ -102,7 +138,7 @@ impl MeasurementSynchronizer {
             );
         }
         self.last_lidar_time_sec = Some(lidar.base_timestamp_sec);
-        self.pending_lidar = Some(lidar);
+        self.pending_lidar.push_back(lidar);
         self.try_build_group()
     }
 }
@@ -180,10 +216,11 @@ mod test {
     }
 
     #[test]
-    fn new_lidar_before_previous_processed_is_error() {
+    fn multiple_lidar_frames_can_wait_for_future_imu() {
         let mut sync = MeasurementSynchronizer::new();
         sync.pend_lidar(lidar(0.0, 1.0)).unwrap();
-        assert!(sync.pend_lidar(lidar(1.0, 2.0)).is_err());
+        assert!(sync.pend_lidar(lidar(1.0, 2.0)).unwrap().is_none());
+        assert_eq!(sync.pending_lidar.len(), 2);
     }
 
     #[test]
@@ -322,9 +359,44 @@ mod test {
             "expected no group when IMU does not cover scan end"
         );
         assert!(
-            sync.pending_lidar.is_some(),
+            !sync.pending_lidar.is_empty(),
             "pending lidar should remain when sync is not yet possible"
         );
+    }
+
+    #[test]
+    fn drain_ready_returns_all_covered_lidar_frames_in_order() {
+        let mut sync = MeasurementSynchronizer::new();
+        sync.pend_lidar(lidar(0.0, 1.0)).unwrap();
+        sync.pend_lidar(lidar(1.0, 2.0)).unwrap();
+        let mut groups = Vec::new();
+        if let Some(group) = sync.pend_imu(imu(0.0)).unwrap() {
+            groups.push(group);
+        }
+        if let Some(group) = sync.pend_imu(imu(1.0)).unwrap() {
+            groups.push(group);
+        }
+        if let Some(group) = sync.pend_imu(imu(2.0)).unwrap() {
+            groups.push(group);
+        }
+
+        groups.extend(sync.drain_ready().unwrap());
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].lidar.base_timestamp_sec, 0.0);
+        assert_eq!(groups[1].lidar.base_timestamp_sec, 1.0);
+    }
+
+    #[test]
+    fn stale_lidar_before_first_imu_is_dropped_without_blocking_later_lidar() {
+        let mut sync = MeasurementSynchronizer::new();
+        sync.pend_lidar(lidar(0.0, 0.5)).unwrap();
+        sync.pend_lidar(lidar(1.0, 2.0)).unwrap();
+        assert!(sync.pend_imu(imu(1.0)).unwrap().is_none());
+        let group = sync.pend_imu(imu(2.0)).unwrap().unwrap();
+
+        assert_eq!(sync.dropped_lidar_without_begin_imu, 1);
+        assert_eq!(group.lidar.base_timestamp_sec, 1.0);
     }
 
     #[test]

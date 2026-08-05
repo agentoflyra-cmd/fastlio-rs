@@ -5,7 +5,7 @@ use nalgebra::UnitQuaternion;
 
 use crate::trajectory::MotionSegment;
 
-const TIME_EPS: f64 = 1.0e-9;
+const TIME_EPS: f64 = 1.0e-6;
 
 pub fn build_motion_segments(
     measure_group: &MeasureGroup,

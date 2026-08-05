@@ -25,7 +25,7 @@ impl SensorEvent {
         match result {
             ros2_dispatch::DecodedMessageBorrowed::LivoxRosDriver2CustomMsg(custom_msg) => {
                 let mut max_offset = 0;
-                let points = custom_msg
+                let mut points: Vec<_> = custom_msg
                     .points
                     .iter()
                     .map(|e| {
@@ -43,6 +43,7 @@ impl SensorEvent {
                         }
                     })
                     .collect();
+                sort_points_by_offset_time(&mut points);
                 let msg = LidarFrame::new(
                     custom_msg.timebase as f64 / 1e9,
                     custom_msg.timebase as f64 / 1e9 + max_offset as f64 / 1e9,
@@ -149,9 +150,38 @@ where
     Ok(stats)
 }
 
+fn sort_points_by_offset_time(points: &mut [TimedPoint]) {
+    points.sort_by(|a, b| a.offset_time_sec.total_cmp(&b.offset_time_sec));
+}
+
 #[cfg(test)]
 mod test {
-    use crate::read_mcap_events;
+    use fastlio_types::{PointXYZI, TimedPoint};
+
+    use crate::{read_mcap_events, sort_points_by_offset_time};
+
+    fn point(offset_time_sec: f64) -> TimedPoint {
+        TimedPoint {
+            offset_time_sec,
+            point: PointXYZI {
+                x: offset_time_sec as f32,
+                y: 0.0,
+                z: 0.0,
+                intensity: 1.0,
+            },
+            tag: 0,
+            line: 0,
+        }
+    }
+
+    #[test]
+    fn livox_points_are_normalized_to_offset_time_order() {
+        let mut points = vec![point(0.3), point(0.1), point(0.2), point(0.2)];
+        sort_points_by_offset_time(&mut points);
+        let offsets: Vec<_> = points.iter().map(|point| point.offset_time_sec).collect();
+
+        assert_eq!(offsets, vec![0.1, 0.2, 0.2, 0.3]);
+    }
 
     #[test]
     #[ignore]

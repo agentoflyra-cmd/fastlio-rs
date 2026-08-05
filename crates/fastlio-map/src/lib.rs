@@ -1,16 +1,19 @@
 use fastlio_types::{Mat3, PointXYZI, Vec3};
-use kiddo::{KdTree, NearestNeighbour, SquaredEuclidean};
+use kiddo::{DonnellyCyclicSimdFull, KdTree, QueryResultItem, SquaredEuclidean, VecOfArrays};
 use std::cmp::Ordering;
+use std::num::NonZeroUsize;
+
+type MapKdTree =
+    KdTree<f64, u32, DonnellyCyclicSimdFull<4>, VecOfArrays<f64, u32, 3, 4096>, 3, 4096>;
 
 /// Local scan-to-map storage with owned world-frame points and a k-d tree index.
 ///
 /// Points inserted into this map are expected to already be expressed in the
 /// world/map frame `W`, in meters. The map owns the points; the `kiddo` index is
 /// rebuilt after mutations and stores point indexes back into `points`.
-#[derive(Debug)]
 pub struct LocalMap {
     points: Vec<PointXYZI>,
-    index: KdTree<f64, 3>,
+    index: MapKdTree,
 }
 
 /// A nearest-neighbour hit returned by [`LocalMap`].
@@ -133,8 +136,19 @@ impl LocalMap {
     where
         I: IntoIterator<Item = PointXYZI>,
     {
-        self.points.extend(points);
-        self.rebuild_index();
+        for point in points {
+            let point_index = self.points.len();
+            if self
+                .index
+                .add(
+                    &[point.x as f64, point.y as f64, point.z as f64],
+                    point_index as u32,
+                )
+                .is_ok()
+            {
+                self.points.push(point);
+            }
+        }
     }
 
     pub fn nearest_n(&self, query_w: Vec3<f64>, count: usize) -> Vec<NearestPoint> {
@@ -143,7 +157,9 @@ impl LocalMap {
         }
 
         self.index
-            .nearest_n::<SquaredEuclidean>(&[query_w.x, query_w.y, query_w.z], count)
+            .query(&[query_w.x, query_w.y, query_w.z])
+            .nearest_n::<SquaredEuclidean<f64>>(NonZeroUsize::new(count).unwrap())
+            .execute()
             .into_iter()
             .map(nearest_point_from_kiddo)
             .collect()
@@ -157,9 +173,12 @@ impl LocalMap {
         }
 
         let radius_squared = radius_m * radius_m;
+        let old_len = self.points.len();
         self.points
             .retain(|point| squared_distance(point, &center_w) <= radius_squared);
-        self.rebuild_index();
+        if self.points.len() != old_len {
+            self.rebuild_index();
+        }
     }
 
     pub fn fit_plane_from_nearest(
@@ -257,15 +276,20 @@ impl Default for LocalMap {
     }
 }
 
-fn build_index(points: &[PointXYZI]) -> KdTree<f64, 3> {
-    let entries: Vec<[f64; 3]> = points
-        .iter()
-        .map(|point| [point.x as f64, point.y as f64, point.z as f64])
-        .collect();
-    (&entries).into()
+fn build_index(points: &[PointXYZI]) -> MapKdTree {
+    let mut index = MapKdTree::default();
+    for (point_index, point) in points.iter().enumerate() {
+        index
+            .add(
+                &[point.x as f64, point.y as f64, point.z as f64],
+                point_index as u32,
+            )
+            .ok();
+    }
+    index
 }
 
-fn nearest_point_from_kiddo(neighbour: NearestNeighbour<f64, u64>) -> NearestPoint {
+fn nearest_point_from_kiddo(neighbour: QueryResultItem<(), u32, f64>) -> NearestPoint {
     NearestPoint {
         index: neighbour.item as usize,
         squared_distance: neighbour.distance,
@@ -418,6 +442,19 @@ mod tests {
 
         assert_eq!(map.len(), 2);
         assert_eq!(hits[0].index, 1);
+    }
+
+    #[test]
+    fn index_build_accepts_many_points_with_same_axis_value() {
+        let points = (0..128)
+            .map(|idx| point(1.0, idx as f32 * 0.01, 0.0))
+            .collect();
+        let map = LocalMap::from_points(points);
+
+        let hits = map.nearest_n(Vec3::new(1.0, 0.0, 0.0), 5);
+
+        assert_eq!(map.len(), 128);
+        assert_eq!(hits.len(), 5);
     }
 
     #[test]

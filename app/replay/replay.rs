@@ -1,6 +1,9 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,7 +26,7 @@ fn main() -> Result<()> {
     let config = read_from_config_path(&args.config_path)
         .with_context(|| format!("failed to read config `{}`", args.config_path))?;
     let mut replay = OfflineReplay::new(config)?;
-    let stats = read_mcap_events(&args.bag_path, |event| replay.on_event(event))
+    let stats = run_spsc_replay(&args, &mut replay)
         .with_context(|| format!("failed to replay MCAP `{}`", args.bag_path))?;
 
     let trajectory_path = args.output_dir.join("trajectory.csv");
@@ -51,22 +54,132 @@ struct ReplayArgs {
     bag_path: Utf8PathBuf,
     config_path: Utf8PathBuf,
     output_dir: Utf8PathBuf,
+    playback_rate: f64,
+    channel_capacity: usize,
 }
 
 impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
-        if args.len() != 4 {
+        if !(4..=6).contains(&args.len()) {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir>",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
+        }
+        let playback_rate = if let Some(rate) = args.get(4) {
+            rate.parse::<f64>()
+                .with_context(|| format!("invalid playback_rate `{rate}`"))?
+        } else {
+            0.0
+        };
+        if playback_rate < 0.0 || !playback_rate.is_finite() {
+            bail!("playback_rate must be finite and non-negative");
+        }
+
+        let channel_capacity = if let Some(capacity) = args.get(5) {
+            capacity
+                .parse::<usize>()
+                .with_context(|| format!("invalid channel_capacity `{capacity}`"))?
+        } else {
+            1024
+        };
+        if channel_capacity == 0 {
+            bail!("channel_capacity must be positive");
         }
 
         Ok(Self {
             bag_path: Utf8PathBuf::from(&args[1]),
             config_path: Utf8PathBuf::from(&args[2]),
             output_dir: Utf8PathBuf::from(&args[3]),
+            playback_rate,
+            channel_capacity,
         })
+    }
+}
+
+enum ReplayMessage {
+    Event(SensorEvent),
+    Finished(Result<fastlio_dataset::ReadStats, String>),
+}
+
+fn run_spsc_replay(
+    args: &ReplayArgs,
+    replay: &mut OfflineReplay,
+) -> Result<fastlio_dataset::ReadStats> {
+    let (sender, receiver) = mpsc::sync_channel(args.channel_capacity);
+    let bag_path = args.bag_path.clone();
+    let producer = thread::spawn(move || produce_events(bag_path, sender));
+
+    let stats = consume_events(receiver, replay, args.playback_rate)?;
+    producer
+        .join()
+        .map_err(|_| anyhow::anyhow!("replay producer thread panicked"))?;
+    Ok(stats)
+}
+
+fn produce_events(bag_path: Utf8PathBuf, sender: SyncSender<ReplayMessage>) {
+    let event_sender = sender.clone();
+    let result = read_mcap_events(&bag_path, |event| {
+        event_sender
+            .send(ReplayMessage::Event(event))
+            .map_err(|_| anyhow::anyhow!("replay consumer stopped"))?;
+        Ok(())
+    })
+    .map_err(|err| format!("{err:#}"));
+
+    let _ = sender.send(ReplayMessage::Finished(result));
+}
+
+fn consume_events(
+    receiver: Receiver<ReplayMessage>,
+    replay: &mut OfflineReplay,
+    playback_rate: f64,
+) -> Result<fastlio_dataset::ReadStats> {
+    let mut clock = PlaybackClock::new(playback_rate);
+    while let Ok(message) = receiver.recv() {
+        match message {
+            ReplayMessage::Event(event) => {
+                clock.sleep_until_event_time(event.timestamp_sec());
+                replay.on_event(event)?;
+            }
+            ReplayMessage::Finished(result) => return result.map_err(|err| anyhow::anyhow!(err)),
+        }
+    }
+
+    bail!("replay producer stopped before sending completion stats")
+}
+
+struct PlaybackClock {
+    playback_rate: f64,
+    first_sensor_time: Option<f64>,
+    wall_start: Instant,
+}
+
+impl PlaybackClock {
+    fn new(playback_rate: f64) -> Self {
+        Self {
+            playback_rate,
+            first_sensor_time: None,
+            wall_start: Instant::now(),
+        }
+    }
+
+    fn sleep_until_event_time(&mut self, sensor_time_sec: f64) {
+        if self.playback_rate <= 0.0 || !sensor_time_sec.is_finite() {
+            return;
+        }
+
+        let first_sensor_time = *self.first_sensor_time.get_or_insert(sensor_time_sec);
+        let sensor_elapsed = sensor_time_sec - first_sensor_time;
+        if sensor_elapsed <= 0.0 {
+            return;
+        }
+
+        let target_wall_elapsed = Duration::from_secs_f64(sensor_elapsed / self.playback_rate);
+        let elapsed = self.wall_start.elapsed();
+        if target_wall_elapsed > elapsed {
+            thread::sleep(target_wall_elapsed - elapsed);
+        }
     }
 }
 
@@ -89,6 +202,11 @@ struct OfflineReplay {
     tracking_frames: usize,
     bootstrap_frames: usize,
     failed_groups: usize,
+    max_pending_lidar: usize,
+    first_imu_time_sec: Option<f64>,
+    last_imu_time_sec: Option<f64>,
+    first_lidar_time_sec: Option<f64>,
+    last_lidar_time_sec: Option<f64>,
 }
 
 impl OfflineReplay {
@@ -126,6 +244,8 @@ impl OfflineReplay {
             min_effective_observations: 10,
             map_crop_radius: Some(100.0),
             insert_scan_points: true,
+            max_factor_points: Some(2_000),
+            max_map_insert_points: Some(5_000),
         };
 
         Ok(Self {
@@ -142,38 +262,58 @@ impl OfflineReplay {
             tracking_frames: 0,
             bootstrap_frames: 0,
             failed_groups: 0,
+            max_pending_lidar: 0,
+            first_imu_time_sec: None,
+            last_imu_time_sec: None,
+            first_lidar_time_sec: None,
+            last_lidar_time_sec: None,
         })
     }
 
     fn on_event(&mut self, event: SensorEvent) -> Result<()> {
         let group = match event {
-            SensorEvent::Imu(imu) => self.synchronizer.pend_imu(imu)?,
-            SensorEvent::Lidar(lidar) => self.synchronizer.pend_lidar(lidar)?,
+            SensorEvent::Imu(imu) => {
+                self.first_imu_time_sec.get_or_insert(imu.time_stamp_sec);
+                self.last_imu_time_sec = Some(imu.time_stamp_sec);
+                self.synchronizer.pend_imu(imu)?
+            }
+            SensorEvent::Lidar(lidar) => {
+                self.first_lidar_time_sec
+                    .get_or_insert(lidar.base_timestamp_sec);
+                self.last_lidar_time_sec = Some(lidar.base_timestamp_sec);
+                self.synchronizer.pend_lidar(lidar)?
+            }
         };
 
         if let Some(group) = group {
-            let timestamp_sec = group.lidar.end_timestamp_sec();
-            match self.pipeline.process_measurement_group(group) {
-                Ok(report) => {
-                    self.processed_frames += 1;
-                    match report.mode {
-                        PipelineMode::BootstrapMap => self.bootstrap_frames += 1,
-                        PipelineMode::Tracking => self.tracking_frames += 1,
-                    }
-                    self.push_trajectory_row(
-                        timestamp_sec,
-                        report.mode,
-                        report.effective_observations,
-                    );
-                }
-                Err(err) => {
-                    self.failed_groups += 1;
-                    eprintln!("frame processing failed at {timestamp_sec:.6}: {err:#}");
-                }
-            }
+            self.process_group(group);
         }
+        for group in self.synchronizer.drain_ready()? {
+            self.process_group(group);
+        }
+        self.max_pending_lidar = self
+            .max_pending_lidar
+            .max(self.synchronizer.pending_lidar.len());
 
         Ok(())
+    }
+
+    fn process_group(&mut self, group: fastlio_types::MeasureGroup) {
+        let timestamp_sec = group.lidar.end_timestamp_sec();
+        match self.pipeline.process_measurement_group(group) {
+            Ok(report) => {
+                self.processed_frames += 1;
+                match report.mode {
+                    PipelineMode::BootstrapMap => self.bootstrap_frames += 1,
+                    PipelineMode::Tracking => self.tracking_frames += 1,
+                }
+                self.push_trajectory_row(timestamp_sec, report.mode, report.effective_observations);
+            }
+            Err(err) => {
+                self.failed_groups += 1;
+                eprintln!("frame processing failed at {timestamp_sec:.6}: {err:#}");
+            }
+        }
     }
 
     fn push_trajectory_row(
@@ -293,12 +433,55 @@ fn write_summary(
     writeln!(writer, "tracking_frames={}", replay.tracking_frames)?;
     writeln!(writer, "bootstrap_frames={}", replay.bootstrap_frames)?;
     writeln!(writer, "failed_groups={}", replay.failed_groups)?;
+    writeln!(writer, "max_pending_lidar={}", replay.max_pending_lidar)?;
+    writeln!(
+        writer,
+        "first_imu_time_sec={}",
+        format_optional_f64(replay.first_imu_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "last_imu_time_sec={}",
+        format_optional_f64(replay.last_imu_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "first_lidar_time_sec={}",
+        format_optional_f64(replay.first_lidar_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "last_lidar_time_sec={}",
+        format_optional_f64(replay.last_lidar_time_sec)
+    )?;
+    writeln!(
+        writer,
+        "dropped_lidar_without_begin_imu={}",
+        replay.synchronizer.dropped_lidar_without_begin_imu
+    )?;
+    if let Some(drop) = replay.synchronizer.first_lidar_drop_without_begin_imu {
+        writeln!(
+            writer,
+            "first_lidar_drop_without_begin_imu={:.9},{:.9},{:.9}",
+            drop.lidar_base_time_sec, drop.lidar_end_time_sec, drop.first_imu_time_sec
+        )?;
+    } else {
+        writeln!(writer, "first_lidar_drop_without_begin_imu=none")?;
+    }
     writeln!(writer, "map_points={}", replay.pipeline.local_map.len())?;
     writeln!(writer)?;
     writeln!(writer, "minimal_implementation_notes=")?;
     writeln!(
         writer,
-        "- callback replay only; no SPSC queue, playback rate control, sleep, pause, or backpressure yet"
+        "- SPSC replay is implemented with a bounded std::sync::mpsc::sync_channel and optional sensor-time playback_rate"
+    )?;
+    writeln!(
+        writer,
+        "- replay limits scan-to-map association to 2000 deterministic scan samples and map insertion to 5000 deterministic scan samples per frame"
+    )?;
+    writeln!(
+        writer,
+        "- pending LiDAR frames are queued in MeasurementSynchronizer; no frame dropping policy yet"
     )?;
     writeln!(
         writer,
@@ -317,4 +500,8 @@ fn write_summary(
         "- failed synchronized frames are counted and skipped; no retry or queue-based recovery yet"
     )?;
     Ok(())
+}
+
+fn format_optional_f64(value: Option<f64>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| format!("{value:.9}"))
 }
