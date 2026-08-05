@@ -14,7 +14,9 @@ use fastlio_dataset::{SensorEvent, read_mcap_events};
 use fastlio_estimator::iesekf::{ErrorStateCovariance, Iesekf, IesekfConfig};
 use fastlio_imu::ImuIntegrator;
 use fastlio_map::{LocalMap, PointToPlaneConfig};
-use fastlio_pipeline::main_pipeline::{FastLioPipeline, PipelineConfig, PipelineMode};
+use fastlio_pipeline::main_pipeline::{
+    FastLioPipeline, PipelineConfig, PipelineMode, PipelineStageTimings,
+};
 use fastlio_pipeline::synchronizer::MeasurementSynchronizer;
 use fastlio_types::{
     Config, LidarImuExtrinsic, NavState, PointXYZI, Pose3, Vec3, read_from_config_path,
@@ -37,10 +39,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("failed to replay MCAP `{}`", args.bag_path))?;
 
     let trajectory_path = args.output_dir.join("trajectory.csv");
+    let latency_path = args.output_dir.join("latency.csv");
     let map_path = args.output_dir.join("map.pcd");
     let summary_path = args.output_dir.join("summary.txt");
 
     write_trajectory_csv(&trajectory_path, &replay.trajectory)?;
+    write_latency_csv(&latency_path, &replay.latency)?;
     write_ascii_pcd(&map_path, replay.pipeline.local_map.points())?;
     write_summary(&summary_path, stats, &replay)?;
     open_viewer(&args.viewer, &map_path)?;
@@ -53,6 +57,7 @@ fn main() -> Result<()> {
     println!("  failed groups: {}", replay.failed_groups);
     println!("  map points: {}", replay.pipeline.local_map.len());
     println!("  trajectory: {trajectory_path}");
+    println!("  latency: {latency_path}");
     println!("  map: {map_path}");
     println!("  summary: {summary_path}");
 
@@ -434,6 +439,18 @@ struct TrajectoryRow {
     map_points: usize,
 }
 
+#[derive(Debug, Clone)]
+struct LatencyRow {
+    frame_index: usize,
+    timestamp_sec: f64,
+    mode: PipelineMode,
+    effective_observations: usize,
+    map_points: usize,
+    end_to_end: Duration,
+    live_stream: Duration,
+    pipeline: PipelineStageTimings,
+}
+
 struct OfflineReplay {
     synchronizer: MeasurementSynchronizer,
     pipeline: FastLioPipeline,
@@ -441,6 +458,7 @@ struct OfflineReplay {
     /// `t_imu_for_sync = t_imu_raw - time_offset_lidar_to_imu_sec`.
     time_offset_lidar_to_imu_sec: f64,
     trajectory: Vec<TrajectoryRow>,
+    latency: Vec<LatencyRow>,
     processed_frames: usize,
     initializing_frames: usize,
     tracking_frames: usize,
@@ -514,6 +532,7 @@ impl OfflineReplay {
             ),
             time_offset_lidar_to_imu_sec,
             trajectory: Vec::new(),
+            latency: Vec::new(),
             processed_frames: 0,
             initializing_frames: 0,
             tracking_frames: 0,
@@ -569,6 +588,7 @@ impl OfflineReplay {
 
     fn process_group(&mut self, group: fastlio_types::MeasureGroup) {
         let timestamp_sec = group.lidar.end_timestamp_sec();
+        let end_to_end_start = Instant::now();
         match self.pipeline.process_measurement_group(group) {
             Ok(report) => {
                 self.processed_frames += 1;
@@ -578,12 +598,24 @@ impl OfflineReplay {
                     PipelineMode::Tracking => self.tracking_frames += 1,
                 }
                 self.push_trajectory_row(timestamp_sec, report.mode, report.effective_observations);
+                let live_stream_start = Instant::now();
                 if let Some(live_stream) = &mut self.live_stream
                     && let Err(err) = live_stream.send_map_delta(self.pipeline.local_map.points())
                 {
                     eprintln!("live viewer stream failed at {timestamp_sec:.6}: {err:#}");
                     self.live_stream = None;
                 }
+                let live_stream_duration = live_stream_start.elapsed();
+                self.latency.push(LatencyRow {
+                    frame_index: self.processed_frames,
+                    timestamp_sec,
+                    mode: report.mode,
+                    effective_observations: report.effective_observations,
+                    map_points: self.pipeline.local_map.len(),
+                    end_to_end: end_to_end_start.elapsed(),
+                    live_stream: live_stream_duration,
+                    pipeline: report.timings,
+                });
             }
             Err(err) => {
                 self.failed_groups += 1;
@@ -650,6 +682,41 @@ fn write_trajectory_csv(path: &Utf8Path, trajectory: &[TrajectoryRow]) -> Result
             row.mode,
             row.effective_observations,
             row.map_points
+        )?;
+    }
+    Ok(())
+}
+
+fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create latency `{path}`"))?,
+    );
+    writeln!(
+        writer,
+        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,update_ms,map_insert_ms,map_crop_ms"
+    )?;
+    for row in latency {
+        writeln!(
+            writer,
+            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            row.frame_index,
+            row.timestamp_sec,
+            row.mode,
+            row.effective_observations,
+            row.map_points,
+            duration_ms(row.end_to_end),
+            duration_ms(row.live_stream),
+            duration_ms(row.pipeline.total),
+            duration_ms(row.pipeline.imu_boundary),
+            duration_ms(row.pipeline.initialization),
+            duration_ms(row.pipeline.motion_segments),
+            duration_ms(row.pipeline.predict),
+            duration_ms(row.pipeline.deskew),
+            duration_ms(row.pipeline.preprocess),
+            duration_ms(row.pipeline.association),
+            duration_ms(row.pipeline.update),
+            duration_ms(row.pipeline.map_insert),
+            duration_ms(row.pipeline.map_crop),
         )?;
     }
     Ok(())
@@ -775,6 +842,7 @@ fn write_summary(
         writeln!(writer, "first_lidar_drop_before_first_imu=none")?;
     }
     writeln!(writer, "map_points={}", replay.pipeline.local_map.len())?;
+    write_latency_summary(&mut writer, replay)?;
     writeln!(writer)?;
     writeln!(writer, "minimal_implementation_notes=")?;
     writeln!(
@@ -814,6 +882,171 @@ fn write_summary(
 
 fn format_optional_f64(value: Option<f64>) -> String {
     value.map_or_else(|| "none".to_string(), |value| format!("{value:.9}"))
+}
+
+fn write_latency_summary(writer: &mut impl Write, replay: &OfflineReplay) -> Result<()> {
+    writeln!(writer, "latency_rows={}", replay.latency.len())?;
+    write_latency_metric(
+        writer,
+        "latency_end_to_end_ms",
+        replay.latency.iter().map(|row| duration_ms(row.end_to_end)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_live_stream_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.live_stream)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_pipeline_total_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.total)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_imu_boundary_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.imu_boundary)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_initialization_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.initialization)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_motion_segments_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.motion_segments)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_predict_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.predict)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_deskew_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.deskew)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_preprocess_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.preprocess)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_association_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.association)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_update_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.update)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_map_insert_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.map_insert)),
+    )?;
+    write_latency_metric(
+        writer,
+        "latency_map_crop_ms",
+        replay
+            .latency
+            .iter()
+            .map(|row| duration_ms(row.pipeline.map_crop)),
+    )?;
+    Ok(())
+}
+
+fn write_latency_metric(
+    writer: &mut impl Write,
+    name: &str,
+    values: impl Iterator<Item = f64>,
+) -> Result<()> {
+    let stats = LatencyStats::from_values(values);
+    if let Some(stats) = stats {
+        writeln!(
+            writer,
+            "{name}=count:{},min:{:.6},mean:{:.6},p50:{:.6},p95:{:.6},max:{:.6}",
+            stats.count, stats.min, stats.mean, stats.p50, stats.p95, stats.max
+        )?;
+    } else {
+        writeln!(writer, "{name}=none")?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LatencyStats {
+    count: usize,
+    min: f64,
+    mean: f64,
+    p50: f64,
+    p95: f64,
+    max: f64,
+}
+
+impl LatencyStats {
+    fn from_values(values: impl Iterator<Item = f64>) -> Option<Self> {
+        let mut values: Vec<_> = values.filter(|value| value.is_finite()).collect();
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(f64::total_cmp);
+        let count = values.len();
+        let sum: f64 = values.iter().sum();
+        Some(Self {
+            count,
+            min: values[0],
+            mean: sum / count as f64,
+            p50: percentile_sorted(&values, 0.50),
+            p95: percentile_sorted(&values, 0.95),
+            max: values[count - 1],
+        })
+    }
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    debug_assert!(!values.is_empty());
+    let max_index = values.len() - 1;
+    let index = ((max_index as f64) * percentile).ceil() as usize;
+    values[index.min(max_index)]
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 #[cfg(test)]
@@ -920,5 +1153,18 @@ mod tests {
     #[test]
     fn parse_replay_args_rejects_unknown_option() {
         assert!(ReplayArgs::parse(args(&["--rerun"])).is_err());
+    }
+
+    #[test]
+    fn latency_stats_sort_and_ignore_non_finite_values() {
+        let stats = LatencyStats::from_values([5.0, f64::NAN, 1.0, 3.0, 2.0].into_iter())
+            .expect("finite latency stats");
+
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.min, 1.0);
+        assert_eq!(stats.mean, 2.75);
+        assert_eq!(stats.p50, 3.0);
+        assert_eq!(stats.p95, 5.0);
+        assert_eq!(stats.max, 5.0);
     }
 }

@@ -8,6 +8,7 @@ use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
     ImuSample, LidarFrame, LidarImuExtrinsic, MeasureGroup, PointXYZI, PreprocessConfig, Vec3,
 };
+use std::time::{Duration, Instant};
 
 use crate::deskew::{build_motion_segments, deskew};
 
@@ -40,6 +41,22 @@ pub struct PipelineFrameReport {
     pub map_points_before: usize,
     pub map_points_after: usize,
     pub update: Option<IesekfUpdateReport>,
+    pub timings: PipelineStageTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PipelineStageTimings {
+    pub total: Duration,
+    pub imu_boundary: Duration,
+    pub initialization: Duration,
+    pub motion_segments: Duration,
+    pub predict: Duration,
+    pub deskew: Duration,
+    pub preprocess: Duration,
+    pub association: Duration,
+    pub update: Duration,
+    pub map_insert: Duration,
+    pub map_crop: Duration,
 }
 
 /// Stateful front-end pipeline.
@@ -91,6 +108,8 @@ impl FastLioPipeline {
         &mut self,
         mut measure_group: MeasureGroup,
     ) -> Result<PipelineFrameReport> {
+        let total_start = Instant::now();
+        let imu_boundary_start = Instant::now();
         let imu_for_initialization = measure_group.imu.clone();
         let current_tail_imu = measure_group.imu.last().cloned();
         if let Some(last_imu) = self.last_imu_for_deskew.clone()
@@ -118,10 +137,18 @@ impl FastLioPipeline {
             end_imu.time_stamp_sec = measure_group.lidar.end_timestamp_sec();
             measure_group.imu.push(end_imu);
         }
+        let imu_boundary_duration = imu_boundary_start.elapsed();
 
         if !self.initialized && self.config.initialization_groups > 0 {
+            let initialization_start = Instant::now();
             self.initializer.accumulate(&imu_for_initialization);
+            let mut timings = PipelineStageTimings {
+                imu_boundary: imu_boundary_duration,
+                initialization: initialization_start.elapsed(),
+                ..PipelineStageTimings::default()
+            };
             if self.initializer.group_count < self.config.initialization_groups {
+                timings.total = total_start.elapsed();
                 return Ok(PipelineFrameReport {
                     mode: PipelineMode::Initializing,
                     preprocessed_points: 0,
@@ -129,6 +156,7 @@ impl FastLioPipeline {
                     map_points_before: self.local_map.len(),
                     map_points_after: self.local_map.len(),
                     update: None,
+                    timings,
                 });
             }
 
@@ -143,6 +171,8 @@ impl FastLioPipeline {
                 .context("failed to set IMU acceleration scale")?;
             self.initialized = true;
 
+            timings.initialization = initialization_start.elapsed();
+            timings.total = total_start.elapsed();
             return Ok(PipelineFrameReport {
                 mode: PipelineMode::Initializing,
                 preprocessed_points: 0,
@@ -150,18 +180,22 @@ impl FastLioPipeline {
                 map_points_before: self.local_map.len(),
                 map_points_after: self.local_map.len(),
                 update: None,
+                timings,
             });
         }
 
         let map_points_before = self.local_map.len();
         let predicted_start_state = self.filter.state.clone();
+        let motion_segments_start = Instant::now();
         let segments = build_motion_segments(
             &measure_group,
             predicted_start_state.clone(),
             &self.imu_integrator,
         )
         .context("failed to build deskew motion segments")?;
+        let motion_segments_duration = motion_segments_start.elapsed();
 
+        let predict_start = Instant::now();
         let (predicted_state, predicted_covariance) = predict_through_imu(
             &self.imu_integrator,
             predicted_start_state,
@@ -172,13 +206,20 @@ impl FastLioPipeline {
         self.filter
             .set_predicted(predicted_state, predicted_covariance)
             .map_err(|err| anyhow::anyhow!("failed to set predicted IESEKF state: {err:?}"))?;
+        let predict_duration = predict_start.elapsed();
 
+        let deskew_start = Instant::now();
         deskew(&mut measure_group.lidar, &segments, &self.extrinsic)
             .context("failed to deskew lidar frame")?;
+        let deskew_duration = deskew_start.elapsed();
+
+        let preprocess_start = Instant::now();
         let preprocessed = preprocess(&self.config.preprocess, measure_group.lidar)
             .context("failed to preprocess deskewed lidar frame")?;
         let preprocessed_points = preprocessed.points.len();
+        let preprocess_duration = preprocess_start.elapsed();
 
+        let association_start = Instant::now();
         let mut factors = Vec::new();
         if !self.local_map.is_empty() {
             factors = build_iesekf_factors(
@@ -191,7 +232,9 @@ impl FastLioPipeline {
             );
         }
         let effective_observations = factors.len();
+        let association_duration = association_start.elapsed();
 
+        let update_start = Instant::now();
         let (mode, update) = if effective_observations >= self.config.min_effective_observations {
             let update = self
                 .filter
@@ -201,7 +244,9 @@ impl FastLioPipeline {
         } else {
             (PipelineMode::BootstrapMap, None)
         };
+        let update_duration = update_start.elapsed();
 
+        let map_insert_start = Instant::now();
         if self.config.insert_scan_points {
             let map_points = transform_lidar_frame_to_world(
                 &preprocessed,
@@ -217,11 +262,14 @@ impl FastLioPipeline {
                 self.local_map.insert_points(map_points);
             }
         }
+        let map_insert_duration = map_insert_start.elapsed();
 
+        let map_crop_start = Instant::now();
         if let Some(radius) = self.config.map_crop_radius {
             self.local_map
                 .crop_by_center_radius(self.filter.state.position, radius);
         }
+        let map_crop_duration = map_crop_start.elapsed();
 
         Ok(PipelineFrameReport {
             mode,
@@ -230,6 +278,19 @@ impl FastLioPipeline {
             map_points_before,
             map_points_after: self.local_map.len(),
             update,
+            timings: PipelineStageTimings {
+                total: total_start.elapsed(),
+                imu_boundary: imu_boundary_duration,
+                initialization: Duration::ZERO,
+                motion_segments: motion_segments_duration,
+                predict: predict_duration,
+                deskew: deskew_duration,
+                preprocess: preprocess_duration,
+                association: association_duration,
+                update: update_duration,
+                map_insert: map_insert_duration,
+                map_crop: map_crop_duration,
+            },
         })
     }
 }
