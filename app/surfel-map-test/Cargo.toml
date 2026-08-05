@@ -1,0 +1,20 @@
+[package]
+name = "surfel-map-test"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fastlio-surfel"
+path = "test.rs"
+
+[dependencies]
+fastlio-map = { path = "../../crates/fastlio-map" }
+fastlio-types = { path = "../../crates/fastlio-types" }
+csv = { workspace = true }
+camino = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+memmap2 = "0.9.11"
+pcd-rs = { version = "0.13.0", features = ["derive"] }
+nalgebra = { workspace = true }

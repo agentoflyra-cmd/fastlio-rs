@@ -1,0 +1,14 @@
+[package]
+name = "surfel-viewer"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fastlio-surfel-viewer"
+path = "main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+iced = "0.14.0"
+pcd-rs = "0.13.0"
