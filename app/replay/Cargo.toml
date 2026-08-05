@@ -1,0 +1,19 @@
+[package]
+name = "fastlio-replay"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fastlio-replay"
+path = "replay.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+camino = { workspace = true }
+fastlio-dataset = { path = "../../crates/fastlio-dataset" }
+fastlio-estimator = { path = "../../crates/fastlio-estimator" }
+fastlio-imu = { path = "../../crates/fastlio-imu" }
+fastlio-pipeline = { path = "../../crates/fastlio-pipeline" }
+fastlio-types = { path = "../../crates/fastlio-types" }
+nalgebra = { workspace = true }
+ringbuffer-spsc = { workspace = true }
