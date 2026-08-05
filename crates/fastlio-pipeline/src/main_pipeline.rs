@@ -14,6 +14,7 @@ use crate::deskew::{build_motion_segments, deskew};
 /// Main FAST-LIO front-end pipeline status for the company-version path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineMode {
+    Initializing,
     BootstrapMap,
     Tracking,
 }
@@ -27,6 +28,7 @@ pub struct PipelineConfig {
     pub insert_scan_points: bool,
     pub max_factor_points: Option<usize>,
     pub max_map_insert_points: Option<usize>,
+    pub initialization_groups: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +62,8 @@ pub struct FastLioPipeline {
     pub extrinsic: LidarImuExtrinsic,
     pub config: PipelineConfig,
     last_imu_for_deskew: Option<ImuSample>,
+    initializer: ImuInitializer,
+    initialized: bool,
 }
 
 impl FastLioPipeline {
@@ -77,6 +81,8 @@ impl FastLioPipeline {
             extrinsic,
             config,
             last_imu_for_deskew: None,
+            initializer: ImuInitializer::default(),
+            initialized: false,
         }
     }
 
@@ -84,6 +90,7 @@ impl FastLioPipeline {
         &mut self,
         mut measure_group: MeasureGroup,
     ) -> Result<PipelineFrameReport> {
+        let imu_for_initialization = measure_group.imu.clone();
         let current_tail_imu = measure_group.imu.last().cloned();
         if let Some(last_imu) = self.last_imu_for_deskew.clone()
             && measure_group
@@ -109,6 +116,40 @@ impl FastLioPipeline {
             let mut end_imu = last_imu;
             end_imu.time_stamp_sec = measure_group.lidar.end_timestamp_sec();
             measure_group.imu.push(end_imu);
+        }
+
+        if !self.initialized && self.config.initialization_groups > 0 {
+            self.initializer.accumulate(&imu_for_initialization);
+            if self.initializer.group_count < self.config.initialization_groups {
+                return Ok(PipelineFrameReport {
+                    mode: PipelineMode::Initializing,
+                    preprocessed_points: 0,
+                    effective_observations: 0,
+                    map_points_before: self.local_map.len(),
+                    map_points_after: self.local_map.len(),
+                    update: None,
+                });
+            }
+
+            let initialized = self
+                .initializer
+                .finish()
+                .context("failed to initialize IMU state")?;
+            self.filter.state.gravity = initialized.gravity;
+            self.filter.state.gyro_bias = initialized.gyro_bias;
+            self.imu_integrator
+                .set_accel_scale(initialized.accel_scale)
+                .context("failed to set IMU acceleration scale")?;
+            self.initialized = true;
+
+            return Ok(PipelineFrameReport {
+                mode: PipelineMode::Initializing,
+                preprocessed_points: 0,
+                effective_observations: 0,
+                map_points_before: self.local_map.len(),
+                map_points_after: self.local_map.len(),
+                update: None,
+            });
         }
 
         let map_points_before = self.local_map.len();
@@ -183,6 +224,48 @@ impl FastLioPipeline {
             map_points_before,
             map_points_after: self.local_map.len(),
             update,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ImuInitializer {
+    group_count: usize,
+    sample_count: usize,
+    mean_acc: Vec3<f64>,
+    mean_gyr: Vec3<f64>,
+}
+
+struct ImuInitialization {
+    gravity: Vec3<f64>,
+    gyro_bias: Vec3<f64>,
+    accel_scale: f64,
+}
+
+impl ImuInitializer {
+    fn accumulate(&mut self, imu_samples: &[ImuSample]) {
+        self.group_count += 1;
+        for imu in imu_samples {
+            self.sample_count += 1;
+            let n = self.sample_count as f64;
+            self.mean_acc += (imu.accel - self.mean_acc) / n;
+            self.mean_gyr += (imu.gyro - self.mean_gyr) / n;
+        }
+    }
+
+    fn finish(&self) -> Result<ImuInitialization> {
+        if self.sample_count == 0 {
+            anyhow::bail!("cannot initialize IMU without samples");
+        }
+        let acc_norm = self.mean_acc.norm();
+        if !acc_norm.is_finite() || acc_norm <= 1.0e-6 {
+            anyhow::bail!("invalid mean acceleration norm for IMU initialization: {acc_norm}");
+        }
+
+        Ok(ImuInitialization {
+            gravity: -self.mean_acc / acc_norm * 9.81,
+            gyro_bias: self.mean_gyr,
+            accel_scale: 9.81 / acc_norm,
         })
     }
 }
@@ -296,10 +379,14 @@ mod tests {
     }
 
     fn imu(time_stamp_sec: f64) -> ImuSample {
+        imu_with_motion(time_stamp_sec, Vec3::zeros(), Vec3::zeros())
+    }
+
+    fn imu_with_motion(time_stamp_sec: f64, gyro: Vec3<f64>, accel: Vec3<f64>) -> ImuSample {
         ImuSample {
             time_stamp_sec,
-            gyro: Vec3::zeros(),
-            accel: Vec3::zeros(),
+            gyro,
+            accel,
         }
     }
 
@@ -342,6 +429,7 @@ mod tests {
             insert_scan_points: true,
             max_factor_points: None,
             max_map_insert_points: None,
+            initialization_groups: 0,
         }
     }
 
@@ -362,6 +450,54 @@ mod tests {
         assert_eq!(limited, vec![0, 4, 8]);
     }
 
+    #[test]
+    fn initialization_groups_do_not_insert_map_points() {
+        let mut pipeline = init_pipeline(2);
+        let group = MeasureGroup {
+            imu: vec![
+                imu_with_motion(10.0, Vec3::zeros(), Vec3::new(0.0, 0.0, 9.81)),
+                imu_with_motion(10.1, Vec3::zeros(), Vec3::new(0.0, 0.0, 9.81)),
+            ],
+            lidar: lidar(vec![point(0.0, 1.0, 0.0, 0.0)]),
+        };
+
+        let report = pipeline.process_measurement_group(group).unwrap();
+
+        assert_eq!(report.mode, PipelineMode::Initializing);
+        assert_eq!(report.map_points_after, 0);
+        assert_eq!(pipeline.local_map.len(), 0);
+    }
+
+    #[test]
+    fn initialization_sets_gravity_gyro_bias_and_accel_scale() {
+        let mut pipeline = init_pipeline(2);
+        let gyro = Vec3::new(0.01, -0.02, 0.03);
+        let accel = Vec3::new(0.0, 0.0, 9.7);
+
+        for group_idx in 0..2 {
+            let scan_begin = 10.0 + group_idx as f64 * 0.1;
+            let group = MeasureGroup {
+                imu: vec![
+                    imu_with_motion(scan_begin, gyro, accel),
+                    imu_with_motion(scan_begin + 0.1, gyro, accel),
+                ],
+                lidar: LidarFrame::new(
+                    scan_begin,
+                    scan_begin + 0.1,
+                    vec![point(0.0, 1.0, 0.0, 0.0)],
+                ),
+            };
+
+            let report = pipeline.process_measurement_group(group).unwrap();
+            assert_eq!(report.mode, PipelineMode::Initializing);
+            assert_eq!(pipeline.local_map.len(), 0);
+        }
+
+        assert!((pipeline.filter.state.gravity - Vec3::new(0.0, 0.0, -9.81)).norm() < 1.0e-12);
+        assert!((pipeline.filter.state.gyro_bias - gyro).norm() < 1.0e-12);
+        assert!((pipeline.imu_integrator.accel_scale - 9.81 / 9.7).abs() < 1.0e-12);
+    }
+
     fn pipeline(initial_position: Vec3<f64>, local_map: LocalMap) -> FastLioPipeline {
         let filter = Iesekf::new(
             navstate(initial_position),
@@ -374,6 +510,23 @@ mod tests {
             ImuIntegrator::init(0.0, 0.0, 0.0, 0.0),
             Pose3::new(UnitQuaternion::identity(), Vec3::zeros()),
             config(3),
+        )
+    }
+
+    fn init_pipeline(initialization_groups: usize) -> FastLioPipeline {
+        let filter = Iesekf::new(
+            navstate(Vec3::zeros()),
+            ErrorStateCovariance::identity() * 0.1,
+        )
+        .unwrap();
+        let mut config = config(3);
+        config.initialization_groups = initialization_groups;
+        FastLioPipeline::new(
+            filter,
+            LocalMap::new(),
+            ImuIntegrator::init(0.0, 0.0, 0.0, 0.0),
+            Pose3::new(UnitQuaternion::identity(), Vec3::zeros()),
+            config,
         )
     }
 

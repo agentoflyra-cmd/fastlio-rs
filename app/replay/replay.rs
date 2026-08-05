@@ -47,6 +47,7 @@ fn main() -> Result<()> {
 
     println!("replay complete");
     println!("  processed frames: {}", replay.processed_frames);
+    println!("  initializing frames: {}", replay.initializing_frames);
     println!("  tracking frames: {}", replay.tracking_frames);
     println!("  bootstrap frames: {}", replay.bootstrap_frames);
     println!("  failed groups: {}", replay.failed_groups);
@@ -441,6 +442,7 @@ struct OfflineReplay {
     time_offset_lidar_to_imu_sec: f64,
     trajectory: Vec<TrajectoryRow>,
     processed_frames: usize,
+    initializing_frames: usize,
     tracking_frames: usize,
     bootstrap_frames: usize,
     failed_groups: usize,
@@ -497,6 +499,7 @@ impl OfflineReplay {
             insert_scan_points: true,
             max_factor_points: Some(2_000),
             max_map_insert_points: Some(5_000),
+            initialization_groups: 10,
         };
 
         Ok(Self {
@@ -511,6 +514,7 @@ impl OfflineReplay {
             time_offset_lidar_to_imu_sec,
             trajectory: Vec::new(),
             processed_frames: 0,
+            initializing_frames: 0,
             tracking_frames: 0,
             bootstrap_frames: 0,
             failed_groups: 0,
@@ -568,6 +572,7 @@ impl OfflineReplay {
             Ok(report) => {
                 self.processed_frames += 1;
                 match report.mode {
+                    PipelineMode::Initializing => self.initializing_frames += 1,
                     PipelineMode::BootstrapMap => self.bootstrap_frames += 1,
                     PipelineMode::Tracking => self.tracking_frames += 1,
                 }
@@ -700,6 +705,7 @@ fn write_summary(
         read_stats.skipped_unsupported_topic
     )?;
     writeln!(writer, "processed_frames={}", replay.processed_frames)?;
+    writeln!(writer, "initializing_frames={}", replay.initializing_frames)?;
     writeln!(writer, "tracking_frames={}", replay.tracking_frames)?;
     writeln!(writer, "bootstrap_frames={}", replay.bootstrap_frames)?;
     writeln!(writer, "failed_groups={}", replay.failed_groups)?;
@@ -792,7 +798,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- initial state is fixed identity pose with gravity [0,0,-9.81]; no IMU initialization window yet"
+        "- the first 10 synchronized groups initialize IMU gravity, gyro bias, and acceleration scale before map insertion"
     )?;
     writeln!(
         writer,

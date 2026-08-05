@@ -39,7 +39,8 @@ pub fn build_motion_segments(
         // Midpoint IMU measurements.
         let omega_mid = 0.5 * (imu_prev.gyro + imu_curr.gyro) - navstate.gyro_bias;
 
-        let acc_mid = 0.5 * (imu_prev.accel + imu_curr.accel) - navstate.accel_bias;
+        let acc_mid = 0.5 * (imu_inte.scaled_accel(imu_prev) + imu_inte.scaled_accel(imu_curr))
+            - navstate.accel_bias;
 
         // Midpoint orientation.
         let half_delta_rotation = UnitQuaternion::from_scaled_axis(omega_mid * (0.5 * dt));
