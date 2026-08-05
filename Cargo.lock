@@ -299,6 +299,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastlio-replay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camino",
+ "fastlio-dataset",
+ "fastlio-estimator",
+ "fastlio-imu",
+ "fastlio-map",
+ "fastlio-pipeline",
+ "fastlio-types",
+ "nalgebra",
+]
+
+[[package]]
 name = "fastlio-ros2"
 version = "0.1.0"
 
