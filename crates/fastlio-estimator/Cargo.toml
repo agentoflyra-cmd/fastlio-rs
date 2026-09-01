@@ -4,3 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+fastlio-types = { path = "../fastlio-types" }
+fastlio-map = { path = "../fastlio-map" }
+nalgebra = { workspace = true }
+
+[dev-dependencies]
+slotmap = { workspace = true }

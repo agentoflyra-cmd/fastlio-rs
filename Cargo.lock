@@ -964,6 +964,12 @@ dependencies = [
 [[package]]
 name = "fastlio-estimator"
 version = "0.1.0"
+dependencies = [
+ "fastlio-map",
+ "fastlio-types",
+ "nalgebra",
+ "slotmap",
+]
 
 [[package]]
 name = "fastlio-imu"
