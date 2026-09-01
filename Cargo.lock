@@ -965,6 +965,7 @@ dependencies = [
 name = "fastlio-estimator"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "fastlio-map",
  "fastlio-types",
  "nalgebra",

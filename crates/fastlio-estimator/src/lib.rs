@@ -32,6 +32,8 @@
 use fastlio_map::surfel::SurfelObservation;
 use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI};
 use nalgebra::SMatrix;
+pub mod iekf;
+pub mod optimizer;
 
 /// Linearize a point-to-plane residual with respect to the 24D error state.
 ///
