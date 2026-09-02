@@ -1119,6 +1119,7 @@ dependencies = [
  "fastlio-pointcloud",
  "fastlio-types",
  "nalgebra",
+ "smallvec",
 ]
 
 [[package]]

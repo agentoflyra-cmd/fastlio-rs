@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path, Utf8PathBuf};
-use fastlio_dataset::{SensorEvent, read_mcap_events};
+use fastlio_dataset::{ReadOptions, SensorEvent, read_mcap_events_with_options};
 use fastlio_estimator::iesekf::{ErrorStateCovariance, Iesekf, IesekfConfig};
 use fastlio_imu::ImuIntegrator;
 use fastlio_map::{LocalMap, PointToPlaneConfig, surfel::SurfelMap};
 use fastlio_pipeline::main_pipeline::{
-    FastLioPipeline, PipelineAssociationStats, PipelineConfig, PipelineMode, PipelineStageTimings,
+    FastLioPipeline, PipelineAssociationStats, PipelineConfig, PipelineMapInsertDiagnostics,
+    PipelineMode, PipelineStageTimings,
 };
 use fastlio_pipeline::synchronizer::MeasurementSynchronizer;
 use fastlio_types::{
@@ -35,9 +36,13 @@ fn main() -> Result<()> {
         config.common.time_offset_lidar_to_imu = Some(offset_sec);
     }
     args.surfel_options.apply_to_config(&mut config)?;
+    let read_options = ReadOptions::new(
+        config.common.lid_topic.clone(),
+        config.common.imu_topic.clone(),
+    );
     let mut replay = OfflineReplay::new(config, args.map_backend)?;
     replay.live_stream = start_live_viewer(&args.viewer)?;
-    let stats = run_spsc_replay(&args, &mut replay)
+    let stats = run_spsc_replay(&args, read_options, &mut replay)
         .with_context(|| format!("failed to replay MCAP `{}`", args.bag_path))?;
 
     let trajectory_path = args.output_dir.join("trajectory.csv");
@@ -56,6 +61,9 @@ fn main() -> Result<()> {
         let path = args.output_dir.join("surfel.pcd");
         write_binary_surfel_pcd(&path, &surfels)?;
         surfel_viewer_path = Some(path);
+    }
+    if let Some(surfel_map) = replay.pipeline.local_map.surfel_map() {
+        print_classification_quality(surfel_map);
     }
     write_summary(&summary_path, stats, &replay)?;
     open_viewer(&args.viewer, &map_path)?;
@@ -95,7 +103,7 @@ impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--time-offset-lidar-to-imu <sec>] [--map-backend kiddo|surfel] [--surfel-allow-growing-constraints] [--surfel-growing-constraint-weight <weight>] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--time-offset-lidar-to-imu <sec>] [--map-backend kiddo|surfel] [--surfel-allow-growing-constraints] [--surfel-max-growing-constraint-distance <meters>] [--surfel-growing-constraint-weight <weight>] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
@@ -168,12 +176,16 @@ impl ReplayMapBackend {
 #[derive(Debug, Clone, Copy, Default)]
 struct ReplaySurfelOptions {
     allow_growing_constraints: bool,
+    max_growing_constraint_distance: Option<f32>,
     growing_constraint_weight: Option<f32>,
 }
 
 impl ReplaySurfelOptions {
     fn apply_to_config(self, config: &mut Config) -> Result<()> {
-        if !self.allow_growing_constraints && self.growing_constraint_weight.is_none() {
+        if !self.allow_growing_constraints
+            && self.max_growing_constraint_distance.is_none()
+            && self.growing_constraint_weight.is_none()
+        {
             return Ok(());
         }
         let surfel_config = config
@@ -181,6 +193,12 @@ impl ReplaySurfelOptions {
             .get_or_insert_with(SurfelConfig::default);
         if self.allow_growing_constraints {
             surfel_config.allow_growing_constraints = true;
+        }
+        if let Some(distance) = self.max_growing_constraint_distance {
+            if !distance.is_finite() || distance <= 0.0 {
+                bail!("--surfel-max-growing-constraint-distance must be finite and positive");
+            }
+            surfel_config.max_growing_constraint_distance = distance;
         }
         if let Some(weight) = self.growing_constraint_weight {
             if !weight.is_finite() || weight < 0.0 {
@@ -239,6 +257,16 @@ fn parse_replay_options(
                     format!("invalid --surfel-growing-constraint-weight `{value}`")
                 })?;
                 surfel_options.growing_constraint_weight = Some(weight);
+                idx += 2;
+            }
+            "--surfel-max-growing-constraint-distance" => {
+                let Some(value) = args.get(idx + 1) else {
+                    bail!("--surfel-max-growing-constraint-distance requires a distance value");
+                };
+                let distance = value.parse::<f32>().with_context(|| {
+                    format!("invalid --surfel-max-growing-constraint-distance `{value}`")
+                })?;
+                surfel_options.max_growing_constraint_distance = Some(distance);
                 idx += 2;
             }
             _ => {
@@ -453,11 +481,12 @@ enum ReplayMessage {
 
 fn run_spsc_replay(
     args: &ReplayArgs,
+    read_options: ReadOptions,
     replay: &mut OfflineReplay,
 ) -> Result<fastlio_dataset::ReadStats> {
     let (sender, receiver) = mpsc::sync_channel(args.channel_capacity);
     let bag_path = args.bag_path.clone();
-    let producer = thread::spawn(move || produce_events(bag_path, sender));
+    let producer = thread::spawn(move || produce_events(bag_path, read_options, sender));
 
     let stats = consume_events(receiver, replay, args.playback_rate)?;
     producer
@@ -466,9 +495,13 @@ fn run_spsc_replay(
     Ok(stats)
 }
 
-fn produce_events(bag_path: Utf8PathBuf, sender: SyncSender<ReplayMessage>) {
+fn produce_events(
+    bag_path: Utf8PathBuf,
+    read_options: ReadOptions,
+    sender: SyncSender<ReplayMessage>,
+) {
     let event_sender = sender.clone();
-    let result = read_mcap_events(&bag_path, |event| {
+    let result = read_mcap_events_with_options(&bag_path, &read_options, |event| {
         event_sender
             .send(ReplayMessage::Event(event))
             .map_err(|_| anyhow::anyhow!("replay consumer stopped"))?;
@@ -554,6 +587,7 @@ struct LatencyRow {
     live_stream: Duration,
     pipeline: PipelineStageTimings,
     association_stats: PipelineAssociationStats,
+    map_insert_diagnostics: PipelineMapInsertDiagnostics,
 }
 
 struct OfflineReplay {
@@ -638,6 +672,15 @@ impl OfflineReplay {
             // at the predicted pose (pose error above the strict tolerance)
             // without globally relaxing the match tolerance.
             max_reassociation_passes: 1,
+            // Incremental merge disabled (fixed surfel baseline, end_drift
+            // 0.30 m on yuanqu). Both mature-mature and growing-growing merge
+            // soften the map under pose drift (7.5 m end_drift for growing
+            // merge): merged fragments average observations taken at different
+            // poses. Re-enable only with time awareness (surfel last_frame,
+            // merging fragments inserted close in time) once point-pool timing
+            // exists. should_merge / merge_surfel_stats / merge_incremental
+            // are kept for that path.
+            merge_budget_per_frame: None,
         };
 
         let pipeline = match map_backend {
@@ -752,6 +795,7 @@ impl OfflineReplay {
                     live_stream: live_stream_duration,
                     pipeline: report.timings,
                     association_stats: report.association_stats,
+                    map_insert_diagnostics: report.map_insert_diagnostics,
                 });
             }
             Err(err) => {
@@ -830,7 +874,7 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
     );
     writeln!(
         writer,
-        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,association_nearest_ms,association_plane_fit_ms,association_residual_ms,association_factor_build_ms,update_ms,map_insert_ms,map_crop_ms,association_sampled_points,association_accepted_observations,association_non_finite_scan_points,association_invalid_configs,association_no_planar_surfel,association_neighbour_too_far,association_plane_fit_errors,association_residual_too_large,surfel_primary_raw_candidates,surfel_primary_unique_candidates,surfel_fallback_raw_candidates,surfel_fallback_unique_candidates,surfel_fallback_queries,surfel_fallback_hits,surfel_planar_candidates,surfel_growing_candidates,surfel_accepted_growing_weak,association_normal_mean_x,association_normal_mean_y,association_normal_mean_z"
+        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,association_nearest_ms,association_plane_fit_ms,association_residual_ms,association_factor_build_ms,update_ms,map_insert_ms,map_crop_ms,association_sampled_points,association_accepted_observations,association_non_finite_scan_points,association_invalid_configs,association_no_planar_surfel,association_neighbour_too_far,association_plane_fit_errors,association_residual_too_large,surfel_primary_raw_candidates,surfel_primary_unique_candidates,surfel_fallback_raw_candidates,surfel_fallback_unique_candidates,surfel_fallback_queries,surfel_fallback_hits,surfel_planar_candidates,surfel_line_candidates,surfel_growing_candidates,surfel_accepted_line_constraints,surfel_accepted_growing_weak,association_normal_mean_x,association_normal_mean_y,association_normal_mean_z,insert_diag_sampled_points,insert_diag_matched_plane,insert_diag_matched_line,insert_diag_matched_growing_weak,insert_diag_no_match,insert_diag_distance_mean,insert_diag_distance_p50,insert_diag_distance_p95,insert_diag_distance_max"
     )?;
     for row in latency {
         let accepted = row.association_stats.accepted_observations as f64;
@@ -845,7 +889,7 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
         };
         writeln!(
             writer,
-            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9}",
+            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9},{},{},{},{},{},{:.9},{:.9},{:.9},{:.9}",
             row.frame_index,
             row.timestamp_sec,
             row.mode,
@@ -883,11 +927,22 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
             row.association_stats.surfel_fallback_queries,
             row.association_stats.surfel_fallback_hits,
             row.association_stats.surfel_planar_candidates,
+            row.association_stats.surfel_line_candidates,
             row.association_stats.surfel_growing_candidates,
+            row.association_stats.surfel_accepted_line_constraints,
             row.association_stats.surfel_accepted_growing_weak,
             normal_mean_x,
             normal_mean_y,
             normal_mean_z,
+            row.map_insert_diagnostics.sampled_points,
+            row.map_insert_diagnostics.matched_plane,
+            row.map_insert_diagnostics.matched_line,
+            row.map_insert_diagnostics.matched_growing_weak,
+            row.map_insert_diagnostics.no_match,
+            row.map_insert_diagnostics.distance_mean(),
+            row.map_insert_diagnostics.distance_p50,
+            row.map_insert_diagnostics.distance_p95,
+            row.map_insert_diagnostics.distance_max,
         )?;
     }
     Ok(())
@@ -916,6 +971,91 @@ fn write_ascii_pcd(path: &Utf8Path, points: &[PointXYZI]) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Per-class quality summary of the final surfel map (dev surfel-test style).
+///
+/// For each geometry class reports the total count, mature count, and the
+/// fraction that is *strongly* credible under stricter margins than the
+/// classification thresholds themselves:
+/// - Plane strong: planarity (λ0/λ1) < 0.03 (classification allows 0.10) and
+///   λ1 >= 0.02 (clear tangential spread).
+/// - Line strong: linearity > 0.85 (classification allows 0.70) and λ2 >= 0.01.
+fn print_classification_quality(map: &fastlio_map::surfel::SurfelMap) {
+    let mut relaxed = map.surfel_config().clone();
+    relaxed.min_plane_spread_eigenvalue = 0.001;
+    let active_label = format!(
+        "spread_{:.3}",
+        map.surfel_config().min_plane_spread_eigenvalue
+    );
+    for (label, config) in [
+        (active_label.as_str(), map.surfel_config()),
+        ("spread_0.001", &relaxed),
+    ] {
+        print_classification_quality_with(map, config, label);
+    }
+}
+
+fn print_classification_quality_with(
+    map: &fastlio_map::surfel::SurfelMap,
+    config: &SurfelConfig,
+    label: &str,
+) {
+    use fastlio_map::surfel_types::GeometryClass;
+    #[derive(Default)]
+    struct Bucket {
+        total: usize,
+        mature: usize,
+        strong: usize,
+    }
+    let mut buckets = std::collections::HashMap::<GeometryClass, Bucket>::new();
+    for surfel in map.surfels() {
+        let class = surfel.geometry_class(config);
+        let bucket = buckets.entry(class).or_default();
+        bucket.total += 1;
+        if surfel.count < config.min_mature_surfel_count {
+            continue;
+        }
+        bucket.mature += 1;
+        let l0 = surfel.eigenvalues[0];
+        let l1 = surfel.eigenvalues[1];
+        let l2 = surfel.eigenvalues[2];
+        match class {
+            GeometryClass::Plane => {
+                let planarity = if l1 > 0.0 { l0 / l1 } else { f64::INFINITY };
+                if planarity < 0.03 && l1 >= 0.02 {
+                    bucket.strong += 1;
+                }
+            }
+            GeometryClass::Line => {
+                let linearity = if l2 > 0.0 { (l2 - l1) / l2 } else { 0.0 };
+                if linearity > 0.85 && l2 >= 0.01 {
+                    bucket.strong += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let names = [
+        (GeometryClass::Plane, "plane"),
+        (GeometryClass::Line, "line"),
+        (GeometryClass::Scatter, "scatter"),
+        (GeometryClass::Degenerate, "degenerate"),
+        (GeometryClass::Growing, "growing"),
+    ];
+    for (class, name) in names {
+        if let Some(b) = buckets.get(&class) {
+            let strong_pct = if b.mature > 0 {
+                100.0 * b.strong as f64 / b.mature as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "class_quality[{label}] {name}: total={} mature={} strong={} (strong/mature={:.1}%)",
+                b.total, b.mature, b.strong, strong_pct
+            );
+        }
+    }
 }
 
 /// Write surfel centroids as a little-endian binary PCD with
@@ -1094,7 +1234,7 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- dataset reader still hardcodes /livox/lidar and /livox/imu instead of using config topics"
+        "- dataset reader filters LiDAR/IMU topics from config.common.lid_topic and config.common.imu_topic"
     )?;
     writeln!(
         writer,
@@ -1396,6 +1536,27 @@ mod tests {
         let parsed = ReplayArgs::parse(args(&["--map-backend", "surfel"])).unwrap();
 
         assert_eq!(parsed.map_backend, ReplayMapBackend::Surfel);
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_surfel_growing_options() {
+        let parsed = ReplayArgs::parse(args(&[
+            "--map-backend",
+            "surfel",
+            "--surfel-allow-growing-constraints",
+            "--surfel-max-growing-constraint-distance",
+            "0.08",
+            "--surfel-growing-constraint-weight",
+            "0.02",
+        ]))
+        .unwrap();
+
+        assert!(parsed.surfel_options.allow_growing_constraints);
+        assert_eq!(
+            parsed.surfel_options.max_growing_constraint_distance,
+            Some(0.08)
+        );
+        assert_eq!(parsed.surfel_options.growing_constraint_weight, Some(0.02));
     }
 
     #[test]

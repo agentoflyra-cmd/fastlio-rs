@@ -5,7 +5,7 @@ use fastlio_estimator::iesekf::{
 use fastlio_imu::ImuIntegrator;
 use fastlio_map::{
     LocalMap, PointToPlaneConfig, PointToPlaneError,
-    surfel::{SurfelMap, SurfelMapQueryStats, SurfelOutputPoint},
+    surfel::{SurfelConstraintKind, SurfelMap, SurfelMapQueryStats, SurfelOutputPoint},
 };
 use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
@@ -83,6 +83,10 @@ pub struct PipelineConfig {
     /// at the corrected pose recovers them with a clean (strict) tolerance
     /// instead of globally relaxing it.
     pub max_reassociation_passes: usize,
+    /// Per-frame budget of surfel merge checks (`None`/0 disables). Merging
+    /// fragments of the same surface grows count/spread so the merged surfel
+    /// classifies and matches more reliably.
+    pub merge_budget_per_frame: Option<usize>,
 }
 
 pub enum PipelineMap {
@@ -134,6 +138,13 @@ impl PipelineMap {
         }
     }
 
+    pub fn surfel_map(&self) -> Option<&SurfelMap> {
+        match self {
+            Self::Kiddo(_) => None,
+            Self::Surfel(map) => Some(map),
+        }
+    }
+
     pub fn insert_points<I>(&mut self, points: I, min_distance_m: Option<f64>) -> Result<()>
     where
         I: IntoIterator<Item = PointXYZI>,
@@ -174,10 +185,35 @@ pub struct PipelineFrameReport {
     pub preprocessed_points: usize,
     pub effective_observations: usize,
     pub association_stats: PipelineAssociationStats,
+    pub map_insert_diagnostics: PipelineMapInsertDiagnostics,
     pub map_points_before: usize,
     pub map_points_after: usize,
     pub update: Option<IesekfUpdateReport>,
     pub timings: PipelineStageTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PipelineMapInsertDiagnostics {
+    pub sampled_points: usize,
+    pub matched_plane: usize,
+    pub matched_line: usize,
+    pub matched_growing_weak: usize,
+    pub no_match: usize,
+    pub distance_sum: f64,
+    pub distance_p50: f64,
+    pub distance_p95: f64,
+    pub distance_max: f64,
+}
+
+impl PipelineMapInsertDiagnostics {
+    pub fn distance_mean(self) -> f64 {
+        let matched = self.matched_plane + self.matched_line + self.matched_growing_weak;
+        if matched == 0 {
+            0.0
+        } else {
+            self.distance_sum / matched as f64
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -197,7 +233,9 @@ pub struct PipelineAssociationStats {
     pub surfel_fallback_queries: usize,
     pub surfel_fallback_hits: usize,
     pub surfel_planar_candidates: usize,
+    pub surfel_line_candidates: usize,
     pub surfel_growing_candidates: usize,
+    pub surfel_accepted_line_constraints: usize,
     pub surfel_accepted_growing_weak: usize,
     pub normal_sum_x: f64,
     pub normal_sum_y: f64,
@@ -224,7 +262,9 @@ impl PipelineAssociationStats {
         self.surfel_fallback_queries += stats.fallback_queries;
         self.surfel_fallback_hits += stats.fallback_hits;
         self.surfel_planar_candidates += stats.planar_candidates;
+        self.surfel_line_candidates += stats.line_candidates;
         self.surfel_growing_candidates += stats.growing_candidates;
+        self.surfel_accepted_line_constraints += stats.accepted_line_constraints;
         self.surfel_accepted_growing_weak += stats.accepted_growing_weak;
     }
 
@@ -279,6 +319,7 @@ pub struct FastLioPipeline {
     initialized: bool,
     tracking_established: bool,
     tracking_lost: bool,
+    merge_frame_counter: usize,
 }
 
 impl FastLioPipeline {
@@ -300,6 +341,7 @@ impl FastLioPipeline {
             initialized: false,
             tracking_established: false,
             tracking_lost: false,
+            merge_frame_counter: 0,
         }
     }
 
@@ -321,6 +363,7 @@ impl FastLioPipeline {
             initialized: false,
             tracking_established: false,
             tracking_lost: false,
+            merge_frame_counter: 0,
         }
     }
 
@@ -374,6 +417,7 @@ impl FastLioPipeline {
                     preprocessed_points: 0,
                     effective_observations: 0,
                     association_stats: PipelineAssociationStats::default(),
+                    map_insert_diagnostics: PipelineMapInsertDiagnostics::default(),
                     map_points_before: self.local_map.len(),
                     map_points_after: self.local_map.len(),
                     update: None,
@@ -410,6 +454,7 @@ impl FastLioPipeline {
                 preprocessed_points: 0,
                 effective_observations: 0,
                 association_stats: PipelineAssociationStats::default(),
+                map_insert_diagnostics: PipelineMapInsertDiagnostics::default(),
                 map_points_before: self.local_map.len(),
                 map_points_after: self.local_map.len(),
                 update: None,
@@ -588,14 +633,17 @@ impl FastLioPipeline {
         let update_duration = update_start.elapsed();
 
         let map_insert_start = Instant::now();
+        let mut map_insert_diagnostics = PipelineMapInsertDiagnostics::default();
         if self.config.insert_scan_points && mode != PipelineMode::TrackingLost {
-            let map_points = transform_lidar_frame_to_world_points(
+            let map_points: Vec<_> = transform_lidar_frame_to_world_points(
                 &preprocessed,
                 &self.extrinsic,
                 self.filter.state.orientation,
                 self.filter.state.position,
                 self.config.max_map_insert_points,
-            );
+            )
+            .collect();
+            map_insert_diagnostics = diagnose_map_insert_consistency(&self.local_map, &map_points)?;
             self.local_map
                 .insert_points(map_points, self.config.map_insert_min_distance)
                 .context("failed to insert scan points into map")?;
@@ -609,11 +657,35 @@ impl FastLioPipeline {
         }
         let map_crop_duration = map_crop_start.elapsed();
 
+        // Incremental surfel merge: neighbouring fragments of the same surface
+        // are combined with a small per-frame budget so count and spread grow
+        // and the merged surfel matches more reliably. Runs after the frame's
+        // query/insert so it never stalls association, and the cost is spread
+        // across frames instead of a periodic full-map sweep.
+        self.merge_frame_counter = self.merge_frame_counter.wrapping_add(1);
+        if let Some(budget) = self.config.merge_budget_per_frame
+            && budget > 0
+            && let PipelineMap::Surfel(map) = &mut self.local_map
+        {
+            let merge_start = Instant::now();
+            let merged = map.merge_incremental(budget);
+            if merged > 0 {
+                eprintln!(
+                    "surfel_merge t={:.6} merged={} map_points={}",
+                    frame_end_ts,
+                    merged,
+                    map.len()
+                );
+            }
+            let _ = merge_start.elapsed();
+        }
+
         Ok(PipelineFrameReport {
             mode,
             preprocessed_points,
             effective_observations,
             association_stats,
+            map_insert_diagnostics,
             map_points_before,
             map_points_after: self.local_map.len(),
             update,
@@ -636,6 +708,55 @@ impl FastLioPipeline {
             },
         })
     }
+}
+
+fn diagnose_map_insert_consistency(
+    local_map: &PipelineMap,
+    points_w: &[PointXYZI],
+) -> Result<PipelineMapInsertDiagnostics> {
+    let PipelineMap::Surfel(map) = local_map else {
+        return Ok(PipelineMapInsertDiagnostics::default());
+    };
+    if map.is_empty() || points_w.is_empty() {
+        return Ok(PipelineMapInsertDiagnostics::default());
+    }
+
+    let mut scratch = map.create_query_scratch();
+    let mut diagnostics = PipelineMapInsertDiagnostics {
+        sampled_points: points_w.len(),
+        ..PipelineMapInsertDiagnostics::default()
+    };
+    let mut distances = Vec::with_capacity(points_w.len());
+    for point in points_w {
+        let Some(consistency) = map.insertion_consistency_with_scratch(point, &mut scratch)? else {
+            diagnostics.no_match += 1;
+            continue;
+        };
+        match consistency.kind {
+            SurfelConstraintKind::Plane => diagnostics.matched_plane += 1,
+            SurfelConstraintKind::Line => diagnostics.matched_line += 1,
+            SurfelConstraintKind::GrowingWeak => diagnostics.matched_growing_weak += 1,
+        }
+        diagnostics.distance_sum += consistency.distance;
+        diagnostics.distance_max = diagnostics.distance_max.max(consistency.distance);
+        distances.push(consistency.distance);
+    }
+
+    if !distances.is_empty() {
+        distances.sort_by(f64::total_cmp);
+        diagnostics.distance_p50 = percentile_sorted(&distances, 0.50);
+        diagnostics.distance_p95 = percentile_sorted(&distances, 0.95);
+    }
+    Ok(diagnostics)
+}
+
+fn percentile_sorted(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let last = values.len() - 1;
+    let index = ((last as f64) * percentile.clamp(0.0, 1.0)).round() as usize;
+    values[index]
 }
 
 #[derive(Default)]
@@ -844,10 +965,17 @@ fn build_factors_for_indices(
             &mut surfel_query_scratch,
         ) {
             (PipelineMap::Kiddo(map), Some(scratch), _) => {
-                map.point_to_plane_match_attempt_with_scratch(point_w, config, scratch)
+                let (matched, timings) =
+                    map.point_to_plane_match_attempt_with_scratch(point_w, config, scratch);
+                let matched = matched.map(|matched| {
+                    let mut matches = smallvec::SmallVec::new();
+                    matches.push(matched);
+                    matches
+                });
+                (matched, timings)
             }
             (PipelineMap::Surfel(map), _, Some(scratch)) => {
-                map.point_to_plane_match_attempt_with_scratch(point_w, config, scratch)
+                map.point_to_plane_or_line_matches_attempt_with_scratch(point_w, config, scratch)
             }
             (PipelineMap::Kiddo(_), None, _) => unreachable!("kiddo map requires query scratch"),
             (PipelineMap::Surfel(_), _, None) => unreachable!("surfel map requires query scratch"),
@@ -859,24 +987,26 @@ fn build_factors_for_indices(
             build.stats.record_surfel_query(scratch.last_stats());
         }
 
-        let matched = match matched {
-            Ok(matched) => matched,
+        let matches = match matched {
+            Ok(matches) => matches,
             Err(err) => {
                 build.stats.record_error(&err);
                 build.missed_sample_indices.push(point_index);
                 continue;
             }
         };
-        build.stats.accepted_observations += 1;
-        build.stats.record_normal(matched.plane.normal_w);
+        for matched in matches {
+            build.stats.accepted_observations += 1;
+            build.stats.record_normal(matched.plane.normal_w);
 
-        let factor_start = Instant::now();
-        build.factors.push(IesekfPointToPlaneFactor {
-            point_i,
-            plane_w: matched.plane,
-            weight: matched.weight,
-        });
-        build.timings.factor_build += factor_start.elapsed();
+            let factor_start = Instant::now();
+            build.factors.push(IesekfPointToPlaneFactor {
+                point_i,
+                plane_w: matched.plane,
+                weight: matched.weight,
+            });
+            build.timings.factor_build += factor_start.elapsed();
+        }
     }
     build
 }
@@ -1056,6 +1186,7 @@ mod tests {
             map_insert_min_distance: None,
             initialization_groups: 0,
             max_reassociation_passes: 0,
+            merge_budget_per_frame: None,
         }
     }
 

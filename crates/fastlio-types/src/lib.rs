@@ -102,7 +102,11 @@ pub struct SurfelConfig {
     pub min_mature_surfel_count: usize,
     pub max_mahalanobis_distance: f32,
     pub growing_radius: f32,
+    pub enable_line_constraints: bool,
+    pub max_line_distance: f32,
+    pub line_constraint_weight: f32,
     pub allow_growing_constraints: bool,
+    pub max_growing_constraint_distance: f32,
     pub growing_constraint_weight: f32,
 }
 
@@ -116,6 +120,10 @@ impl Default for SurfelConfig {
             // surfel planes strict while surviving normal pose error.
             max_plane_distance: 0.3,
             max_planarity_ratio: 0.10,
+            // 0.001 (dev value) classifies narrow-spread surfaces (tree
+            // patches, edge noise) as planes; measured end_drift 43 m on
+            // yuanqu vs 0.30 m at 0.025. 0.025 filters to trustworthy planes
+            // (tangential spread >= 0.16 m radius).
             min_plane_spread_eigenvalue: 0.025,
             covariance_eigenvalue_floor: default_covariance_eigenvalue_floor(),
             min_linearity: 0.70,
@@ -124,7 +132,11 @@ impl Default for SurfelConfig {
             min_mature_surfel_count: 16,
             max_mahalanobis_distance: 2.0,
             growing_radius: 0.8,
+            enable_line_constraints: false,
+            max_line_distance: 0.3,
+            line_constraint_weight: 0.5,
             allow_growing_constraints: false,
+            max_growing_constraint_distance: 0.25,
             growing_constraint_weight: 0.05,
         }
     }

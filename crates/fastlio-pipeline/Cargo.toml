@@ -12,3 +12,4 @@ fastlio-estimator = { path = "../fastlio-estimator" }
 anyhow = { workspace = true }
 nalgebra = { workspace = true }
 camino = { workspace = true }
+smallvec = "1.15.2"

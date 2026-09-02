@@ -1,0 +1,39 @@
+common:
+    lid_topic:  "/velodyne_points"
+    imu_topic:  "/imu/data"
+    time_sync_en: false
+    time_offset_lidar_to_imu: 0.0
+
+preprocess:
+    lidar_type: 2
+    scan_line: 16
+    blind: 2.0
+    voxel_size: 0.2
+
+mapping:
+    acc_cov: 0.01256144599541998
+    gyr_cov: 9.331396894090049e-05
+    b_acc_cov: 0.0001286757133427232
+    b_gyr_cov: 0.0001286757133427232
+    extrinsic_est_en: false
+    extrinsic_T: [-0.01907, 0.0045, 0.05714]
+    extrinsic_R: [0.9992567134, 0.0323885370, -0.0209046257,
+                  -0.0323328632, 0.9994726664, 0.0029958365,
+                   0.0209906327, -0.0023177033, 0.9997769859]
+
+surfel_map_config:
+    voxel_size: 0.4
+    insert_search_radius: 0
+    search_radius: 0
+    fallback_search_radius: 2
+
+surfel_config:
+    max_plane_distance: 0.15
+    max_planarity_ratio: 0.10
+    min_plane_spread_eigenvalue: 0.025
+    min_mature_surfel_count: 16
+    max_mahalanobis_distance: 2.0
+    growing_radius: 0.8
+    enable_line_constraints: true
+    max_line_distance: 0.2
+    line_constraint_weight: 0.5

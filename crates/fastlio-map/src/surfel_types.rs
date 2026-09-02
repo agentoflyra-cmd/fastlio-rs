@@ -65,7 +65,7 @@ impl VoxelKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeometryClass {
     Plane,
     Line,
@@ -183,6 +183,34 @@ impl Surfel {
             return 0.0;
         }
         (self.eigenvalues[2] - self.eigenvalues[1]) / self.eigenvalues[2]
+    }
+
+    pub fn line_quality(&self) -> f64 {
+        self.linearity()
+    }
+
+    pub fn line_distance(&self, point: &PointXYZI) -> f64 {
+        let delta = point.to_vec3_f64() - self.mean_w;
+        let n0 = self.eigenvectors.column(0);
+        let n1 = self.eigenvectors.column(1);
+        let r0 = n0.dot(&delta);
+        let r1 = n1.dot(&delta);
+        (r0 * r0 + r1 * r1).sqrt()
+    }
+
+    pub fn within_line_distance(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
+        self.line_distance(point) <= config.max_line_distance as f64
+    }
+
+    pub fn within_line_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
+        let delta = point.to_vec3_f64() - self.mean_w;
+        let direction = self.eigenvectors.column(2);
+        let along = direction.dot(&delta);
+        let covariance_floor = config.covariance_eigenvalue_floor as f64;
+        let l2 = self.eigenvalues[2].max(covariance_floor);
+        let support_sigma = config.max_mahalanobis_distance as f64;
+
+        along * along / l2 <= support_sigma * support_sigma
     }
 
     fn scattering(&self) -> f64 {
