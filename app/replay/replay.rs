@@ -13,13 +13,14 @@ use camino::{Utf8Path, Utf8PathBuf};
 use fastlio_dataset::{SensorEvent, read_mcap_events};
 use fastlio_estimator::iesekf::{ErrorStateCovariance, Iesekf, IesekfConfig};
 use fastlio_imu::ImuIntegrator;
-use fastlio_map::{LocalMap, PointToPlaneConfig};
+use fastlio_map::{LocalMap, PointToPlaneConfig, surfel::SurfelMap};
 use fastlio_pipeline::main_pipeline::{
-    FastLioPipeline, PipelineConfig, PipelineMode, PipelineStageTimings,
+    FastLioPipeline, PipelineAssociationStats, PipelineConfig, PipelineMode, PipelineStageTimings,
 };
 use fastlio_pipeline::synchronizer::MeasurementSynchronizer;
 use fastlio_types::{
-    Config, LidarImuExtrinsic, NavState, PointXYZI, Pose3, Vec3, read_from_config_path,
+    Config, LidarImuExtrinsic, NavState, PointXYZI, Pose3, SurfelConfig, Vec3,
+    read_from_config_path,
 };
 use nalgebra::UnitQuaternion;
 
@@ -33,7 +34,8 @@ fn main() -> Result<()> {
     if let Some(offset_sec) = args.time_offset_lidar_to_imu_override {
         config.common.time_offset_lidar_to_imu = Some(offset_sec);
     }
-    let mut replay = OfflineReplay::new(config)?;
+    args.surfel_options.apply_to_config(&mut config)?;
+    let mut replay = OfflineReplay::new(config, args.map_backend)?;
     replay.live_stream = start_live_viewer(&args.viewer)?;
     let stats = run_spsc_replay(&args, &mut replay)
         .with_context(|| format!("failed to replay MCAP `{}`", args.bag_path))?;
@@ -45,7 +47,8 @@ fn main() -> Result<()> {
 
     write_trajectory_csv(&trajectory_path, &replay.trajectory)?;
     write_latency_csv(&latency_path, &replay.latency)?;
-    write_ascii_pcd(&map_path, replay.pipeline.local_map.points())?;
+    let map_output_points = replay.pipeline.local_map.output_points();
+    write_ascii_pcd(&map_path, &map_output_points)?;
     write_summary(&summary_path, stats, &replay)?;
     open_viewer(&args.viewer, &map_path)?;
 
@@ -53,6 +56,7 @@ fn main() -> Result<()> {
     println!("  processed frames: {}", replay.processed_frames);
     println!("  initializing frames: {}", replay.initializing_frames);
     println!("  tracking frames: {}", replay.tracking_frames);
+    println!("  tracking lost frames: {}", replay.tracking_lost_frames);
     println!("  bootstrap frames: {}", replay.bootstrap_frames);
     println!("  failed groups: {}", replay.failed_groups);
     println!("  map points: {}", replay.pipeline.local_map.len());
@@ -72,13 +76,15 @@ struct ReplayArgs {
     channel_capacity: usize,
     time_offset_lidar_to_imu_override: Option<f64>,
     viewer: ReplayViewer,
+    map_backend: ReplayMapBackend,
+    surfel_options: ReplaySurfelOptions,
 }
 
 impl ReplayArgs {
     fn parse(args: Vec<String>) -> Result<Self> {
         if args.len() < 4 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--time-offset-lidar-to-imu <sec>] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
+                "usage: {} <bag.mcap> <config.yaml> <output_dir> [playback_rate] [channel_capacity] [--time-offset-lidar-to-imu <sec>] [--map-backend kiddo|surfel] [--surfel-allow-growing-constraints] [--surfel-growing-constraint-weight <weight>] [--open-playground|--live-playground|--playground <path>|--live-addr <addr>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
@@ -107,7 +113,7 @@ impl ReplayArgs {
         if channel_capacity == 0 {
             bail!("channel_capacity must be positive");
         }
-        let (viewer_args, time_offset_lidar_to_imu_override) =
+        let (viewer_args, time_offset_lidar_to_imu_override, map_backend, surfel_options) =
             parse_replay_options(&args[next_arg..])?;
         let viewer = ReplayViewer::parse(&viewer_args)?;
 
@@ -119,13 +125,74 @@ impl ReplayArgs {
             channel_capacity,
             time_offset_lidar_to_imu_override,
             viewer,
+            map_backend,
+            surfel_options,
         })
     }
 }
 
-fn parse_replay_options(args: &[String]) -> Result<(Vec<String>, Option<f64>)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayMapBackend {
+    Kiddo,
+    Surfel,
+}
+
+impl ReplayMapBackend {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "kiddo" | "local" | "local-map" => Ok(Self::Kiddo),
+            "surfel" | "surfel-map" => Ok(Self::Surfel),
+            _ => bail!("unknown --map-backend `{value}`; expected kiddo or surfel"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kiddo => "kiddo",
+            Self::Surfel => "surfel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ReplaySurfelOptions {
+    allow_growing_constraints: bool,
+    growing_constraint_weight: Option<f32>,
+}
+
+impl ReplaySurfelOptions {
+    fn apply_to_config(self, config: &mut Config) -> Result<()> {
+        if !self.allow_growing_constraints && self.growing_constraint_weight.is_none() {
+            return Ok(());
+        }
+        let surfel_config = config
+            .surfel_config
+            .get_or_insert_with(SurfelConfig::default);
+        if self.allow_growing_constraints {
+            surfel_config.allow_growing_constraints = true;
+        }
+        if let Some(weight) = self.growing_constraint_weight {
+            if !weight.is_finite() || weight < 0.0 {
+                bail!("--surfel-growing-constraint-weight must be finite and non-negative");
+            }
+            surfel_config.growing_constraint_weight = weight;
+        }
+        Ok(())
+    }
+}
+
+fn parse_replay_options(
+    args: &[String],
+) -> Result<(
+    Vec<String>,
+    Option<f64>,
+    ReplayMapBackend,
+    ReplaySurfelOptions,
+)> {
     let mut viewer_args = Vec::new();
     let mut time_offset_lidar_to_imu_override = None;
+    let mut map_backend = ReplayMapBackend::Kiddo;
+    let mut surfel_options = ReplaySurfelOptions::default();
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {
@@ -142,6 +209,27 @@ fn parse_replay_options(args: &[String]) -> Result<(Vec<String>, Option<f64>)> {
                 time_offset_lidar_to_imu_override = Some(offset_sec);
                 idx += 2;
             }
+            "--map-backend" => {
+                let Some(value) = args.get(idx + 1) else {
+                    bail!("--map-backend requires `kiddo` or `surfel`");
+                };
+                map_backend = ReplayMapBackend::parse(value)?;
+                idx += 2;
+            }
+            "--surfel-allow-growing-constraints" => {
+                surfel_options.allow_growing_constraints = true;
+                idx += 1;
+            }
+            "--surfel-growing-constraint-weight" => {
+                let Some(value) = args.get(idx + 1) else {
+                    bail!("--surfel-growing-constraint-weight requires a weight value");
+                };
+                let weight = value.parse::<f32>().with_context(|| {
+                    format!("invalid --surfel-growing-constraint-weight `{value}`")
+                })?;
+                surfel_options.growing_constraint_weight = Some(weight);
+                idx += 2;
+            }
             _ => {
                 viewer_args.push(args[idx].clone());
                 idx += 1;
@@ -149,7 +237,12 @@ fn parse_replay_options(args: &[String]) -> Result<(Vec<String>, Option<f64>)> {
         }
     }
 
-    Ok((viewer_args, time_offset_lidar_to_imu_override))
+    Ok((
+        viewer_args,
+        time_offset_lidar_to_imu_override,
+        map_backend,
+        surfel_options,
+    ))
 }
 
 enum ReplayViewer {
@@ -449,6 +542,7 @@ struct LatencyRow {
     end_to_end: Duration,
     live_stream: Duration,
     pipeline: PipelineStageTimings,
+    association_stats: PipelineAssociationStats,
 }
 
 struct OfflineReplay {
@@ -462,6 +556,7 @@ struct OfflineReplay {
     processed_frames: usize,
     initializing_frames: usize,
     tracking_frames: usize,
+    tracking_lost_frames: usize,
     bootstrap_frames: usize,
     failed_groups: usize,
     max_pending_lidar: usize,
@@ -477,7 +572,7 @@ struct OfflineReplay {
 }
 
 impl OfflineReplay {
-    fn new(config: Config) -> Result<Self> {
+    fn new(config: Config, map_backend: ReplayMapBackend) -> Result<Self> {
         let time_offset_lidar_to_imu_sec = config.common.time_offset_lidar_to_imu.unwrap_or(0.0);
         if !time_offset_lidar_to_imu_sec.is_finite() {
             bail!("common.time_offset_lidar_to_imu must be finite when present");
@@ -513,29 +608,57 @@ impl OfflineReplay {
                 ..IesekfConfig::default()
             },
             min_effective_observations: 10,
+            // Frame-to-frame displacement is physical motion (speed * dt), so a
+            // displacement gate is always overtaken by real vehicle speed
+            // (1.0 m at 10 m/s, 3.0 m at 30 m/s on aneng). Update sanity is
+            // enforced solely by the correction gates below, which constrain
+            // predicted->updated change (error), not previous->updated motion.
+            max_tracking_translation_step: None,
+            max_tracking_rotation_step_rad: Some(20.0_f64.to_radians()),
+            max_update_translation_correction: Some(0.3),
+            max_update_rotation_correction_rad: Some(10.0_f64.to_radians()),
             map_crop_radius: Some(100.0),
             insert_scan_points: true,
             max_factor_points: Some(2_000),
             max_map_insert_points: Some(5_000),
             map_insert_min_distance: Some(0.10),
             initialization_groups: 10,
+            // Reassociate once at the corrected pose: recovers points missed
+            // at the predicted pose (pose error above the strict tolerance)
+            // without globally relaxing the match tolerance.
+            max_reassociation_passes: 1,
         };
 
-        Ok(Self {
-            synchronizer: MeasurementSynchronizer::new(),
-            pipeline: FastLioPipeline::new(
+        let pipeline = match map_backend {
+            ReplayMapBackend::Kiddo => FastLioPipeline::new(
                 filter,
                 LocalMap::new(),
                 imu_integrator,
                 extrinsic,
                 pipeline_config,
             ),
+            ReplayMapBackend::Surfel => FastLioPipeline::new_with_surfel_map(
+                filter,
+                SurfelMap::new(
+                    config.surfel_map_config.unwrap_or_default(),
+                    config.surfel_config.unwrap_or_default(),
+                ),
+                imu_integrator,
+                extrinsic,
+                pipeline_config,
+            ),
+        };
+
+        Ok(Self {
+            synchronizer: MeasurementSynchronizer::new(),
+            pipeline,
             time_offset_lidar_to_imu_sec,
             trajectory: Vec::new(),
             latency: Vec::new(),
             processed_frames: 0,
             initializing_frames: 0,
             tracking_frames: 0,
+            tracking_lost_frames: 0,
             bootstrap_frames: 0,
             failed_groups: 0,
             max_pending_lidar: 0,
@@ -596,11 +719,13 @@ impl OfflineReplay {
                     PipelineMode::Initializing => self.initializing_frames += 1,
                     PipelineMode::BootstrapMap => self.bootstrap_frames += 1,
                     PipelineMode::Tracking => self.tracking_frames += 1,
+                    PipelineMode::TrackingLost => self.tracking_lost_frames += 1,
                 }
                 self.push_trajectory_row(timestamp_sec, report.mode, report.effective_observations);
                 let live_stream_start = Instant::now();
                 if let Some(live_stream) = &mut self.live_stream
-                    && let Err(err) = live_stream.send_map_delta(self.pipeline.local_map.points())
+                    && let Err(err) =
+                        live_stream.send_map_delta(&self.pipeline.local_map.output_points())
                 {
                     eprintln!("live viewer stream failed at {timestamp_sec:.6}: {err:#}");
                     self.live_stream = None;
@@ -615,6 +740,7 @@ impl OfflineReplay {
                     end_to_end: end_to_end_start.elapsed(),
                     live_stream: live_stream_duration,
                     pipeline: report.timings,
+                    association_stats: report.association_stats,
                 });
             }
             Err(err) => {
@@ -693,12 +819,22 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
     );
     writeln!(
         writer,
-        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,association_nearest_ms,association_plane_fit_ms,association_residual_ms,association_factor_build_ms,update_ms,map_insert_ms,map_crop_ms"
+        "frame_index,timestamp_sec,mode,effective_observations,map_points,end_to_end_ms,live_stream_ms,pipeline_total_ms,imu_boundary_ms,initialization_ms,motion_segments_ms,predict_ms,deskew_ms,preprocess_ms,association_ms,association_nearest_ms,association_plane_fit_ms,association_residual_ms,association_factor_build_ms,update_ms,map_insert_ms,map_crop_ms,association_sampled_points,association_accepted_observations,association_non_finite_scan_points,association_invalid_configs,association_no_planar_surfel,association_neighbour_too_far,association_plane_fit_errors,association_residual_too_large,surfel_primary_raw_candidates,surfel_primary_unique_candidates,surfel_fallback_raw_candidates,surfel_fallback_unique_candidates,surfel_fallback_queries,surfel_fallback_hits,surfel_planar_candidates,surfel_growing_candidates,surfel_accepted_growing_weak,association_normal_mean_x,association_normal_mean_y,association_normal_mean_z"
     )?;
     for row in latency {
+        let accepted = row.association_stats.accepted_observations as f64;
+        let (normal_mean_x, normal_mean_y, normal_mean_z) = if accepted > 0.0 {
+            (
+                row.association_stats.normal_sum_x / accepted,
+                row.association_stats.normal_sum_y / accepted,
+                row.association_stats.normal_sum_z / accepted,
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        };
         writeln!(
             writer,
-            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6}",
+            "{},{:.9},{:?},{},{},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.9},{:.9},{:.9}",
             row.frame_index,
             row.timestamp_sec,
             row.mode,
@@ -721,6 +857,26 @@ fn write_latency_csv(path: &Utf8Path, latency: &[LatencyRow]) -> Result<()> {
             duration_ms(row.pipeline.update),
             duration_ms(row.pipeline.map_insert),
             duration_ms(row.pipeline.map_crop),
+            row.association_stats.sampled_points,
+            row.association_stats.accepted_observations,
+            row.association_stats.non_finite_scan_points,
+            row.association_stats.invalid_configs,
+            row.association_stats.no_planar_surfel,
+            row.association_stats.neighbour_too_far,
+            row.association_stats.plane_fit_errors,
+            row.association_stats.residual_too_large,
+            row.association_stats.surfel_primary_raw_candidates,
+            row.association_stats.surfel_primary_unique_candidates,
+            row.association_stats.surfel_fallback_raw_candidates,
+            row.association_stats.surfel_fallback_unique_candidates,
+            row.association_stats.surfel_fallback_queries,
+            row.association_stats.surfel_fallback_hits,
+            row.association_stats.surfel_planar_candidates,
+            row.association_stats.surfel_growing_candidates,
+            row.association_stats.surfel_accepted_growing_weak,
+            normal_mean_x,
+            normal_mean_y,
+            normal_mean_z,
         )?;
     }
     Ok(())
@@ -779,9 +935,19 @@ fn write_summary(
     writeln!(writer, "processed_frames={}", replay.processed_frames)?;
     writeln!(writer, "initializing_frames={}", replay.initializing_frames)?;
     writeln!(writer, "tracking_frames={}", replay.tracking_frames)?;
+    writeln!(
+        writer,
+        "tracking_lost_frames={}",
+        replay.tracking_lost_frames
+    )?;
     writeln!(writer, "bootstrap_frames={}", replay.bootstrap_frames)?;
     writeln!(writer, "failed_groups={}", replay.failed_groups)?;
     writeln!(writer, "max_pending_lidar={}", replay.max_pending_lidar)?;
+    writeln!(
+        writer,
+        "map_backend={}",
+        replay.pipeline.local_map.backend_name()
+    )?;
     writeln!(
         writer,
         "time_offset_lidar_to_imu_sec={:.9}",
@@ -846,6 +1012,17 @@ fn write_summary(
         writeln!(writer, "first_lidar_drop_before_first_imu=none")?;
     }
     writeln!(writer, "map_points={}", replay.pipeline.local_map.len())?;
+    if replay.pipeline.local_map.backend_name() == ReplayMapBackend::Surfel.as_str() {
+        writeln!(
+            writer,
+            "map_output_points={}",
+            replay.pipeline.local_map.output_points().len()
+        )?;
+        writeln!(
+            writer,
+            "map_output_semantics=surfel_centroids_with_intensity_as_surfel_point_count"
+        )?;
+    }
     write_latency_summary(&mut writer, replay)?;
     writeln!(writer)?;
     writeln!(writer, "minimal_implementation_notes=")?;
@@ -875,11 +1052,19 @@ fn write_summary(
     )?;
     writeln!(
         writer,
-        "- map output is a single ASCII PCD; pass --open-playground to launch /home/lyra/playground on that PCD after replay"
+        "- map backend defaults to kiddo; pass --map-backend surfel to test the surfel compression backend on the same replay pipeline"
+    )?;
+    writeln!(
+        writer,
+        "- map output is a single ASCII PCD; surfel backend writes surfel centroids instead of the dense inserted point pool"
     )?;
     writeln!(
         writer,
         "- failed synchronized frames are counted and skipped; no retry or queue-based recovery yet"
+    )?;
+    writeln!(
+        writer,
+        "- after tracking is established, low-observation or gate-rejected frames enter TrackingLost and skip map insertion; with sufficient observations and a passing acceptance gate the next frame recovers tracking and resumes map insertion"
     )?;
     Ok(())
 }
@@ -1107,6 +1292,7 @@ mod tests {
         assert_eq!(parsed.playback_rate, 0.0);
         assert_eq!(parsed.channel_capacity, 1024);
         assert_eq!(parsed.time_offset_lidar_to_imu_override, None);
+        assert_eq!(parsed.map_backend, ReplayMapBackend::Kiddo);
         assert!(matches!(parsed.viewer, ReplayViewer::None));
     }
 
@@ -1149,6 +1335,13 @@ mod tests {
     #[test]
     fn parse_replay_args_rejects_non_finite_time_offset() {
         assert!(ReplayArgs::parse(args(&["--time-offset-lidar-to-imu", "NaN"])).is_err());
+    }
+
+    #[test]
+    fn parse_replay_args_accepts_surfel_map_backend() {
+        let parsed = ReplayArgs::parse(args(&["--map-backend", "surfel"])).unwrap();
+
+        assert_eq!(parsed.map_backend, ReplayMapBackend::Surfel);
     }
 
     #[test]
