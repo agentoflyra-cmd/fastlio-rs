@@ -67,6 +67,23 @@ pub struct SurfelMapQueryStats {
     pub accepted_growing_weak: usize,
 }
 
+/// One surfel as a renderable point for the three.js surfel viewer.
+///
+/// Matches the dev-branch `SurfelPcdPoint` layout: centroid position, point
+/// count as intensity, plane normal, and geometry class id in `GeometryClass`
+/// order (Plane=0, Line=1, Scatter=2, Degenerate=3, Growing=4).
+#[derive(Debug, Clone, Copy)]
+pub struct SurfelOutputPoint {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub intensity: f32,
+    pub normal_x: f32,
+    pub normal_y: f32,
+    pub normal_z: f32,
+    pub class_id: f32,
+}
+
 impl SurfelMap {
     pub fn new(map_config: SurfelMapConfig, surfel_config: SurfelConfig) -> Self {
         Self {
@@ -97,6 +114,27 @@ impl SurfelMap {
                 y: surfel.mean_w.y as f32,
                 z: surfel.mean_w.z as f32,
                 intensity: surfel.count.min(u16::MAX as usize) as f32,
+            })
+            .collect()
+    }
+
+    /// Centroid + normal + geometry class for the three.js surfel viewer
+    /// (dev-branch compatible binary PCD with `normal_*` and `class_id`).
+    pub fn output_surfel_points(&self) -> Vec<SurfelOutputPoint> {
+        self.surfels
+            .values()
+            .map(|surfel| {
+                let normal = surfel.eigenvectors.column(0);
+                SurfelOutputPoint {
+                    x: surfel.mean_w.x as f32,
+                    y: surfel.mean_w.y as f32,
+                    z: surfel.mean_w.z as f32,
+                    intensity: surfel.count.min(u16::MAX as usize) as f32,
+                    normal_x: normal.x as f32,
+                    normal_y: normal.y as f32,
+                    normal_z: normal.z as f32,
+                    class_id: surfel.geometry_class(&self.surfel_config).class_id() as f32,
+                }
             })
             .collect()
     }

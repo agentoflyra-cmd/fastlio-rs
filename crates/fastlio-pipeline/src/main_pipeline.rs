@@ -5,7 +5,7 @@ use fastlio_estimator::iesekf::{
 use fastlio_imu::ImuIntegrator;
 use fastlio_map::{
     LocalMap, PointToPlaneConfig, PointToPlaneError,
-    surfel::{SurfelMap, SurfelMapQueryStats},
+    surfel::{SurfelMap, SurfelMapQueryStats, SurfelOutputPoint},
 };
 use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
@@ -122,6 +122,15 @@ impl PipelineMap {
                 })
                 .collect(),
             Self::Surfel(map) => map.output_points(),
+        }
+    }
+
+    /// Surfel centroids with normals and geometry classes for the three.js
+    /// viewer (binary PCD with `normal_*` + `class_id`). `None` for kiddo.
+    pub fn output_surfel_points(&self) -> Option<Vec<SurfelOutputPoint>> {
+        match self {
+            Self::Kiddo(_) => None,
+            Self::Surfel(map) => Some(map.output_surfel_points()),
         }
     }
 

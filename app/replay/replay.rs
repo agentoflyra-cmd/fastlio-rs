@@ -49,6 +49,14 @@ fn main() -> Result<()> {
     write_latency_csv(&latency_path, &replay.latency)?;
     let map_output_points = replay.pipeline.local_map.output_points();
     write_ascii_pcd(&map_path, &map_output_points)?;
+    let mut surfel_viewer_path = None;
+    if let Some(surfels) = replay.pipeline.local_map.output_surfel_points() {
+        // Dev-compatible binary PCD (normals + class_id) for the three.js
+        // surfel viewer at app/surfel-viewer-web.
+        let path = args.output_dir.join("surfel.pcd");
+        write_binary_surfel_pcd(&path, &surfels)?;
+        surfel_viewer_path = Some(path);
+    }
     write_summary(&summary_path, stats, &replay)?;
     open_viewer(&args.viewer, &map_path)?;
 
@@ -63,6 +71,9 @@ fn main() -> Result<()> {
     println!("  trajectory: {trajectory_path}");
     println!("  latency: {latency_path}");
     println!("  map: {map_path}");
+    if let Some(surfel_viewer_path) = surfel_viewer_path {
+        println!("  surfel viewer pcd: {surfel_viewer_path}");
+    }
     println!("  summary: {summary_path}");
 
     Ok(())
@@ -903,6 +914,49 @@ fn write_ascii_pcd(path: &Utf8Path, points: &[PointXYZI]) -> Result<()> {
             "{:.6} {:.6} {:.6} {:.6}",
             point.x, point.y, point.z, point.intensity
         )?;
+    }
+    Ok(())
+}
+
+/// Write surfel centroids as a little-endian binary PCD with
+/// `x y z intensity normal_x normal_y normal_z class_id`, the format the
+/// three.js surfel viewer (`app/surfel-viewer-web`) renders with class colors
+/// and normal lines.
+fn write_binary_surfel_pcd(
+    path: &Utf8Path,
+    surfels: &[fastlio_map::surfel::SurfelOutputPoint],
+) -> Result<()> {
+    let mut writer = BufWriter::new(
+        File::create(path).with_context(|| format!("failed to create map `{path}`"))?,
+    );
+    writeln!(writer, "# .PCD v0.7 - Point Cloud Data file format")?;
+    writeln!(writer, "VERSION 0.7")?;
+    writeln!(
+        writer,
+        "FIELDS x y z intensity normal_x normal_y normal_z class_id"
+    )?;
+    writeln!(writer, "SIZE 4 4 4 4 4 4 4 4")?;
+    writeln!(writer, "TYPE F F F F F F F F")?;
+    writeln!(writer, "COUNT 1 1 1 1 1 1 1 1")?;
+    writeln!(writer, "WIDTH {}", surfels.len())?;
+    writeln!(writer, "HEIGHT 1")?;
+    writeln!(writer, "VIEWPOINT 0 0 0 1 0 0 0")?;
+    writeln!(writer, "POINTS {}", surfels.len())?;
+    writeln!(writer, "DATA binary")?;
+    writer.flush()?;
+    let mut out = writer
+        .into_inner()
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    use std::io::Write as _;
+    for surfel in surfels {
+        out.write_all(&surfel.x.to_le_bytes())?;
+        out.write_all(&surfel.y.to_le_bytes())?;
+        out.write_all(&surfel.z.to_le_bytes())?;
+        out.write_all(&surfel.intensity.to_le_bytes())?;
+        out.write_all(&surfel.normal_x.to_le_bytes())?;
+        out.write_all(&surfel.normal_y.to_le_bytes())?;
+        out.write_all(&surfel.normal_z.to_le_bytes())?;
+        out.write_all(&surfel.class_id.to_le_bytes())?;
     }
     Ok(())
 }

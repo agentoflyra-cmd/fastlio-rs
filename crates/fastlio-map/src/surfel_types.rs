@@ -74,6 +74,20 @@ pub enum GeometryClass {
     Growing,
 }
 
+impl GeometryClass {
+    /// Viewer class id (order matches the dev three.js viewer's
+    /// `CLASS_NAMES`/`CLASS_COLORS` tables).
+    pub fn class_id(self) -> u8 {
+        match self {
+            Self::Plane => 0,
+            Self::Line => 1,
+            Self::Scatter => 2,
+            Self::Degenerate => 3,
+            Self::Growing => 4,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Surfel {
     pub mean_w: Vec3<f64>,

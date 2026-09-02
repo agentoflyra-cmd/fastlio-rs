@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Surfel Viewer</title>
+  <style>
+    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #101214; }
+    #toolbar { position: fixed; z-index: 2; inset: 12px 12px auto 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    #file { max-width: 280px; }
+    #stats { color: #d8dee9; background: #20252b; padding: 7px 10px; border-radius: 5px; }
+    #class-filters { display: flex; gap: 8px; flex-wrap: wrap; color: #cbd5e1; }
+    .class-filter { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+    .class-swatch { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+    #help { color: #9ba7b4; }
+    #scene { width: 100%; height: 100%; }
+    label { color: #cbd5e1; }
+    input[type=range] { width: 100px; vertical-align: middle; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <input id="file" type="file" accept=".pcd">
+    <label>点大小 <input id="point-size" type="range" min="1" max="12" step="0.5" value="3"></label>
+    <label><input id="show-normals" type="checkbox" checked> 法向量</label>
+    <span id="class-filters"></span>
+    <span id="stats">请选择包含 class_id 的 Surfel PCD</span>
+    <span id="help">左键旋转 · 中键缩放 · 右键平移 · 滚轮缩放</span>
+  </div>
+  <div id="scene"></div>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+        "three/": "https://unpkg.com/three@0.182.0/"
+      }
+    }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+
+    const CLASS_NAMES = ["Plane", "Line", "Scatter", "Degenerate", "Growing"];
+    const CLASS_COLORS = [0x35d06f, 0xf29b38, 0xf04444, 0xc05be8, 0x668cff];
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x101214);
+    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100000);
+    camera.position.set(0, -20, 10);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio);
+    renderer.setSize(innerWidth, innerHeight);
+    document.querySelector("#scene").appendChild(renderer.domElement);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.mouseButtons = {
+      LEFT: THREE.MOUSE.ROTATE,
+      MIDDLE: THREE.MOUSE.PAN,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+    renderer.domElement.addEventListener("contextmenu", event => event.preventDefault());
+    controls.touches.ONE = THREE.TOUCH.ROTATE;
+    controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+
+    const root = new THREE.Group();
+    scene.add(root);
+    let pointMaterial;
+    let classVisibility = [true, true, true, true, true];
+    let normalLines;
+    let loadedPoints = 0;
+
+    document.querySelector("#file").addEventListener("change", async event => {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      try {
+        await loadPcd(file.name, await file.arrayBuffer());
+      } catch (error) {
+        document.querySelector("#stats").textContent = `加载失败: ${error.message}`;
+      }
+    });
+
+    const defaultPcd = new URLSearchParams(location.search).get("pcd") ?? "surfel.pcd";
+    fetch(defaultPcd)
+      .then(response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.arrayBuffer();
+      })
+      .then(buffer => loadPcd(defaultPcd, buffer))
+      .catch(() => {
+        document.querySelector("#stats").textContent =
+          "请选择 PCD，或将 surfel.pcd 放到网页目录后刷新";
+      });
+
+    document.querySelector("#point-size").addEventListener("input", event => {
+      if (pointMaterial) pointMaterial.uniforms.uPointSize.value = Number(event.target.value);
+    });
+    document.querySelector("#show-normals").addEventListener("change", event => {
+      if (normalLines) normalLines.visible = event.target.checked;
+    });
+
+    function parsePcd(buffer) {
+      const bytes = new Uint8Array(buffer);
+      const marker = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 8192)));
+      const dataMatch = marker.match(/(?:^|\n)DATA\s+(\w+)\s*\n/i);
+      if (!dataMatch) throw new Error("PCD 缺少 DATA header");
+      if (dataMatch[1].toLowerCase() !== "binary") throw new Error("只支持 binary PCD");
+      const headerEnd = dataMatch.index + dataMatch[0].length;
+      const header = marker.slice(0, headerEnd);
+      const get = name => header.match(new RegExp(`(?:^|\\n)${name}\\s+([^\\n]+)`, "i"))?.[1].trim().split(/\s+/);
+      const fields = get("FIELDS");
+      const sizes = get("SIZE").map(Number);
+      const types = get("TYPE");
+      const counts = get("COUNT")?.map(Number) ?? fields.map(() => 1);
+      const points = Number(get("POINTS")?.[0] ?? get("WIDTH")?.[0]);
+      if (!fields || !sizes || !types || !Number.isFinite(points)) throw new Error("PCD header 不完整");
+      const index = name => fields.findIndex(field => field.toLowerCase() === name);
+      const x = index("x"), y = index("y"), z = index("z");
+      const nx = index("normal_x"), ny = index("normal_y"), nz = index("normal_z");
+      const classId = index("class_id");
+      if ([x, y, z].some(i => i < 0)) throw new Error("PCD 缺少 x/y/z");
+      if (classId < 0) throw new Error("PCD 缺少 class_id，请用 fastlio-replay --map-backend surfel 重新生成");
+      const offsets = [];
+      let stride = 0;
+      for (let i = 0; i < fields.length; i++) {
+        offsets.push(stride);
+        stride += sizes[i] * counts[i];
+      }
+      const dataStart = headerEnd;
+      const view = new DataView(buffer, dataStart);
+      const value = (row, field) => {
+        const offset = row * stride + offsets[field];
+        if (types[field] === "F" && sizes[field] === 4) return view.getFloat32(offset, true);
+        if (types[field] === "F" && sizes[field] === 8) return view.getFloat64(offset, true);
+        if (types[field] === "U" && sizes[field] === 4) return view.getUint32(offset, true);
+        throw new Error(`不支持字段 ${fields[field]} 的类型`);
+      };
+      const positions = new Float32Array(points * 3);
+      const normals = new Float32Array(points * 3);
+      const classes = new Uint8Array(points);
+      const resultCounts = [0, 0, 0, 0, 0];
+      for (let row = 0; row < points; row++) {
+        positions[row * 3] = value(row, x);
+        positions[row * 3 + 1] = value(row, y);
+        positions[row * 3 + 2] = value(row, z);
+        normals[row * 3] = nx < 0 ? 0 : value(row, nx);
+        normals[row * 3 + 1] = ny < 0 ? 0 : value(row, ny);
+        normals[row * 3 + 2] = nz < 0 ? 1 : value(row, nz);
+        const id = Math.max(0, Math.min(4, Math.round(value(row, classId))));
+        classes[row] = id;
+        resultCounts[id]++;
+      }
+      return { positions, normals, classes, counts: resultCounts, count: points };
+    }
+
+    async function loadPcd(name, buffer) {
+      const result = parsePcd(buffer);
+      showSurfels(result);
+      renderClassFilters(result.counts);
+      document.querySelector("#stats").textContent =
+        `${name} | ${result.counts.map((n, i) => `${CLASS_NAMES[i]}: ${n}`).join("  ")}`;
+    }
+
+    function renderClassFilters(counts) {
+      const container = document.querySelector("#class-filters");
+      container.replaceChildren();
+      counts.forEach((count, i) => {
+        const color = new THREE.Color(CLASS_COLORS[i]);
+        const label = document.createElement("label");
+        label.className = "class-filter";
+        const swatch = document.createElement("span");
+        swatch.className = "class-swatch";
+        swatch.style.background = `#${color.getHexString()}`;
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = true;
+        checkbox.addEventListener("change", () => {
+          classVisibility[i] = checkbox.checked;
+          if (pointMaterial) pointMaterial.uniforms.uClassVisible.value = classVisibility.map(v => v ? 1 : 0);
+          if (normalLines) normalLines.material.uniforms.uClassVisible.value = classVisibility.map(v => v ? 1 : 0);
+        });
+        label.append(swatch, checkbox, document.createTextNode(`${CLASS_NAMES[i]} ${count}`));
+        container.appendChild(label);
+      });
+    }
+
+    function showSurfels(data) {
+      while (root.children.length) root.remove(root.children[0]);
+      const colors = new Float32Array(data.count * 3);
+      for (let i = 0; i < data.count; i++) {
+        const color = new THREE.Color(CLASS_COLORS[data.classes[i]]);
+        colors.set([color.r, color.g, color.b], i * 3);
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(data.positions, 3));
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      geometry.setAttribute("classId", new THREE.BufferAttribute(data.classes, 1));
+      pointMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          uPointSize: { value: 3 },
+          uClassVisible: { value: classVisibility.map(value => value ? 1 : 0) },
+        },
+        vertexShader: `
+          attribute float classId;
+          attribute vec3 color;
+          varying vec3 vColor;
+          varying float vClassId;
+          uniform float uPointSize;
+          void main() {
+            vColor = color;
+            vClassId = classId;
+            gl_PointSize = uPointSize;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying vec3 vColor;
+          varying float vClassId;
+          uniform float uClassVisible[5];
+          void main() {
+            int id = int(vClassId + 0.5);
+            if (uClassVisible[id] < 0.5) discard;
+            gl_FragColor = vec4(vColor, 1.0);
+          }
+        `,
+      });
+      root.add(new THREE.Points(geometry, pointMaterial));
+
+      const maxNormals = 100000;
+      const normalStep = Math.max(1, Math.ceil(data.count / maxNormals));
+      const normalCount = Math.ceil(data.count / normalStep);
+      const linePositions = new Float32Array(normalCount * 6);
+      const lineClasses = new Uint8Array(normalCount * 2);
+      let normalIndex = 0;
+      for (let i = 0; i < data.count; i += normalStep) {
+        const p = i * 3;
+        linePositions.set(data.positions.subarray(p, p + 3), normalIndex * 6);
+        linePositions.set([
+          data.positions[p] + data.normals[p] * 0.25,
+          data.positions[p + 1] + data.normals[p + 1] * 0.25,
+          data.positions[p + 2] + data.normals[p + 2] * 0.25,
+        ], normalIndex * 6 + 3);
+        lineClasses[normalIndex * 2] = data.classes[i];
+        lineClasses[normalIndex * 2 + 1] = data.classes[i];
+        normalIndex++;
+      }
+      const lineGeometry = new THREE.BufferGeometry();
+      lineGeometry.setAttribute("position", new THREE.BufferAttribute(linePositions, 3));
+      lineGeometry.setAttribute("classId", new THREE.BufferAttribute(lineClasses, 1));
+      normalLines = new THREE.LineSegments(lineGeometry, new THREE.ShaderMaterial({
+        uniforms: {
+          uClassVisible: { value: classVisibility.map(value => value ? 1 : 0) },
+        },
+        vertexShader: `
+          attribute float classId;
+          varying float vClassId;
+          void main() {
+            vClassId = classId;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          varying float vClassId;
+          uniform float uClassVisible[5];
+          void main() {
+            int id = int(vClassId + 0.5);
+            if (uClassVisible[id] < 0.5) discard;
+            gl_FragColor = vec4(0.6, 0.6, 0.6, 0.5);
+          }
+        `,
+        transparent: true,
+      }));
+      root.add(normalLines);
+      normalLines.visible = document.querySelector("#show-normals").checked;
+      loadedPoints = data.count;
+    }
+
+    function fitCamera() {
+      if (!loadedPoints) return;
+      const box = new THREE.Box3().setFromObject(root);
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      camera.position.copy(sphere.center).add(new THREE.Vector3(0, -1, 0.5).normalize().multiplyScalar(Math.max(sphere.radius, 1) * 2.2));
+      controls.target.copy(sphere.center);
+      controls.update();
+    }
+
+    animate();
+    function animate() {
+      controls.update();
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+  </script>
+</body>
+</html>
