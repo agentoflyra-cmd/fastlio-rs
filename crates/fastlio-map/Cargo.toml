@@ -4,5 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 fastlio-types = { path = "../fastlio-types" }
+hashbrown = "0.16.1"
 kiddo = { version = "6.0.0", default-features = false, features = ["fixed", "simd"] }
+slotmap = "1.0.7"
+smallvec = "1.15.1"

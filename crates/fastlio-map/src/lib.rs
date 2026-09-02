@@ -1,3 +1,6 @@
+pub mod surfel;
+pub mod surfel_types;
+
 use fastlio_types::{Mat3, PointXYZI, Vec3};
 use kiddo::{
     DonnellyCyclicSimdFull, KdTree, QueryResultItem, QueryScratch, SquaredEuclidean, VecOfArrays,
@@ -139,6 +142,7 @@ pub struct PointToPlaneMatchTimings {
 pub enum PointToPlaneError {
     NonFiniteScanPoint,
     InvalidConfig,
+    NoPlanarSurfel,
     NeighbourTooFar {
         squared_distance: f64,
         max_squared_distance: f64,
@@ -703,7 +707,11 @@ fn fit_plane_from_points<'a>(
     })
 }
 
-fn point_to_plane_weight(residual: f64, planarity_ratio: f64, config: &PointToPlaneConfig) -> f64 {
+pub(crate) fn point_to_plane_weight(
+    residual: f64,
+    planarity_ratio: f64,
+    config: &PointToPlaneConfig,
+) -> f64 {
     let residual_score = if config.max_absolute_residual <= 0.0 {
         1.0
     } else {
