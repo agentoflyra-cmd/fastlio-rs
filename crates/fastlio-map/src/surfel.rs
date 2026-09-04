@@ -113,7 +113,7 @@ impl SurfelMap {
             .filter_map(|id| self.surfels.get(id).map(|s| (id, s)))
             .filter(|(_, surfel)| {
                 surfel.is_planar(&self.surfel_config)
-                    && surfel.within_support(point, &self.surfel_config)
+                    && surfel.within_tangent_support(point, &self.surfel_config)
                     && surfel.within_plane_distance(point, &self.surfel_config)
             });
         let mut best: Option<(SurfelID, f32)> = None;

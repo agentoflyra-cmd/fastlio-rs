@@ -837,16 +837,12 @@ mod surfel_test {
     }
 
     #[test]
-    fn query_is_gated_by_three_dimensional_support() {
-        let mut map = SurfelMap::new(
-            map_config(),
-            surfel_config(|c| {
-                c.growing_radius = 3.5;
-                // Loosened plane distance alone must NOT widen association:
-                // the 3D Mahalanobis support is the binding constraint.
-                c.max_plane_distance = 6.0;
-            }),
-        );
+    fn query_is_gated_by_tangent_support_and_plane_distance() {
+        // Two parallel horizontal planes 5 m apart, default max_plane_distance.
+        // The query is gated by the tangent Mahalanobis support (d1, d2) and by
+        // the absolute plane distance (normal d0) individually, NOT by a full
+        // 3D support that would double-tighten the normal direction.
+        let mut map = SurfelMap::new(map_config(), surfel_config(|c| c.growing_radius = 3.5));
         let mut all = plane_cluster(Vec3::new(0.0f32, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0));
         all.extend(plane_cluster(
             Vec3::new(0.0f32, 0.0, 5.0),
@@ -855,8 +851,8 @@ mod surfel_test {
         map.insert(all.into_iter()).unwrap();
         assert_eq!(map.surfels.len(), 2, "two separated planes expected");
 
-        // In-plane query point matches, and only the nearer plane qualifies
-        // (the distant plane is outside both supports' Gaussian slab).
+        // In-plane query matches the nearer plane (the far one is beyond
+        // max_plane_distance along the normal).
         let obs = map
             .query(&pt(0.0, 0.0, 0.0))
             .expect("query must not error")
@@ -867,10 +863,14 @@ mod surfel_test {
             obs.mean_w.z
         );
 
-        // 1 m off the plane: within max_plane_distance, but outside the
-        // 3D support (a perfect plane has ~zero extent along its normal).
-        assert_none(&map, &pt(0.0, 0.0, 1.0));
+        // Normal gate: 2.5 m off each plane is beyond max_plane_distance, so
+        // neither qualifies even though the tangent Mahalanobis is satisfied.
         assert_none(&map, &pt(0.0, 0.0, 2.5));
+
+        // Tangent gate: within voxel search radius, tangent Mahalanobis to
+        // both planes is beyond the support -> rejected even though it is
+        // exactly in-plane (normal distance is zero on both).
+        assert_none(&map, &pt(3.0, 0.0, 0.0));
 
         // On the second plane: matches it instead.
         let obs = map

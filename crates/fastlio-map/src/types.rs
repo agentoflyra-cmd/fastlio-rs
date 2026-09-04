@@ -158,6 +158,19 @@ impl Surfel {
         self.mahalanobis_squared(point, config) <= support_sigma * support_sigma
     }
 
+    pub fn within_tangent_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
+        let delta = point.to_vec3_f64() - self.mean_w;
+        let d1 = self.eigenvectors.column(1).dot(&delta);
+        let d2 = self.eigenvectors.column(2).dot(&delta);
+
+        let covariance_floor = config.covariance_eigenvalue_floor as f64;
+        let l1 = self.eigenvalues[1].max(covariance_floor);
+        let l2 = self.eigenvalues[2].max(covariance_floor);
+        let support_sigma = config.max_mahalanobis_distance as f64;
+
+        d1 * d1 / l1 + d2 * d2 / l2 <= support_sigma * support_sigma
+    }
+
     pub(crate) fn planarity(&self) -> f64 {
         self.eigenvalues[0] / self.eigenvalues[1]
     }
