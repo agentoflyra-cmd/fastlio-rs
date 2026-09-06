@@ -24,6 +24,19 @@ pub struct NavState {
     pub gravity: Vec3<f64>,
 }
 
+impl Default for NavState {
+    fn default() -> Self {
+        Self {
+            position: Vec3::zeros(),
+            orientation: Default::default(),
+            velocity: Default::default(),
+            gyro_bias: Default::default(),
+            accel_bias: Default::default(),
+            gravity: Vec3::new(0.0, 0.0, -9.81),
+        }
+    }
+}
+
 pub struct MeasureGroup {
     pub imu: Vec<ImuSample>,
     pub lidar: LidarFrame,

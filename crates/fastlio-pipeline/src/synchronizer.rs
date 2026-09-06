@@ -2,7 +2,7 @@ use anyhow::Result;
 use fastlio_types::{ImuSample, LidarFrame, MeasureGroup};
 use std::collections::VecDeque;
 
-const TIME_EPS_SEC: f64 = 5.0e-6;
+pub(crate) const TIME_EPS_SEC: f64 = 5.0e-6;
 
 #[derive(Default)]
 pub struct MeasurementSynchronizer {

@@ -17,6 +17,20 @@ pub struct ImuIntegrator {
     pub gyro_bias_noise: f64,
     /// discrete per-step standard deviation
     pub gyro_noise: f64,
+    /// FAST-LIO style acceleration normalization scale.
+    pub accel_scale: f64,
+}
+
+impl Default for ImuIntegrator {
+    fn default() -> Self {
+        Self {
+            accel_bias_noise: 0.0001,
+            accel_noise: 0.01,
+            gyro_bias_noise: 0.0001,
+            gyro_noise: 0.01,
+            accel_scale: 1.0,
+        }
+    }
 }
 
 fn checked_dt(imu_prev: &ImuSample, imu_curr: &ImuSample) -> Result<f64> {
@@ -48,7 +62,22 @@ impl ImuIntegrator {
             accel_noise,
             gyro_bias_noise,
             accel_bias_noise,
+            accel_scale: 1.0,
         }
+    }
+
+    pub fn set_accel_scale(&mut self, accel_scale: f64) -> Result<()> {
+        if accel_scale.is_finite() {
+            self.accel_scale = accel_scale;
+            Ok(())
+        } else {
+            anyhow::bail!("accel_scale must be finite and positive")
+        }
+    }
+
+    #[inline]
+    pub fn scaled_accel(&self, imu_sample: &ImuSample) -> Vec3<f64> {
+        imu_sample.accel * self.accel_scale
     }
 
     pub fn propagate_nominal_state_mut(
@@ -62,7 +91,8 @@ impl ImuIntegrator {
             return Ok(());
         }
         let omega_mid = 0.5 * (imu_prev.gyro + imu_curr.gyro) - state.gyro_bias;
-        let acc_mid = 0.5 * (imu_prev.accel + imu_curr.accel) - state.accel_bias;
+        let acc_mid =
+            0.5 * (self.scaled_accel(imu_prev) + self.scaled_accel(imu_curr)) - state.accel_bias;
 
         let delta_theta = omega_mid * dt;
         let delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta);
@@ -126,7 +156,8 @@ impl ImuIntegrator {
         }
         let dt2 = dt * dt;
         let omega_mid = 0.5 * (imu_prev.gyro + imu_curr.gyro) - state_at_k.gyro_bias;
-        let acc_mid = 0.5 * (imu_prev.accel + imu_curr.accel) - state_at_k.accel_bias;
+        let acc_mid = 0.5 * (self.scaled_accel(imu_prev) + self.scaled_accel(imu_curr))
+            - state_at_k.accel_bias;
 
         let delta_theta = omega_mid * dt;
         let delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta);

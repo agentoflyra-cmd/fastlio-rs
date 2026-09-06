@@ -38,6 +38,7 @@ where
 
 #[derive(Deserialize)]
 pub struct CommonConfig {
+    pub debug_mode: bool,
     pub lid_topic: String,
     pub imu_topic: String,
     pub time_sync_en: Option<bool>,
@@ -68,7 +69,7 @@ impl<'de> Deserialize<'de> for LidarType {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct SurfelMapConfig {
     pub voxel_size: f32,
@@ -84,7 +85,7 @@ impl Default for SurfelMapConfig {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(default)]
 pub struct SurfelConfig {
     pub max_plane_distance: f32,
@@ -103,7 +104,7 @@ pub struct SurfelConfig {
 impl Default for SurfelConfig {
     fn default() -> Self {
         Self {
-            max_plane_distance: 0.08,
+            max_plane_distance: 0.30,
             max_planarity_ratio: 0.10,
             min_plane_spread_eigenvalue: 0.025,
             covariance_eigenvalue_floor: default_covariance_eigenvalue_floor(),

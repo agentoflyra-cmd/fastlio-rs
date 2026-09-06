@@ -1,13 +1,12 @@
-use anyhow::{Result, anyhow};
+// use anyhow::{anyhow, Result};
 use fastlio_map::surfel::SurfelMap;
-use fastlio_types::{NavState, PointXYZI};
+use fastlio_types::{LidarImuExtrinsic, NavState, PointXYZI};
 use nalgebra::{SMatrix, SVector, UnitQuaternion};
 
-use crate::optimizer::{IekfConfig, build_observations, converged, linear_update};
+use crate::optimizer::{IekfConfig, IekfUpdateError, build_observations, linear_update};
 /// ```text
 /// [delta_theta_i, delta_P_wi, delta_v, delta_bg, delta_ba, delta_g, delta_theta_li, delta_P_li]
 /// ```
-// Not yet wired into the pipeline; only exercised from tests for now.
 pub(crate) fn box_plus(state: &NavState, error_state: &SVector<f64, 24>) -> NavState {
     let delta_theta = error_state.fixed_rows::<3>(0).into_owned();
     let delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta);
@@ -42,18 +41,55 @@ pub(crate) fn box_minus(state_iter: &NavState, state: &NavState) -> SVector<f64,
     dx
 }
 
+#[derive(Debug)]
+pub struct IekfUpdateSummary {
+    pub iterations: usize,
+    pub observations: Vec<usize>,
+    pub converged: bool,
+    pub final_delta_norm: f64,
+}
+
 pub struct IekfState {
     pub state: NavState,
     pub covariance: SMatrix<f64, 24, 24>,
 }
 
+impl Default for IekfState {
+    fn default() -> Self {
+        Self {
+            state: NavState::default(),
+            covariance: SMatrix::<f64, 24, 24>::identity() * 0.1,
+        }
+    }
+}
+
+fn navstate_is_finite(state: &NavState) -> bool {
+    state.position.iter().all(|value| value.is_finite())
+        && state.velocity.iter().all(|value| value.is_finite())
+        && state.gyro_bias.iter().all(|value| value.is_finite())
+        && state.accel_bias.iter().all(|value| value.is_finite())
+        && state.gravity.iter().all(|value| value.is_finite())
+}
+
+fn matrix_is_finite(matrix: &SMatrix<f64, 24, 24>) -> bool {
+    matrix.iter().all(|value| value.is_finite())
+}
+
 impl IekfState {
+    pub fn new(state: NavState, covariance: SMatrix<f64, 24, 24>) -> Result<Self, IekfUpdateError> {
+        if !navstate_is_finite(&state) || !matrix_is_finite(&covariance) {
+            return Err(IekfUpdateError::InvalidInput);
+        }
+
+        Ok(Self { state, covariance })
+    }
     pub fn update(
         &mut self,
         points: &[PointXYZI],
+        extrinsic: &LidarImuExtrinsic,
         map: &SurfelMap,
         config: &IekfConfig,
-    ) -> Result<()> {
+    ) -> Result<IekfUpdateSummary, IekfUpdateError> {
         let state_prior = self.state.clone();
         let p_prior = self.covariance;
 
@@ -61,34 +97,55 @@ impl IekfState {
         let mut p_final = p_prior;
         let mut observations = Vec::new();
 
-        for _ in 0..config.max_iterations {
-            build_observations(&state_iter, points, map, config, &mut observations)?;
+        let mut real_iterations = 0;
+        let mut converge_flag = false;
+        let mut observations_len_vec = Vec::new();
+        let mut final_norm = 0.0;
 
-            if observations.len() < config.min_observations {
-                return Err(anyhow!("IEKF update failed: not enough observations"));
+        for _ in 0..config.max_iterations {
+            real_iterations += 1;
+            build_observations(
+                &state_iter,
+                points,
+                map,
+                extrinsic,
+                config,
+                &mut observations,
+            )?;
+            let observations_len = observations.len();
+            observations_len_vec.push(observations_len);
+
+            if observations_len < config.min_observations {
+                return Err(IekfUpdateError::NotEnoughObservations {
+                    actual: observations_len,
+                    required: config.min_observations,
+                });
             }
 
-            let Some((error_state, p_work)) =
-                linear_update(&state_prior, &state_iter, &p_prior, &observations, config)
-            else {
-                // TODO(iekf): replace anyhow with a typed update status before
-                // this is wired into the main pipeline diagnostics.
-                return Err(anyhow!(
-                    "IEKF update failed: linear solve or SPD check failed."
-                ));
-            };
+            let (error_state, p_work) =
+                linear_update(&state_prior, &state_iter, &p_prior, &observations, config)?;
 
             state_iter = box_plus(&state_iter, &error_state);
             p_final = p_work;
-
-            if converged(&error_state, config) {
+            final_norm = error_state.norm();
+            if final_norm < config.min_delta_norm {
+                converge_flag = true;
                 break;
             }
         }
 
+        let summary = IekfUpdateSummary {
+            iterations: real_iterations,
+            observations: observations_len_vec,
+            converged: converge_flag,
+            final_delta_norm: final_norm,
+        };
+
         self.state = state_iter;
+        // TODO(iekf): transform p_final with the reset Jacobian after injecting
+        // the right-multiplicative orientation error into the nominal state.
         self.covariance = p_final;
-        Ok(())
+        Ok(summary)
     }
 }
 

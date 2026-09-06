@@ -25,7 +25,7 @@ impl SensorEvent {
         match result {
             ros2_dispatch::DecodedMessageBorrowed::LivoxRosDriver2CustomMsg(custom_msg) => {
                 let mut max_offset = 0;
-                let points = custom_msg
+                let mut points: Vec<_> = custom_msg
                     .points
                     .iter()
                     .map(|e| {
@@ -43,6 +43,7 @@ impl SensorEvent {
                         }
                     })
                     .collect();
+                sort_timepoint_by_offset(&mut points);
                 let msg = LidarFrame::new(
                     custom_msg.timebase as f64 / 1e9,
                     custom_msg.timebase as f64 / 1e9 + max_offset as f64 / 1e9,
@@ -71,6 +72,10 @@ impl SensorEvent {
             }
         }
     }
+}
+
+fn sort_timepoint_by_offset(points: &mut [TimedPoint]) {
+    points.sort_by(|a, b| a.offset_time_sec.total_cmp(&b.offset_time_sec));
 }
 
 #[derive(Debug, Default, Clone, Copy)]

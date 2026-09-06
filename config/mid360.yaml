@@ -1,4 +1,5 @@
 common:
+    debug_mode: false
     lid_topic:  "/livox/lidar"
     imu_topic:  "/livox/imu"
     time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
@@ -6,6 +7,7 @@ common:
                                   # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
 
 preprocess:
+    voxel_size: 0.2
     lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
     scan_line: 4
     blind: 0.5
@@ -28,9 +30,9 @@ surfel_map_config:
 
 surfel_config:
     growing_radius: 0.8
-    min_mature_surfel_count: 16
+    min_mature_surfel_count: 8
     max_planarity_ratio: 0.10
-    min_plane_spread_eigenvalue: 0.001
+    min_plane_spread_eigenvalue: 0.025
     max_mahalanobis_distance: 2.0
                    
 # publish:

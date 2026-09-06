@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 fastlio-types = { path = "../fastlio-types" }
 fastlio-imu = { path = "../fastlio-imu" }
+fastlio-estimator = { path = "../fastlio-estimator" }
+fastlio-pointcloud = { path = "../fastlio-pointcloud" }
+fastlio-map = { path = "../fastlio-map" }
 anyhow = { workspace = true }
 nalgebra = { workspace = true }
 camino = { workspace = true }

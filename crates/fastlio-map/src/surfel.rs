@@ -337,4 +337,8 @@ impl SurfelMap {
     pub fn surfels(&self) -> impl Iterator<Item = &Surfel> {
         self.surfels.values()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.surfels.is_empty()
+    }
 }

@@ -1,9 +1,17 @@
-use anyhow::Result;
+use crate::{iekf::box_minus, linearize_point_to_plane_observation};
 use fastlio_map::surfel::{SurfelMap, SurfelObservation};
-use fastlio_types::{NavState, PointXYZI};
+use fastlio_types::{LidarImuExtrinsic, NavState, PointXYZI, Vec3};
 use nalgebra::{SMatrix, SVector};
 
-use crate::{iekf::box_minus, linearize_point_to_plane_observation};
+#[derive(Debug, Clone, PartialEq)]
+pub enum IekfUpdateError {
+    NotSpd,
+    SolveFailed,
+    InvalidObservation,
+    InvalidInput,
+    NotEnoughObservations { actual: usize, required: usize },
+    MapQueryFailed { context: String },
+}
 
 pub struct LinearizedObservation {
     pub residual: f64,
@@ -32,32 +40,50 @@ impl Default for IekfConfig {
             damping: 1.0e-6,
             measurement_variance_floor: 1.0e-6,
             huber_delta: Some(0.1),
-            min_observations: 400,
+            // TODO(tracking): restore a non-zero observation floor after the
+            // pipeline can report low-observation frames as TrackingLost
+            // without blocking bootstrap-map insertion.
+            min_observations: 0,
         }
     }
-}
-
-pub(crate) fn converged(error_state: &SVector<f64, 24>, config: &IekfConfig) -> bool {
-    error_state.norm() <= config.min_delta_norm
 }
 
 pub(crate) fn build_observations(
     state: &NavState,
     points: &[PointXYZI],
     map: &SurfelMap,
+    extrinsic: &LidarImuExtrinsic,
     config: &IekfConfig,
     out: &mut Vec<LinearizedObservation>,
-) -> Result<()> {
+) -> Result<(), IekfUpdateError> {
     out.clear();
 
     for point in points {
-        let point_w = transform_point(state, point);
+        let point_i = extrinsic.transform_point(&point.to_vec3_f64());
+        let point_w = transform_point(state, &point_i);
+        let point_w = PointXYZI {
+            x: point_w.x as f32,
+            y: point_w.y as f32,
+            z: point_w.z as f32,
+            intensity: point.intensity,
+        };
+        let point_i = PointXYZI {
+            x: point_i.x as f32,
+            y: point_i.y as f32,
+            z: point_i.z as f32,
+            intensity: point.intensity,
+        };
 
-        let Some(obs) = map.query(&point_w)? else {
+        let Some(obs) = map
+            .query(&point_w)
+            .map_err(|e| IekfUpdateError::MapQueryFailed {
+                context: e.to_string(),
+            })?
+        else {
             continue;
         };
 
-        let jacobian = linearize_point_to_plane_observation(state, point, &obs);
+        let jacobian = linearize_point_to_plane_observation(state, &point_i, &obs);
 
         let residual = obs.signed_residual;
 
@@ -77,20 +103,12 @@ pub(crate) fn build_variance(obs: &SurfelObservation, config: &IekfConfig) -> f6
     min_eigenvalue.max(config.measurement_variance_floor)
 }
 
-pub(crate) fn transform_point(state: &NavState, point: &PointXYZI) -> PointXYZI {
-    let mut point_vec = point.to_vec3_f64();
+pub(crate) fn transform_point(state: &NavState, point: &Vec3<f64>) -> Vec3<f64> {
     let t = state.position;
     let r = state.orientation.to_rotation_matrix();
     let r = r.matrix();
 
-    point_vec = r * point_vec + t;
-
-    PointXYZI {
-        x: point_vec[0] as f32,
-        y: point_vec[1] as f32,
-        z: point_vec[2] as f32,
-        intensity: point.intensity,
-    }
+    r * point + t
 }
 
 pub(crate) fn linear_update(
@@ -99,8 +117,8 @@ pub(crate) fn linear_update(
     covariance: &SMatrix<f64, 24, 24>,
     observations: &[LinearizedObservation],
     config: &IekfConfig,
-) -> Option<(SVector<f64, 24>, SMatrix<f64, 24, 24>)> {
-    let p_chol = covariance.cholesky()?;
+) -> Result<(SVector<f64, 24>, SMatrix<f64, 24, 24>), IekfUpdateError> {
+    let p_chol = covariance.cholesky().ok_or(IekfUpdateError::NotSpd)?;
     let l = p_chol.l();
 
     // Current IEKF linear solve is written in whitened information form.
@@ -112,14 +130,16 @@ pub(crate) fn linear_update(
     let prior_error = box_minus(state_iter, state);
 
     // L * e_white = prior_error.
-    let e_white = l.solve_lower_triangular(&prior_error)?;
+    let e_white = l
+        .solve_lower_triangular(&prior_error)
+        .ok_or(IekfUpdateError::SolveFailed)?;
 
     let mut information = SMatrix::<f64, 24, 24>::identity();
     let mut rhs = -e_white;
 
     for obs in observations {
         if !obs.residual.is_finite() || !obs.variance.is_finite() || obs.variance <= 0.0 {
-            return None;
+            return Err(IekfUpdateError::InvalidObservation);
         }
 
         let w = 1.0 / obs.variance;
@@ -134,7 +154,7 @@ pub(crate) fn linear_update(
     information += SMatrix::<f64, 24, 24>::identity() * config.damping;
 
     let information = symmetric(&information);
-    let chol = information.cholesky()?;
+    let chol = information.cholesky().ok_or(IekfUpdateError::NotSpd)?;
 
     let y = chol.solve(&rhs);
     let dx = l * y;
@@ -143,7 +163,7 @@ pub(crate) fn linear_update(
     // The current covariance form is simpler for API/tests, but forms A^-1.
     let a_inv = chol.inverse();
     let post_covariance = l * a_inv * l.transpose();
-    Some((dx, post_covariance))
+    Ok((dx, post_covariance))
 }
 
 fn symmetric(covariance: &SMatrix<f64, 24, 24>) -> SMatrix<f64, 24, 24> {
@@ -465,11 +485,11 @@ mod tests {
         let negative_var = vec![position_z_observation(0.5, -1.0)];
 
         assert!(
-            linear_update(&state, &state_iter, &covariance, &zero_var, &config).is_none(),
+            linear_update(&state, &state_iter, &covariance, &zero_var, &config).is_err(),
             "zero measurement variance must be rejected"
         );
         assert!(
-            linear_update(&state, &state_iter, &covariance, &negative_var, &config).is_none(),
+            linear_update(&state, &state_iter, &covariance, &negative_var, &config).is_err(),
             "negative measurement variance must be rejected"
         );
     }
@@ -546,7 +566,10 @@ mod tests {
             state: prior.clone(),
             covariance,
         };
-        single.update(&body_points, &map, &config).unwrap();
+        let extrinsic = LidarImuExtrinsic::new(UnitQuaternion::identity(), Vec3::zeros());
+        single
+            .update(&body_points, &extrinsic, &map, &config)
+            .unwrap();
 
         let config_iter = IekfConfig {
             max_iterations: 15,
@@ -556,7 +579,9 @@ mod tests {
             state: prior.clone(),
             covariance,
         };
-        iterated.update(&body_points, &map, &config_iter).unwrap();
+        iterated
+            .update(&body_points, &extrinsic, &map, &config_iter)
+            .unwrap();
 
         // Metric: mean absolute plane distance of the transformed points to
         // the map plane (via the relinearized query).
@@ -592,7 +617,13 @@ mod tests {
         let mut total = 0.0;
         let mut count = 0usize;
         for p in points {
-            let world = transform_point(state, p);
+            let world = transform_point(state, &p.to_vec3_f64());
+            let world = PointXYZI {
+                x: world.x as f32,
+                y: world.y as f32,
+                z: world.z as f32,
+                intensity: p.intensity,
+            };
             if let Some(obs) = map.query(&world).expect("query must not error") {
                 total += obs.signed_residual.abs();
                 count += 1;
