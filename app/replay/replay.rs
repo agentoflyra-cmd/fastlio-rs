@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use camino::Utf8PathBuf;
 use fastlio_dataset::{ReadStats, SensorEvent, read_mcap_events};
 use fastlio_map::{surfel::SurfelMap, types::GeometryClass};
-use fastlio_pipeline::{MainPipeline, synchronizer::MeasurementSynchronizer};
+use fastlio_pipeline::{MainPipeline, PipelineFrameSummary, synchronizer::MeasurementSynchronizer};
 use fastlio_types::{NavState, read_from_config_path};
 use pcd_rs::{DataKind, PcdSerialize, WriterInit};
 use ringbuffer_spsc::{RingBufferReader, RingBufferWriter, ringbuffer};
@@ -112,6 +112,7 @@ struct SurfelPcdPoint {
 struct TrajectoryRow {
     timestamp_sec: f64,
     state: NavState,
+    frame_summary: PipelineFrameSummary,
 }
 
 #[derive(Default)]
@@ -251,11 +252,12 @@ fn process_ready_groups(
             .filter(|pair| pair[1].offset_time_sec < pair[0].offset_time_sec)
             .count();
         match pipeline.process_measure_group(group) {
-            Ok(_) => {
+            Ok(frame_summary) => {
                 stats.processed_frames += 1;
                 stats.trajectory.push(TrajectoryRow {
                     timestamp_sec,
                     state: pipeline.filter.state.clone(),
+                    frame_summary,
                 });
             }
             Err(error) => {
@@ -351,15 +353,53 @@ fn write_trajectory(path: &Utf8PathBuf, rows: &[TrajectoryRow]) -> Result<()> {
     let mut writer = BufWriter::new(
         File::create(path).with_context(|| format!("failed to create trajectory `{path}`"))?,
     );
-    writeln!(writer, "timestamp_sec,px,py,pz,qx,qy,qz,qw,vx,vy,vz")?;
+    writeln!(
+        writer,
+        "timestamp_sec,px,py,pz,qx,qy,qz,qw,vx,vy,vz,tracking,iekf_iterations,iekf_observations_first,iekf_observations_last,iekf_mean_abs_residual,iekf_max_abs_residual,iekf_final_rotation_delta_norm,iekf_final_position_delta_norm,iekf_final_velocity_delta_norm,iekf_final_accel_bias_delta_norm,iekf_final_gravity_delta_norm,obs_input_points,obs_accepted,obs_plane_accepted,obs_line_accepted,obs_no_association,obs_residual_abs_mean,obs_residual_abs_p50,obs_residual_abs_p90,obs_residual_abs_p95,obs_residual_abs_p99,obs_residual_abs_max,obs_line_residual_abs_p95,obs_line_distance_p95"
+    )?;
     for row in rows {
         let p = row.state.position;
         let v = row.state.velocity;
         let q = row.state.orientation.quaternion();
+        let obs = row.frame_summary.observation_diagnostics;
         writeln!(
             writer,
-            "{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9}",
-            row.timestamp_sec, p.x, p.y, p.z, q.i, q.j, q.k, q.w, v.x, v.y, v.z
+            "{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},{},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            row.timestamp_sec,
+            p.x,
+            p.y,
+            p.z,
+            q.i,
+            q.j,
+            q.k,
+            q.w,
+            v.x,
+            v.y,
+            v.z,
+            row.frame_summary.tracking,
+            row.frame_summary.iekf_iterations,
+            row.frame_summary.iekf_observations_first,
+            row.frame_summary.iekf_observations_last,
+            row.frame_summary.iekf_mean_abs_residual,
+            row.frame_summary.iekf_max_abs_residual,
+            row.frame_summary.iekf_final_rotation_delta_norm,
+            row.frame_summary.iekf_final_position_delta_norm,
+            row.frame_summary.iekf_final_velocity_delta_norm,
+            row.frame_summary.iekf_final_accel_bias_delta_norm,
+            row.frame_summary.iekf_final_gravity_delta_norm,
+            obs.input_points,
+            obs.accepted_observations,
+            obs.plane_accepted,
+            obs.line_accepted,
+            obs.no_association,
+            obs.residual_abs_mean,
+            obs.residual_abs_p50,
+            obs.residual_abs_p90,
+            obs.residual_abs_p95,
+            obs.residual_abs_p99,
+            obs.residual_abs_max,
+            obs.line_residual_abs_p95,
+            obs.line_distance_p95,
         )?;
     }
     Ok(())
@@ -470,6 +510,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use fastlio_types::{ImuSample, LidarFrame, Vec3};
+    use std::fs;
 
     fn imu_event(t: f64) -> SensorEvent {
         SensorEvent::Imu(ImuSample {
@@ -543,6 +584,36 @@ mod tests {
             SensorEvent::Lidar(frame) => assert_eq!(frame.base_timestamp_sec, 20.0),
             SensorEvent::Imu(_) => panic!("expected LiDAR event"),
         }
+    }
+
+    #[test]
+    fn trajectory_csv_has_compact_observation_diagnostics() {
+        let path = Utf8PathBuf::from("/tmp/fastlio-rs-trajectory-diagnostics-test.csv");
+        let rows = vec![TrajectoryRow {
+            timestamp_sec: 1.0,
+            state: NavState::default(),
+            frame_summary: PipelineFrameSummary::default(),
+        }];
+
+        write_trajectory(&path, &rows).unwrap();
+
+        let csv = fs::read_to_string(&path).unwrap();
+        let mut lines = csv.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        assert_eq!(header.split(',').count(), row.split(',').count());
+        assert!(header.contains("obs_plane_accepted"));
+        assert!(header.contains("obs_line_accepted"));
+        assert!(header.contains("obs_no_association"));
+        assert!(header.contains("obs_residual_abs_p95"));
+        assert!(header.contains("obs_line_residual_abs_p95"));
+        assert!(header.contains("obs_line_distance_p95"));
+        assert!(!header.contains("obs_extra_line_added"));
+        assert!(!header.contains("obs_plane_score_mean"));
+        assert!(!header.contains("gravity_variance"));
+        assert!(!header.contains("cross_covariance"));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

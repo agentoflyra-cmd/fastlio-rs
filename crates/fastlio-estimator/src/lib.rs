@@ -16,7 +16,7 @@
 //! P_wi_new = P_wi + delta_P_wi
 //! ```
 //!
-//! The 24D error-state order is:
+//! The 23D error-state order is:
 //!
 //! ```text
 //! [delta_theta_i, delta_P_wi, delta_v, delta_bg, delta_ba, delta_g, delta_theta_li, delta_P_li]
@@ -29,9 +29,9 @@
 //! - the observation was produced at the same linearization point as the
 //!   `NavState` used to build the Jacobian.
 
-use fastlio_map::surfel::SurfelObservation;
+use fastlio_map::surfel::{SurfelLineObservation, SurfelObservation};
 use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
-use nalgebra::SMatrix;
+use nalgebra::SVector;
 pub mod iekf;
 pub mod optimizer;
 
@@ -41,7 +41,7 @@ pub(crate) fn skew(vec3: &Vec3<f64>) -> Mat3<f64> {
     Mat3::new(0.0, -z, y, z, 0.0, -x, -y, x, 0.0)
 }
 
-/// Linearize a point-to-plane residual with respect to the 24D error state.
+/// Linearize a point-to-plane residual with respect to the 23D error state.
 ///
 /// `point_i` is a deskewed scan point expressed in the IMU frame `I`. `obs`
 /// contains the associated plane in the world frame `W`; its `signed_residual`
@@ -53,27 +53,59 @@ pub(crate) fn skew(vec3: &Vec3<f64>) -> Mat3<f64> {
 /// ```text
 /// H[0, 0..3] = -n_w^T * R_wi * [p_i]x
 /// H[0, 3..6] =  n_w^T
-/// H[0, 6..24] = 0
+/// H[0, 6..23] = 0
 /// ```
 pub fn linearize_point_to_plane_observation(
     state: &NavState,
     point_i: &PointXYZI,
     obs: &SurfelObservation,
-) -> SMatrix<f64, 1, 24> {
+) -> SVector<f64, 23> {
     let r_wi = state.orientation.to_rotation_matrix();
     let r_wi = r_wi.matrix();
 
     helper(point_i, obs, r_wi)
 }
 
+pub fn linearize_point_to_line_observation(
+    state: &NavState,
+    point_i: &PointXYZI,
+    surfel_line_observation: &SurfelLineObservation,
+) -> (SVector<f64, 23>, SVector<f64, 23>) {
+    let r_wi = state.orientation.to_rotation_matrix();
+    let r_wi = r_wi.matrix();
+    line_helper(point_i, surfel_line_observation, r_wi)
+}
+
 #[inline]
-fn helper(point_i: &PointXYZI, obs: &SurfelObservation, r_wi: &Mat3<f64>) -> SMatrix<f64, 1, 24> {
+fn line_helper(
+    point_i: &PointXYZI,
+    obs: &SurfelLineObservation,
+    r_wi: &Mat3<f64>,
+) -> (SVector<f64, 23>, SVector<f64, 23>) {
     let skew_p = skew_helper(point_i);
-    let mut h = SMatrix::<f64, 1, 24>::zeros();
+    let mut h0 = SVector::<f64, 23>::zeros();
+    let mut h1 = SVector::<f64, 23>::zeros();
+    let j_theta0 = -(obs.normal0_w.transpose() * r_wi * skew_p);
+    let j_theta1 = -(obs.normal1_w.transpose() * r_wi * skew_p);
+    let j_position0 = obs.normal0_w.transpose();
+    let j_position1 = obs.normal1_w.transpose();
+    h0.fixed_rows_mut::<3>(0).copy_from(&j_theta0.transpose());
+    h0.fixed_rows_mut::<3>(3)
+        .copy_from(&j_position0.transpose());
+    h1.fixed_rows_mut::<3>(0).copy_from(&j_theta1.transpose());
+    h1.fixed_rows_mut::<3>(3)
+        .copy_from(&j_position1.transpose());
+    (h0, h1)
+}
+
+#[inline]
+fn helper(point_i: &PointXYZI, obs: &SurfelObservation, r_wi: &Mat3<f64>) -> SVector<f64, 23> {
+    let skew_p = skew_helper(point_i);
+    let mut h = SVector::<f64, 23>::zeros();
     let j_theta = -(obs.norm_w.transpose() * r_wi * skew_p);
     let j_position = obs.norm_w.transpose();
-    h.fixed_view_mut::<1, 3>(0, 0).copy_from(&j_theta);
-    h.fixed_view_mut::<1, 3>(0, 3).copy_from(&j_position);
+    h.fixed_rows_mut::<3>(0).copy_from(&j_theta.transpose());
+    h.fixed_rows_mut::<3>(3).copy_from(&j_position.transpose());
     h
 }
 
@@ -102,7 +134,7 @@ pub fn linearize_point_to_plane_observation_with_extrinsic(
     point_i: &PointXYZI,
     point_l: &PointXYZI,
     obs: &SurfelObservation,
-) -> SMatrix<f64, 1, 24> {
+) -> SVector<f64, 23> {
     let r_wi = state.orientation.to_rotation_matrix();
     let r_wi = r_wi.matrix();
     let r_il = extrinsic.rotation.to_rotation_matrix();
@@ -113,9 +145,40 @@ pub fn linearize_point_to_plane_observation_with_extrinsic(
     let skew_p_l = skew_helper(point_l);
     let j_theta_il = -(obs.norm_w.transpose() * r_wi * r_il * skew_p_l);
     let j_position_il = obs.norm_w.transpose() * r_wi;
-    h.fixed_view_mut::<1, 3>(0, 18).copy_from(&j_theta_il);
-    h.fixed_view_mut::<1, 3>(0, 21).copy_from(&j_position_il);
+    h.fixed_rows_mut::<3>(17).copy_from(&j_theta_il.transpose());
+    h.fixed_rows_mut::<3>(20)
+        .copy_from(&j_position_il.transpose());
     h
+}
+
+pub fn linearize_point_to_line_observation_with_extrinsic(
+    state: &NavState,
+    extrinsic: &LidarImuExtrinsic,
+    point_i: &PointXYZI,
+    point_l: &PointXYZI,
+    surfel_line_observation: SurfelLineObservation,
+) -> (SVector<f64, 23>, SVector<f64, 23>) {
+    let r_wi = state.orientation.to_rotation_matrix();
+    let r_wi = r_wi.matrix();
+    let r_il = extrinsic.rotation.to_rotation_matrix();
+    let r_il = r_il.matrix();
+
+    let skew_p_l = skew_helper(point_l);
+    let j_theta_il0 = -(surfel_line_observation.normal0_w.transpose() * r_wi * r_il * skew_p_l);
+    let j_position_il0 = surfel_line_observation.normal0_w.transpose() * r_wi;
+    let j_theta_il1 = -(surfel_line_observation.normal1_w.transpose() * r_wi * r_il * skew_p_l);
+    let j_position_il1 = surfel_line_observation.normal1_w.transpose() * r_wi;
+
+    let (mut h0, mut h1) = line_helper(point_i, &surfel_line_observation, r_wi);
+    h0.fixed_rows_mut::<3>(17)
+        .copy_from(&j_theta_il0.transpose());
+    h0.fixed_rows_mut::<3>(20)
+        .copy_from(&j_position_il0.transpose());
+    h1.fixed_rows_mut::<3>(17)
+        .copy_from(&j_theta_il1.transpose());
+    h1.fixed_rows_mut::<3>(20)
+        .copy_from(&j_position_il1.transpose());
+    (h0, h1)
 }
 
 #[cfg(test)]
@@ -161,7 +224,7 @@ mod tests {
     /// where p_W = R_WI * p_I + t_WI.
     fn signed_residual(state: &NavState, point_i: &PointXYZI, obs: &SurfelObservation) -> f64 {
         let r_wi = state.orientation.to_rotation_matrix();
-        let p_w = r_wi * point_i.to_vec3().cast::<f64>() + state.position;
+        let p_w = r_wi * point_i.to_vec3_f64() + state.position;
         obs.norm_w.dot(&(p_w - obs.mean_w))
     }
 
@@ -215,7 +278,7 @@ mod tests {
                 ..state.clone()
             };
             let r_p = signed_residual(&state_p, &point_i, &obs);
-            let predicted = r0 + h[(0, i)] * 1e-4;
+            let predicted = r0 + h[i] * 1e-4;
             assert!(
                 (r_p - predicted).abs() < TAYLOR_EPS,
                 "theta[{i}]: r_pert={r_p:.8}, predicted={predicted:.8}, diff={}",
@@ -232,7 +295,7 @@ mod tests {
                 ..state.clone()
             };
             let r_p = signed_residual(&state_p, &point_i, &obs);
-            let predicted = r0 + h[(0, 3 + i)] * 1e-4;
+            let predicted = r0 + h[3 + i] * 1e-4;
             assert!(
                 (r_p - predicted).abs() < TAYLOR_EPS,
                 "pos[{i}]: r_pert={r_p:.8}, predicted={predicted:.8}, diff={}",
@@ -264,11 +327,11 @@ mod tests {
             let fd = (signed_residual(&sp, &point_i, &obs) - signed_residual(&sm, &point_i, &obs))
                 / (2.0 * FD_EPS);
             assert!(
-                (h[(0, 3 + i)] - fd).abs() < FD_TOL,
+                (h[3 + i] - fd).abs() < FD_TOL,
                 "J_pos[{i}]: analytical={:.8}, fd={:.8}, diff={}",
-                h[(0, 3 + i)],
+                h[3 + i],
                 fd,
-                (h[(0, 3 + i)] - fd).abs()
+                (h[3 + i] - fd).abs()
             );
         }
     }
@@ -309,11 +372,11 @@ mod tests {
             let fd = (signed_residual(&sp, &point_i, &obs) - signed_residual(&sm, &point_i, &obs))
                 / (2.0 * FD_EPS);
             assert!(
-                (h[(0, i)] - fd).abs() < FD_TOL,
+                (h[i] - fd).abs() < FD_TOL,
                 "J_theta[{i}]: analytical={:.8}, fd={:.8}, diff={}",
-                h[(0, i)],
+                h[i],
                 fd,
-                (h[(0, i)] - fd).abs()
+                (h[i] - fd).abs()
             );
         }
     }
@@ -333,11 +396,11 @@ mod tests {
         let obs = make_obs(Vec3::new(0.0, 0.0, 1.0), Vec3::zeros());
         let h = linearize_point_to_plane_observation(&state, &point_i, &obs);
 
-        for col in 6..24 {
+        for col in 6..23 {
             assert!(
-                h[(0, col)].abs() < 1e-15,
+                h[col].abs() < 1e-15,
                 "inactive col {col} should be zero, got {}",
-                h[(0, col)]
+                h[col]
             );
         }
     }
@@ -381,25 +444,25 @@ mod tests {
 
         for i in 0..3 {
             assert!(
-                (h[(0, i)] - expected_j_theta[i]).abs() < 1e-12,
+                (h[i] - expected_j_theta[i]).abs() < 1e-12,
                 "J_theta[{i}]: expected={}, got={}",
                 expected_j_theta[i],
-                h[(0, i)]
+                h[i]
             );
             assert!(
-                (h[(0, 3 + i)] - expected_j_position[i]).abs() < 1e-12,
+                (h[3 + i] - expected_j_position[i]).abs() < 1e-12,
                 "J_position[{i}]: expected={}, got={}",
                 expected_j_position[i],
-                h[(0, 3 + i)]
+                h[3 + i]
             );
         }
 
         // Remaining blocks must be zero.
-        for col in 6..24 {
+        for col in 6..23 {
             assert!(
-                h[(0, col)].abs() < 1e-15,
+                h[col].abs() < 1e-15,
                 "inactive col {col} should be zero, got {}",
-                h[(0, col)]
+                h[col]
             );
         }
     }
@@ -461,11 +524,11 @@ mod tests {
             let rm = signed_residual_with_extrinsic(&state, &sm, &point_l, &obs);
             let fd = (rp - rm) / (2.0 * FD_EPS);
             assert!(
-                (h[(0, 18 + i)] - fd).abs() < FD_TOL,
+                (h[17 + i] - fd).abs() < FD_TOL,
                 "J_theta_li[{i}]: analytical={:.8}, fd={:.8}, diff={}",
-                h[(0, 18 + i)],
+                h[17 + i],
                 fd,
-                (h[(0, 18 + i)] - fd).abs()
+                (h[17 + i] - fd).abs()
             );
         }
     }
@@ -492,11 +555,11 @@ mod tests {
             let rm = signed_residual_with_extrinsic(&state, &sm, &point_l, &obs);
             let fd = (rp - rm) / (2.0 * FD_EPS);
             assert!(
-                (h[(0, 21 + i)] - fd).abs() < FD_TOL,
+                (h[20 + i] - fd).abs() < FD_TOL,
                 "J_pos_li[{i}]: analytical={:.8}, fd={:.8}, diff={}",
-                h[(0, 21 + i)],
+                h[20 + i],
                 fd,
-                (h[(0, 21 + i)] - fd).abs()
+                (h[20 + i] - fd).abs()
             );
         }
     }
@@ -527,10 +590,10 @@ mod tests {
 
         for col in 0..6 {
             assert!(
-                (h_pose_only[(0, col)] - h_with_ext[(0, col)]).abs() < 1e-12,
+                (h_pose_only[col] - h_with_ext[col]).abs() < 1e-12,
                 "pose col {col} differs: pose-only={:.12}, with-ext={:.12}",
-                h_pose_only[(0, col)],
-                h_with_ext[(0, col)]
+                h_pose_only[col],
+                h_with_ext[col]
             );
         }
     }
@@ -546,11 +609,11 @@ mod tests {
             &state, &extrinsic, &point_l, &point_l, &obs,
         );
 
-        for col in 6..18 {
+        for col in 6..17 {
             assert!(
-                h[(0, col)].abs() < 1e-15,
+                h[col].abs() < 1e-15,
                 "inactive col {col} should be zero, got {}",
-                h[(0, col)]
+                h[col]
             );
         }
     }
@@ -576,7 +639,7 @@ mod tests {
             let dq = UnitQuaternion::from_axis_angle(&axis, 1e-4);
             let state_p = LidarImuExtrinsic::new(extrinsic.rotation * dq, extrinsic.translation);
             let rp = signed_residual_with_extrinsic(&state, &state_p, &point_l, &obs);
-            let predicted = r0 + h[(0, 18 + i)] * 1e-4;
+            let predicted = r0 + h[17 + i] * 1e-4;
             assert!(
                 (rp - predicted).abs() < TAYLOR_EPS,
                 "theta_li[{i}]: r_pert={rp:.8}, predicted={predicted:.8}, diff={}",
@@ -590,7 +653,7 @@ mod tests {
             dt[i] = 1e-4;
             let state_p = LidarImuExtrinsic::new(extrinsic.rotation, extrinsic.translation + dt);
             let rp = signed_residual_with_extrinsic(&state, &state_p, &point_l, &obs);
-            let predicted = r0 + h[(0, 21 + i)] * 1e-4;
+            let predicted = r0 + h[20 + i] * 1e-4;
             assert!(
                 (rp - predicted).abs() < TAYLOR_EPS,
                 "pos_li[{i}]: r_pert={rp:.8}, predicted={predicted:.8}, diff={}",

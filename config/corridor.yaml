@@ -1,0 +1,47 @@
+common:
+    debug_mode: false
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/livox/imu"
+    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                  # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+preprocess:
+    voxel_size: 0.2
+    lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 
+    scan_line: 4
+    blind: 0.5
+
+mapping:
+    acc_cov: 0.01256144599541998
+    gyr_cov: 9.331396894090049e-05
+    b_acc_cov: 0.0001286757133427232
+    b_gyr_cov: 0.0001286757133427232
+    extrinsic_est_en: false
+    extrinsic_T: [-0.01907, 0.0045, 0.05714]
+    extrinsic_R: [0.9992567134, 0.0323885370, -0.0209046257,
+                  -0.0323328632, 0.9994726664, 0.0029958365,
+                   0.0209906327, -0.0023177033, 0.9997769859]
+
+
+surfel_map_config:
+    voxel_size: 0.4
+    search_radius: 0
+
+surfel_config:
+    growing_radius: 0.8
+    min_mature_surfel_count: 8
+    max_planarity_ratio: 0.10
+    min_plane_spread_eigenvalue: 0.025
+    max_mahalanobis_distance: 2.0
+                   
+# publish:
+    # path_en:  false
+    # scan_publish_en:  true       # false: close all the point cloud output
+    # dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+    # scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+# pcd_save:
+    # pcd_save_en: true
+    # interval: -1                 # how many LiDAR frames saved in each pcd file; 
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

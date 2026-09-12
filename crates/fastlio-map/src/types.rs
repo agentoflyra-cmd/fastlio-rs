@@ -94,7 +94,7 @@ pub struct Surfel {
 
 impl Surfel {
     pub fn from_first_point(point: &PointXYZI) -> Self {
-        let mean_w = point.to_vec3().cast();
+        let mean_w = point.to_vec3_f64();
         let m2 = Mat3::<f64>::zeros();
         let init_vec3 = Vec3::<f64>::zeros();
 
@@ -111,9 +111,7 @@ impl Surfel {
 
     pub fn plane_distance(&self, point: &PointXYZI) -> f32 {
         let norm_w = self.eigenvectors.column(0);
-        ((point.to_vec3().cast::<f64>() - self.mean_w)
-            .dot(&norm_w)
-            .abs()) as f32
+        ((point.to_vec3_f64() - self.mean_w).dot(&norm_w).abs()) as f32
     }
 
     pub fn within_plane_distance(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
@@ -140,7 +138,7 @@ impl Surfel {
     }
 
     pub fn mahalanobis_squared(&self, point: &PointXYZI, config: &SurfelConfig) -> f32 {
-        let delta = point.to_vec3().cast::<f64>() - self.mean_w;
+        let delta = point.to_vec3_f64() - self.mean_w;
         let d0 = self.eigenvectors.column(0).dot(&delta);
         let d1 = self.eigenvectors.column(1).dot(&delta);
         let d2 = self.eigenvectors.column(2).dot(&delta);
@@ -175,7 +173,7 @@ impl Surfel {
         self.eigenvalues[0] / self.eigenvalues[1]
     }
 
-    fn linearity(&self) -> f64 {
+    pub(crate) fn linearity(&self) -> f64 {
         (self.eigenvalues[2] - self.eigenvalues[1]) / self.eigenvalues[2]
     }
 
@@ -216,9 +214,18 @@ impl Surfel {
     }
 
     pub(crate) fn within_growing_radius(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
-        let dist2 = (point.to_vec3().cast::<f64>() - self.mean_w).norm_squared();
+        let dist2 = (point.to_vec3_f64() - self.mean_w).norm_squared();
         let radius = config.growing_radius as f64;
         dist2 <= radius * radius
+    }
+
+    pub(crate) fn line_distance(&self, point: &PointXYZI) -> f64 {
+        let n0 = self.eigenvectors.column(0);
+        let n1 = self.eigenvectors.column(1);
+        let delta = point.to_vec3_f64() - self.mean_w;
+        let r0 = n0.dot(&delta);
+        let r1 = n1.dot(&delta);
+        (r0 * r0 + r1 * r1).sqrt()
     }
 
     // merge an similar surfel

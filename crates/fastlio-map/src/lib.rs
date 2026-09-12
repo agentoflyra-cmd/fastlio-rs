@@ -708,7 +708,9 @@ mod surfel_test {
 
     fn assert_none(map: &SurfelMap, point: &PointXYZI) {
         assert!(
-            map.query(point).expect("query must not error").is_none(),
+            map.query_plane(point)
+                .expect("query must not error")
+                .is_none(),
             "expected query to return None for point ({}, {}, {})",
             point.x,
             point.y,
@@ -723,7 +725,7 @@ mod surfel_test {
         map.insert(pts.into_iter()).unwrap();
 
         let obs = map
-            .query(&pt(0.0, 0.0, 0.0))
+            .query_plane(&pt(0.0, 0.0, 0.0))
             .expect("query must not error")
             .expect("planar surfel expected");
         assert!(obs.norm_w.norm().is_finite(), "normal must be finite");
@@ -744,7 +746,7 @@ mod surfel_test {
         // Query a point that lies on the plane: pick a stored sample point.
         let sample = &pts[0];
         let obs = map
-            .query(sample)
+            .query_plane(sample)
             .expect("query must not error")
             .expect("planar surfel expected");
 
@@ -854,7 +856,7 @@ mod surfel_test {
         // In-plane query matches the nearer plane (the far one is beyond
         // max_plane_distance along the normal).
         let obs = map
-            .query(&pt(0.0, 0.0, 0.0))
+            .query_plane(&pt(0.0, 0.0, 0.0))
             .expect("query must not error")
             .expect("plane candidate expected");
         assert!(
@@ -874,7 +876,7 @@ mod surfel_test {
 
         // On the second plane: matches it instead.
         let obs = map
-            .query(&pt(0.0, 0.0, 5.0))
+            .query_plane(&pt(0.0, 0.0, 5.0))
             .expect("query must not error")
             .expect("plane candidate expected");
         assert!(
@@ -892,7 +894,7 @@ mod surfel_test {
         )
         .unwrap();
         // sanity: valid point is accepted
-        assert!(map.query(&pt(0.0, 0.0, 0.0)).unwrap().is_some());
+        assert!(map.query_plane(&pt(0.0, 0.0, 0.0)).unwrap().is_some());
 
         let bad_coords = [pt(f32::NAN, 0.0, 0.0), pt(0.0, f32::INFINITY, 0.0)];
         for p in &bad_coords {
@@ -924,6 +926,52 @@ mod surfel_test {
         s.eigenvalues = Vec3::new(degenerate_eigenvalue as f64, 1.0, 1.0);
         s.count = 8;
         s
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn add_axis_line_surfel(map: &mut SurfelMap, y: f64) {
+        let mut s = Surfel::default();
+        s.mean_w = Vec3::new(0.0, y, 0.0);
+        s.eigenvectors = Mat3::identity();
+        s.eigenvalues = Vec3::new(0.04, 0.04, 1.0);
+        s.count = 8;
+        let id = map.surfels.insert(s);
+        let key = VoxelKey::new(&pt(0.0, 0.0, 0.0), map.surfel_map_config().voxel_size)
+            .expect("test voxel key must be valid")
+            .pack();
+        map.buckets.entry(key).or_default().push(id);
+    }
+
+    #[test]
+    fn query_line_returns_unambiguous_line_surfel() {
+        let mut map = SurfelMap::new(map_config(), surfel_config(|_| {}));
+        add_axis_line_surfel(&mut map, 0.0);
+        add_axis_line_surfel(&mut map, 0.30);
+
+        let obs = map
+            .query_line(&pt(0.0, 0.0, 0.0))
+            .expect("query must not error")
+            .expect("unambiguous line expected");
+
+        assert!(obs.distance < 1.0e-12);
+        assert_eq!(obs.second_best_distance, Some(0.30));
+        assert_eq!(obs.ambiguity_ratio, Some(0.0));
+    }
+
+    #[test]
+    fn query_line_rejects_ambiguous_parallel_lines() {
+        let mut map = SurfelMap::new(map_config(), surfel_config(|_| {}));
+        add_axis_line_surfel(&mut map, -0.06);
+        add_axis_line_surfel(&mut map, 0.06);
+
+        let obs = map
+            .query_line(&pt(0.0, 0.0, 0.0))
+            .expect("query must not error");
+
+        assert!(
+            obs.is_none(),
+            "equidistant parallel line candidates must be rejected"
+        );
     }
 
     #[test]

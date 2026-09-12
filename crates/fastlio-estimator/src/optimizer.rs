@@ -1,6 +1,9 @@
-use crate::{iekf::box_minus, linearize_point_to_plane_observation, skew};
-use fastlio_map::surfel::{SurfelMap, SurfelObservation};
-use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
+use crate::{
+    iekf::{box_minus, gravity_box_plus},
+    linearize_point_to_line_observation, linearize_point_to_plane_observation, skew,
+};
+use fastlio_map::surfel::{SurfelLineObservation, SurfelMap, SurfelObservation};
+use fastlio_types::{LidarImuExtrinsic, Mat2, Mat3, Mat32, NavState, PointXYZI, Vec2, Vec3};
 use nalgebra::{SMatrix, SVector};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,13 +16,149 @@ pub enum IekfUpdateError {
     MapQueryFailed { context: String },
 }
 
-pub struct LinearizedObservation {
+// Line observations carry two scalar residual rows and therefore two 23D
+// Jacobians. Keep the enum inline to avoid per-observation heap allocation in
+// the IEKF hot path.
+#[allow(clippy::large_enum_variant)]
+pub enum LinearizedObservation {
+    Plane(PlaneLinearizedObservation),
+    Line(LineLinearizedObservation),
+}
+
+#[derive(Debug, Clone)]
+pub struct LineLinearizedObservation {
+    pub residual0: f64,
+    pub residual1: f64,
+    pub jacobian0: SVector<f64, 23>,
+    pub jacobian1: SVector<f64, 23>,
+    pub variance: f64,
+    pub distance: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaneLinearizedObservation {
     pub residual: f64,
-    pub jacobian: SMatrix<f64, 1, 24>,
+    pub jacobian: SVector<f64, 23>,
     pub variance: f64,
 }
 
-/// Configuration for the current 24D error-state IEKF update.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ObservationDiagnostics {
+    pub input_points: usize,
+    pub accepted_observations: usize,
+    pub plane_accepted: usize,
+    pub line_accepted: usize,
+    pub no_association: usize,
+    pub residual_abs_mean: f64,
+    pub residual_abs_p50: f64,
+    pub residual_abs_p90: f64,
+    pub residual_abs_p95: f64,
+    pub residual_abs_p99: f64,
+    pub residual_abs_max: f64,
+    pub line_residual_abs_p95: f64,
+    pub line_distance_p95: f64,
+}
+
+impl ObservationDiagnostics {
+    pub fn from_observations(input_points: usize, observations: &[LinearizedObservation]) -> Self {
+        let accepted_observations = observations.len();
+        if accepted_observations == 0 {
+            return Self {
+                input_points,
+                no_association: input_points,
+                ..Self::default()
+            };
+        }
+
+        let residuals = sorted_abs_residual_rows(observations);
+        let line_residuals = sorted_abs_line_residual_rows(observations);
+        let line_distances = sorted_line_distances(observations);
+        let plane_accepted = observations
+            .iter()
+            .filter(|observation| matches!(observation, LinearizedObservation::Plane(_)))
+            .count();
+        let line_accepted = observations
+            .iter()
+            .filter(|observation| matches!(observation, LinearizedObservation::Line(_)))
+            .count();
+        Self {
+            input_points,
+            accepted_observations,
+            plane_accepted,
+            line_accepted,
+            no_association: input_points.saturating_sub(accepted_observations),
+            residual_abs_mean: mean(&residuals),
+            residual_abs_p50: percentile(&residuals, 0.50),
+            residual_abs_p90: percentile(&residuals, 0.90),
+            residual_abs_p95: percentile(&residuals, 0.95),
+            residual_abs_p99: percentile(&residuals, 0.99),
+            residual_abs_max: *residuals.last().unwrap_or(&0.0),
+            line_residual_abs_p95: percentile(&line_residuals, 0.95),
+            line_distance_p95: percentile(&line_distances, 0.95),
+        }
+    }
+}
+
+fn sorted_abs_residual_rows(observations: &[LinearizedObservation]) -> Vec<f64> {
+    let mut values = Vec::new();
+    for observation in observations {
+        match observation {
+            LinearizedObservation::Plane(observation) => {
+                values.push(observation.residual.abs());
+            }
+            LinearizedObservation::Line(observation) => {
+                values.push(observation.residual0.abs());
+                values.push(observation.residual1.abs());
+            }
+        }
+    }
+    values.retain(|value| value.is_finite());
+    values.sort_by(f64::total_cmp);
+    values
+}
+
+fn sorted_abs_line_residual_rows(observations: &[LinearizedObservation]) -> Vec<f64> {
+    let mut values = Vec::new();
+    for observation in observations {
+        if let LinearizedObservation::Line(observation) = observation {
+            values.push(observation.residual0.abs());
+            values.push(observation.residual1.abs());
+        }
+    }
+    values.retain(|value| value.is_finite());
+    values.sort_by(f64::total_cmp);
+    values
+}
+
+fn sorted_line_distances(observations: &[LinearizedObservation]) -> Vec<f64> {
+    let mut values = observations
+        .iter()
+        .filter_map(|observation| match observation {
+            LinearizedObservation::Plane(_) => None,
+            LinearizedObservation::Line(observation) => Some(observation.distance),
+        })
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    values.sort_by(f64::total_cmp);
+    values
+}
+
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let index = ((values.len() - 1) as f64 * p).round() as usize;
+    values[index]
+}
+
+/// Configuration for the current 23D error-state IEKF update.
 #[derive(Debug, Clone, Copy)]
 pub struct IekfConfig {
     pub max_iterations: usize,
@@ -40,10 +179,7 @@ impl Default for IekfConfig {
             damping: 1.0e-6,
             measurement_variance_floor: 1.0e-6,
             huber_delta: Some(0.1),
-            // TODO(tracking): restore a non-zero observation floor after the
-            // pipeline can report low-observation frames as TrackingLost
-            // without blocking bootstrap-map insertion.
-            min_observations: 0,
+            min_observations: 400,
         }
     }
 }
@@ -57,14 +193,13 @@ pub(crate) fn build_observations(
     out: &mut Vec<LinearizedObservation>,
 ) -> Result<(), IekfUpdateError> {
     out.clear();
-
     for point in points {
         let point_i = extrinsic.transform_point(&point.to_vec3_f64());
-        let point_w = transform_point(state, &point_i);
+        let point_w_vec = transform_point(state, &point_i);
         let point_w = PointXYZI {
-            x: point_w.x as f32,
-            y: point_w.y as f32,
-            z: point_w.z as f32,
+            x: point_w_vec.x as f32,
+            y: point_w_vec.y as f32,
+            z: point_w_vec.z as f32,
             intensity: point.intensity,
         };
         let point_i = PointXYZI {
@@ -74,32 +209,70 @@ pub(crate) fn build_observations(
             intensity: point.intensity,
         };
 
-        let Some(obs) = map
-            .query(&point_w)
-            .map_err(|e| IekfUpdateError::MapQueryFailed {
-                context: e.to_string(),
-            })?
-        else {
-            continue;
-        };
-
-        let jacobian = linearize_point_to_plane_observation(state, &point_i, &obs);
-
-        let residual = obs.signed_residual;
-
-        let variance = build_variance(&obs, config);
-
-        out.push(LinearizedObservation {
-            jacobian,
-            residual,
-            variance,
-        });
+        let plane_observation =
+            map.query_plane(&point_w)
+                .map_err(|e| IekfUpdateError::MapQueryFailed {
+                    context: e.to_string(),
+                })?;
+        if let Some(plane_observation) = plane_observation {
+            out.push(LinearizedObservation::Plane(
+                build_plane_linearized_observation(state, &point_i, &plane_observation, config),
+            ));
+        } else if let Some(line_observation) =
+            map.query_line(&point_w)
+                .map_err(|e| IekfUpdateError::MapQueryFailed {
+                    context: e.to_string(),
+                })?
+        {
+            out.push(LinearizedObservation::Line(
+                build_line_linearized_observation(state, &point_i, &line_observation, config),
+            ));
+        }
     }
     Ok(())
 }
 
+fn build_plane_linearized_observation(
+    state: &NavState,
+    point_i: &PointXYZI,
+    surfel_observation: &SurfelObservation,
+    config: &IekfConfig,
+) -> PlaneLinearizedObservation {
+    let jacobian = linearize_point_to_plane_observation(state, point_i, surfel_observation);
+    let residual = surfel_observation.signed_residual;
+    let variance = build_variance(surfel_observation, config);
+    PlaneLinearizedObservation {
+        jacobian,
+        residual,
+        variance,
+    }
+}
+
+fn build_line_linearized_observation(
+    state: &NavState,
+    point_i: &PointXYZI,
+    surfel_line_observation: &SurfelLineObservation,
+    config: &IekfConfig,
+) -> LineLinearizedObservation {
+    let (jacobian0, jacobian1) =
+        linearize_point_to_line_observation(state, point_i, surfel_line_observation);
+    LineLinearizedObservation {
+        residual0: surfel_line_observation.residual0,
+        residual1: surfel_line_observation.residual1,
+        jacobian0,
+        jacobian1,
+        variance: build_line_variance(surfel_line_observation, config),
+        distance: surfel_line_observation.distance,
+    }
+}
+
+fn build_line_variance(obs: &SurfelLineObservation, config: &IekfConfig) -> f64 {
+    let min_eigenvalue = obs.eigenvalues[1].max(1.0e-3);
+    min_eigenvalue.max(config.measurement_variance_floor)
+}
+
 pub(crate) fn build_variance(obs: &SurfelObservation, config: &IekfConfig) -> f64 {
-    let min_eigenvalue = obs.eigenvalues[0];
+    let min_eigenvalue = obs.eigenvalues[0].max(1.0e-3);
     min_eigenvalue.max(config.measurement_variance_floor)
 }
 
@@ -109,6 +282,19 @@ pub(crate) fn transform_point(state: &NavState, point: &Vec3<f64>) -> Vec3<f64> 
     let r = r.matrix();
 
     r * point + t
+}
+
+#[inline]
+fn s2_prior_jacobian_inverse(eta: &Vec2<f64>) -> Mat2<f64> {
+    let r2 = eta.norm_squared();
+
+    if r2 < 1e-10 {
+        return Mat2::identity();
+    }
+
+    let r = r2.sqrt();
+    let k = r / r.sin();
+    k * Mat2::identity() + (1.0 - k) * (eta * eta.transpose()) / r2
 }
 
 #[inline]
@@ -129,29 +315,60 @@ fn so3_right_jacobian_inverse(phi: &Vec3<f64>) -> Mat3<f64> {
 }
 
 #[inline]
-fn prior_error_jacobian(state_iter: &NavState, state: &NavState) -> SMatrix<f64, 24, 24> {
-    let prior_error = box_minus(state_iter, state);
-    let mut jacobian = SMatrix::<f64, 24, 24>::identity();
+fn prior_error_jacobian(
+    state_iter: &NavState,
+    state: &NavState,
+    gravity_basis_prior: &Mat32,
+    gravity_basis_iter: &Mat32,
+) -> SMatrix<f64, 23, 23> {
+    let prior_error = box_minus(state_iter, state, gravity_basis_prior);
+    let mut jacobian = SMatrix::<f64, 23, 23>::identity();
     let phi = prior_error.fixed_rows::<3>(0).into_owned();
+    let eta = prior_error.fixed_rows::<2>(15).into_owned();
+    let (_, gravity_basis_direct) = gravity_box_plus(&state.gravity, gravity_basis_prior, &eta);
+    let q = gravity_basis_direct.transpose() * gravity_basis_iter;
+    let j_gravity = s2_prior_jacobian_inverse(&eta) * q;
     jacobian
         .fixed_view_mut::<3, 3>(0, 0)
         .copy_from(&so3_right_jacobian_inverse(&phi));
     jacobian
+        .fixed_view_mut::<2, 2>(15, 15)
+        .copy_from(&j_gravity);
+    jacobian
+}
+
+fn accumulate_row(
+    information: &mut SMatrix<f64, 23, 23>,
+    rhs: &mut SVector<f64, 23>,
+    h: SVector<f64, 23>,
+    residual: f64,
+    variance: f64,
+) -> Result<(), IekfUpdateError> {
+    if !residual.is_finite() || !variance.is_finite() || variance <= 0.0 {
+        return Err(IekfUpdateError::InvalidObservation);
+    }
+    let w = 1.0 / variance;
+    *information += h * w * h.transpose();
+    *rhs -= h * w * residual;
+    Ok(())
 }
 
 pub(crate) fn linear_update(
     state: &NavState,
+    gravity_basis_prior: &Mat32,
+    gravity_basis_iter: &Mat32,
     state_iter: &NavState,
-    covariance: &SMatrix<f64, 24, 24>,
+    covariance: &SMatrix<f64, 23, 23>,
     observations: &[LinearizedObservation],
     _config: &IekfConfig,
-) -> Result<(SVector<f64, 24>, SMatrix<f64, 24, 24>), IekfUpdateError> {
+) -> Result<(SVector<f64, 23>, SMatrix<f64, 23, 23>), IekfUpdateError> {
     let p_chol = covariance.cholesky().ok_or(IekfUpdateError::NotSpd)?;
     let l = p_chol.l();
 
     // Current IEKF linear solve is written in whitened information form.
-    let prior_error = box_minus(state_iter, state);
-    let prior_error_jacobian = prior_error_jacobian(state_iter, state);
+    let prior_error = box_minus(state_iter, state, gravity_basis_prior);
+    let prior_error_jacobian =
+        prior_error_jacobian(state_iter, state, gravity_basis_prior, gravity_basis_iter);
 
     let b_prior = l
         .solve_lower_triangular(&prior_error)
@@ -165,15 +382,33 @@ pub(crate) fn linear_update(
     let mut rhs = -a_prior.transpose() * b_prior;
 
     for obs in observations {
-        if !obs.residual.is_finite() || !obs.variance.is_finite() || obs.variance <= 0.0 {
-            return Err(IekfUpdateError::InvalidObservation);
+        match obs {
+            LinearizedObservation::Plane(o) => {
+                accumulate_row(
+                    &mut information,
+                    &mut rhs,
+                    o.jacobian,
+                    o.residual,
+                    o.variance,
+                )?;
+            }
+            LinearizedObservation::Line(o) => {
+                accumulate_row(
+                    &mut information,
+                    &mut rhs,
+                    o.jacobian0,
+                    o.residual0,
+                    o.variance,
+                )?;
+                accumulate_row(
+                    &mut information,
+                    &mut rhs,
+                    o.jacobian1,
+                    o.residual1,
+                    o.variance,
+                )?;
+            }
         }
-
-        let w = 1.0 / obs.variance;
-        let h = obs.jacobian;
-
-        information += h.transpose() * w * h;
-        rhs -= h.transpose() * w * obs.residual;
     }
 
     let chol = symmetric(&information)
@@ -184,7 +419,7 @@ pub(crate) fn linear_update(
     Ok((dx, post_covariance))
 }
 
-pub(crate) fn symmetric(covariance: &SMatrix<f64, 24, 24>) -> SMatrix<f64, 24, 24> {
+pub(crate) fn symmetric(covariance: &SMatrix<f64, 23, 23>) -> SMatrix<f64, 23, 23> {
     (covariance.transpose() + covariance) / 2.0
 }
 
@@ -239,8 +474,8 @@ mod tests {
     /// SPD prior covariance: `base` on the diagonal plus overrides on the
     /// specified entries. Callers must keep the touched 2x2 blocks positive
     /// definite.
-    fn diagonal_covariance(base: f64, overrides: &[(usize, f64)]) -> SMatrix<f64, 24, 24> {
-        let mut c = SMatrix::<f64, 24, 24>::identity() * base;
+    fn diagonal_covariance(base: f64, overrides: &[(usize, f64)]) -> SMatrix<f64, 23, 23> {
+        let mut c = SMatrix::<f64, 23, 23>::identity() * base;
         for &(i, v) in overrides {
             c[(i, i)] = v;
         }
@@ -249,13 +484,13 @@ mod tests {
 
     fn position_z_observation(residual: f64, variance: f64) -> LinearizedObservation {
         // Jacobian selects only the position-z error state column (index 5).
-        let mut h = SMatrix::<f64, 1, 24>::zeros();
-        h[(0, 5)] = 1.0;
-        LinearizedObservation {
+        let mut h = SVector::<f64, 23>::zeros();
+        h[5] = 1.0;
+        LinearizedObservation::Plane(PlaneLinearizedObservation {
             residual,
             jacobian: h,
             variance,
-        }
+        })
     }
 
     // ---------------------------------------------------------------
@@ -274,8 +509,17 @@ mod tests {
             observations.push(position_z_observation(0.0, 1.0));
         }
 
-        let (dx, post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (dx, post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         assert!(
             dx.norm() < 1e-9,
@@ -303,8 +547,17 @@ mod tests {
         let config = config_with_zero_damping();
 
         let observations = vec![position_z_observation(r, var)];
-        let (dx, _post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (dx, _post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         let expected = -p_z * r / (p_z + var);
         assert!(
@@ -312,7 +565,7 @@ mod tests {
             "position-z correction: got={:.12}, expected={expected:.12}",
             dx[5]
         );
-        for i in 0..24 {
+        for i in 0..23 {
             if i != 5 {
                 assert!(
                     dx[i].abs() < TOL,
@@ -333,21 +586,30 @@ mod tests {
         let covariance = diagonal_covariance(1.0, &[]);
         let config = config_with_zero_damping();
 
-        let mut e = SVector::<f64, 24>::zeros();
+        let mut e = SVector::<f64, 23>::zeros();
         e.fixed_rows_mut::<3>(0)
             .copy_from(&Vec3::new(0.05, 0.0, 0.0));
         e.fixed_rows_mut::<3>(3)
             .copy_from(&Vec3::new(0.2, -0.1, 0.3));
         e.fixed_rows_mut::<3>(6)
             .copy_from(&Vec3::new(0.4, 0.0, -0.2));
-        let state_iter = box_plus(&state, &e);
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (state_iter, gravity_basis_iter) = box_plus(&state, &gravity_basis, &e);
 
         let observations = Vec::new();
-        let (dx, post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let (dx, post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis_iter,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         // dx must be exactly the negative of the prior error (empty update).
-        let neg_prior_error = -box_minus(&state_iter, &state);
+        let neg_prior_error = -box_minus(&state_iter, &state, &gravity_basis);
         assert!(
             (dx - neg_prior_error).norm() < TOL,
             "dx should equal -prior_error, diff norm={}",
@@ -355,7 +617,7 @@ mod tests {
         );
 
         // Re-composing must return to the prior state.
-        let back = box_plus(&state_iter, &dx);
+        let (back, _) = box_plus(&state_iter, &gravity_basis_iter, &dx);
         assert!(
             (back.position - state.position).norm() < TOL,
             "position not pulled back to prior"
@@ -370,7 +632,8 @@ mod tests {
         );
         // The returned covariance is expressed in the current iterate's tangent
         // space, so the prior covariance is transported by J_prior.
-        let j_prior = prior_error_jacobian(&state_iter, &state);
+        let j_prior =
+            prior_error_jacobian(&state_iter, &state, &gravity_basis, &gravity_basis_iter);
         let p_inv = covariance
             .try_inverse()
             .expect("test covariance must be invertible");
@@ -388,8 +651,9 @@ mod tests {
         const FD_EPS: f64 = 1e-7;
         const FD_TOL: f64 = 1e-6;
 
-        let state = make_state();
-        let mut offset = SVector::<f64, 24>::zeros();
+        let mut state = make_state();
+        state.gravity = Vec3::new(2.4, -1.7, -9.2).normalize() * 9.81;
+        let mut offset = SVector::<f64, 23>::zeros();
         offset
             .fixed_rows_mut::<3>(0)
             .copy_from(&Vec3::new(0.4, -0.3, 0.6));
@@ -399,28 +663,162 @@ mod tests {
         offset
             .fixed_rows_mut::<3>(6)
             .copy_from(&Vec3::new(-0.4, 0.1, 0.2));
-        let state_iter = box_plus(&state, &offset);
-        let analytic = prior_error_jacobian(&state_iter, &state);
+        offset
+            .fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(0.2, -0.15));
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (state_iter, gravity_basis_iter) = box_plus(&state, &gravity_basis, &offset);
+        let analytic =
+            prior_error_jacobian(&state_iter, &state, &gravity_basis, &gravity_basis_iter);
 
-        // NavState currently owns the first 18 dimensions. The reserved
-        // extrinsic blocks (18..24) remain fixed and are not implemented by
-        // box_plus, so they cannot be validated through this state-level map.
-        for column in 0..18 {
-            let mut delta_plus = SVector::<f64, 24>::zeros();
-            let mut delta_minus = SVector::<f64, 24>::zeros();
+        // NavState owns the first 17 dimensions. The reserved extrinsic blocks
+        // (17..23) remain fixed and are not implemented by box_plus.
+        for column in 0..17 {
+            let mut delta_plus = SVector::<f64, 23>::zeros();
+            let mut delta_minus = SVector::<f64, 23>::zeros();
             delta_plus[column] = FD_EPS;
             delta_minus[column] = -FD_EPS;
 
-            let error_plus = box_minus(&box_plus(&state_iter, &delta_plus), &state);
-            let error_minus = box_minus(&box_plus(&state_iter, &delta_minus), &state);
+            let (state_plus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_plus);
+            let (state_minus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_minus);
+            let error_plus = box_minus(&state_plus, &state, &gravity_basis);
+            let error_minus = box_minus(&state_minus, &state, &gravity_basis);
             let finite_difference = (error_plus - error_minus) / (2.0 * FD_EPS);
             let analytic_column = analytic.column(column);
 
             assert!(
                 (finite_difference - analytic_column).norm() < FD_TOL,
-                "J_prior column {column} does not match finite difference"
+                "J_prior column {column} does not match finite difference: analytic={}, fd={}, diff_norm={}",
+                analytic_column.transpose(),
+                finite_difference.transpose(),
+                (finite_difference - analytic_column).norm()
             );
         }
+    }
+
+    #[test]
+    fn prior_error_jacobian_matches_finite_difference_after_two_non_collinear_s2_updates() {
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-6;
+
+        let mut state_prior = make_state();
+        state_prior.gravity = Vec3::new(2.4, -1.7, -9.2).normalize() * 9.81;
+        let gravity_basis_prior = fastlio_types::gravity_tangent_basis(&state_prior.gravity);
+
+        let mut first_delta = SVector::<f64, 23>::zeros();
+        first_delta
+            .fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(0.20, -0.12));
+        let (state_after_first, gravity_basis_after_first) =
+            box_plus(&state_prior, &gravity_basis_prior, &first_delta);
+
+        let mut second_delta = SVector::<f64, 23>::zeros();
+        second_delta
+            .fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(-0.08, 0.17));
+        let (state_iter, gravity_basis_iter) = box_plus(
+            &state_after_first,
+            &gravity_basis_after_first,
+            &second_delta,
+        );
+
+        let analytic = prior_error_jacobian(
+            &state_iter,
+            &state_prior,
+            &gravity_basis_prior,
+            &gravity_basis_iter,
+        );
+
+        for column in 15..17 {
+            let mut delta_plus = SVector::<f64, 23>::zeros();
+            let mut delta_minus = SVector::<f64, 23>::zeros();
+            delta_plus[column] = FD_EPS;
+            delta_minus[column] = -FD_EPS;
+
+            let (state_plus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_plus);
+            let (state_minus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_minus);
+            let error_plus = box_minus(&state_plus, &state_prior, &gravity_basis_prior);
+            let error_minus = box_minus(&state_minus, &state_prior, &gravity_basis_prior);
+            let finite_difference = (error_plus - error_minus) / (2.0 * FD_EPS);
+            let analytic_column = analytic.column(column);
+
+            assert!(
+                (finite_difference - analytic_column).norm() < FD_TOL,
+                "J_prior column {column} after two non-collinear S2 updates does not match finite difference: analytic={}, fd={}, diff_norm={}",
+                analytic_column.transpose(),
+                finite_difference.transpose(),
+                (finite_difference - analytic_column).norm()
+            );
+        }
+    }
+
+    #[test]
+    fn prior_error_jacobian_uses_transported_gravity_basis_not_rebuilt_basis() {
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-6;
+
+        let mut state_prior = make_state();
+        state_prior.gravity = Vec3::new(2.4, -1.7, -9.2).normalize() * 9.81;
+        let gravity_basis_prior = fastlio_types::gravity_tangent_basis(&state_prior.gravity);
+
+        let mut first_delta = SVector::<f64, 23>::zeros();
+        first_delta
+            .fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(0.31, -0.19));
+        let (state_after_first, gravity_basis_after_first) =
+            box_plus(&state_prior, &gravity_basis_prior, &first_delta);
+
+        let mut second_delta = SVector::<f64, 23>::zeros();
+        second_delta
+            .fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(-0.16, 0.27));
+        let (state_iter, gravity_basis_iter) = box_plus(
+            &state_after_first,
+            &gravity_basis_after_first,
+            &second_delta,
+        );
+
+        let analytic = prior_error_jacobian(
+            &state_iter,
+            &state_prior,
+            &gravity_basis_prior,
+            &gravity_basis_iter,
+        );
+        let rebuilt_basis_iter = fastlio_types::gravity_tangent_basis(&state_iter.gravity);
+
+        let mut transported_diff_norm = 0.0;
+        let mut rebuilt_diff_norm = 0.0;
+        for column in 15..17 {
+            let mut delta_plus = SVector::<f64, 23>::zeros();
+            let mut delta_minus = SVector::<f64, 23>::zeros();
+            delta_plus[column] = FD_EPS;
+            delta_minus[column] = -FD_EPS;
+
+            let (state_plus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_plus);
+            let (state_minus, _) = box_plus(&state_iter, &gravity_basis_iter, &delta_minus);
+            let transported_fd = (box_minus(&state_plus, &state_prior, &gravity_basis_prior)
+                - box_minus(&state_minus, &state_prior, &gravity_basis_prior))
+                / (2.0 * FD_EPS);
+
+            let (state_plus_rebuilt, _) = box_plus(&state_iter, &rebuilt_basis_iter, &delta_plus);
+            let (state_minus_rebuilt, _) = box_plus(&state_iter, &rebuilt_basis_iter, &delta_minus);
+            let rebuilt_fd = (box_minus(&state_plus_rebuilt, &state_prior, &gravity_basis_prior)
+                - box_minus(&state_minus_rebuilt, &state_prior, &gravity_basis_prior))
+                / (2.0 * FD_EPS);
+
+            let analytic_column = analytic.column(column);
+            transported_diff_norm += (transported_fd - analytic_column).norm();
+            rebuilt_diff_norm += (rebuilt_fd - analytic_column).norm();
+        }
+
+        assert!(
+            transported_diff_norm < FD_TOL,
+            "analytic J_prior must match finite difference in the transported runtime basis, diff={transported_diff_norm}"
+        );
+        assert!(
+            rebuilt_diff_norm > 1e-3,
+            "rebuilt gravity_tangent_basis accidentally matched transported basis; this test must catch Symbolica derivations that assume runtime basis rebuilding, diff={rebuilt_diff_norm}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -445,8 +843,17 @@ mod tests {
         let config = config_with_zero_damping();
         let observations = vec![position_z_observation(r, var)];
 
-        let (dx, _post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (dx, _post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         // Closed form: dx = -C[:,5] * r / (p_z + var), so velocity-x gets
         // dx_6 = -c * r / (p_z + var) through the cross term.
@@ -481,8 +888,17 @@ mod tests {
         let config = config_with_zero_damping();
         let observations = vec![position_z_observation(r, var)];
 
-        let (dx, _post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (dx, _post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         let expected_pos = -p_z * r / (p_z + var);
         assert!(
@@ -513,8 +929,17 @@ mod tests {
         let config = config_with_zero_damping();
         let observations = vec![position_z_observation(0.5, var)];
 
-        let (_, post) = linear_update(&state, &state_iter, &covariance, &observations, &config)
-            .expect("linear solve must succeed");
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
+        let (_, post) = linear_update(
+            &state,
+            &gravity_basis,
+            &gravity_basis,
+            &state_iter,
+            &covariance,
+            &observations,
+            &config,
+        )
+        .expect("linear solve must succeed");
 
         let expected = p_z * var / (p_z + var);
         assert!(
@@ -549,13 +974,32 @@ mod tests {
 
         let zero_var = vec![position_z_observation(0.5, 0.0)];
         let negative_var = vec![position_z_observation(0.5, -1.0)];
+        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
 
         assert!(
-            linear_update(&state, &state_iter, &covariance, &zero_var, &config).is_err(),
+            linear_update(
+                &state,
+                &gravity_basis,
+                &gravity_basis,
+                &state_iter,
+                &covariance,
+                &zero_var,
+                &config
+            )
+            .is_err(),
             "zero measurement variance must be rejected"
         );
         assert!(
-            linear_update(&state, &state_iter, &covariance, &negative_var, &config).is_err(),
+            linear_update(
+                &state,
+                &gravity_basis,
+                &gravity_basis,
+                &state_iter,
+                &covariance,
+                &negative_var,
+                &config
+            )
+            .is_err(),
             "negative measurement variance must be rejected"
         );
     }
@@ -630,6 +1074,7 @@ mod tests {
 
         let mut single = IekfState {
             state: prior.clone(),
+            gravity_basis: fastlio_types::gravity_tangent_basis(&prior.gravity),
             covariance,
         };
         let extrinsic = LidarImuExtrinsic::new(UnitQuaternion::identity(), Vec3::zeros());
@@ -643,6 +1088,7 @@ mod tests {
         };
         let mut iterated = IekfState {
             state: prior.clone(),
+            gravity_basis: fastlio_types::gravity_tangent_basis(&prior.gravity),
             covariance,
         };
         iterated
@@ -690,7 +1136,7 @@ mod tests {
                 z: world.z as f32,
                 intensity: p.intensity,
             };
-            if let Some(obs) = map.query(&world).expect("query must not error") {
+            if let Some(obs) = map.query_plane(&world).expect("query must not error") {
                 total += obs.signed_residual.abs();
                 count += 1;
             }

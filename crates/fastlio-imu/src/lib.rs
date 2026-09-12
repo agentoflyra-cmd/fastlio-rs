@@ -1,11 +1,11 @@
 use anyhow::Result;
-use fastlio_types::{ImuSample, NavState, Vec3};
+use fastlio_types::{ImuSample, Mat32, NavState, Vec3};
 use nalgebra::UnitQuaternion;
 
 pub type SMat3 = nalgebra::SMatrix<f64, 3, 3>;
 pub type SMat12 = nalgebra::SMatrix<f64, 12, 12>;
-pub type SMat24 = nalgebra::SMatrix<f64, 24, 24>;
-pub type SMat24x12 = nalgebra::SMatrix<f64, 24, 12>;
+pub type SMat23 = nalgebra::SMatrix<f64, 23, 23>;
+pub type SMat23x12 = nalgebra::SMatrix<f64, 23, 12>;
 
 /// δx = [δθ_I, δp_I, δv_I, δbω, δba, δg, δθ_LI, δp_LI]
 pub struct ImuIntegrator {
@@ -120,11 +120,13 @@ impl ImuIntegrator {
     pub fn propagate_covariance(
         &self,
         state_at_k: &NavState,
-        cov: SMat24,
+        gravity_basis: &Mat32,
+        cov: SMat23,
         imu_prev: &ImuSample,
         imu_curr: &ImuSample,
-    ) -> Result<SMat24> {
-        let (fx, fw) = self.error_state_transition(state_at_k, imu_prev, imu_curr)?;
+    ) -> Result<SMat23> {
+        let (fx, fw) =
+            self.error_state_transition(state_at_k, gravity_basis, imu_prev, imu_curr)?;
         let mut q = SMat12::zeros();
 
         q.fixed_view_mut::<3, 3>(0, 0)
@@ -147,13 +149,15 @@ impl ImuIntegrator {
     pub fn error_state_transition(
         &self,
         state_at_k: &NavState,
+        gravity_basis: &Mat32,
         imu_prev: &ImuSample,
         imu_curr: &ImuSample,
-    ) -> Result<(SMat24, SMat24x12)> {
+    ) -> Result<(SMat23, SMat23x12)> {
         let dt = checked_dt(imu_prev, imu_curr)?;
         if dt <= 1e-7 {
-            return Ok((SMat24::identity(), SMat24x12::zeros()));
+            return Ok((SMat23::identity(), SMat23x12::zeros()));
         }
+        let g_norm = state_at_k.gravity.norm();
         let dt2 = dt * dt;
         let omega_mid = 0.5 * (imu_prev.gyro + imu_curr.gyro) - state_at_k.gyro_bias;
         let acc_mid = 0.5 * (self.scaled_accel(imu_prev) + self.scaled_accel(imu_curr))
@@ -174,7 +178,7 @@ impl ImuIntegrator {
         let delta_rotation_inv = delta_rotation.inverse().to_rotation_matrix();
         let ar = delta_rotation_inv.matrix();
 
-        let mut fx = SMat24::identity();
+        let mut fx = SMat23::identity();
         // R
         fx.fixed_view_mut::<3, 3>(0, 0).copy_from(ar);
         fx.fixed_view_mut::<3, 3>(0, 9).copy_from(&(-jr * dt));
@@ -186,18 +190,18 @@ impl ImuIntegrator {
             .copy_from(&(SMat3::identity() * dt));
         fx.fixed_view_mut::<3, 3>(3, 12)
             .copy_from(&(-(r_mid_matrix * 0.5 * dt2)));
-        fx.fixed_view_mut::<3, 3>(3, 15)
-            .copy_from(&(&SMat3::identity() * 0.5 * dt2));
+        fx.fixed_view_mut::<3, 2>(3, 15)
+            .copy_from(&(gravity_basis * (0.5 * g_norm * dt2)));
 
         // v
         fx.fixed_view_mut::<3, 3>(6, 0)
             .copy_from(&(accel_orientation_jac * dt));
         fx.fixed_view_mut::<3, 3>(6, 12)
             .copy_from(&(-(r_mid_matrix * dt)));
-        fx.fixed_view_mut::<3, 3>(6, 15)
-            .copy_from(&(SMat3::identity() * dt));
+        fx.fixed_view_mut::<3, 2>(6, 15)
+            .copy_from(&(gravity_basis * (g_norm * dt)));
 
-        let mut fw = SMat24x12::zeros();
+        let mut fw = SMat23x12::zeros();
         // gyro_bias -> rotation
         fw.fixed_view_mut::<3, 3>(0, 0).copy_from(&(-(jr * dt)));
         // accel_bias -> position
@@ -257,9 +261,9 @@ fn skew(v: &Vec3<f64>) -> SMat3 {
 #[cfg(test)]
 mod test {
     use crate::ImuIntegrator;
-    use crate::{SMat3, SMat24};
+    use crate::{SMat3, SMat23};
     use approx::assert_relative_eq;
-    use fastlio_types::{ImuSample, NavState, Vec3};
+    use fastlio_types::{ImuSample, Mat32, NavState, Vec3, gravity_tangent_basis};
     use nalgebra::{SVector, UnitQuaternion};
 
     struct ImuTest {
@@ -286,7 +290,7 @@ mod test {
                 velocity: Vec3::new(0.0, 0.0, 0.0),
                 gyro_bias: Vec3::new(0.0, 0.0, 0.0),
                 accel_bias: Vec3::new(0.0, 0.0, 0.0),
-                gravity: Vec3::new(0.0, 0.0, 0.0),
+                gravity: Vec3::new(0.0, 0.0, -9.81),
             };
 
             Self {
@@ -294,6 +298,10 @@ mod test {
                 imu_curr,
                 state,
             }
+        }
+
+        fn gravity_basis(&self) -> Mat32 {
+            gravity_tangent_basis(&self.state.gravity)
         }
     }
 
@@ -359,8 +367,8 @@ mod test {
         let expected = test.state.velocity
             + Vec3::new(0.0, 1.0, 1.0)
                 * (test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec);
-        test.imu_prev.accel = Vec3::new(0.0, 1.0, 1.0);
-        test.imu_curr.accel = Vec3::new(0.0, 1.0, 1.0);
+        test.imu_prev.accel = Vec3::new(0.0, 1.0, 10.81);
+        test.imu_curr.accel = Vec3::new(0.0, 1.0, 10.81);
 
         let imu_inte = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         imu_inte
@@ -376,14 +384,19 @@ mod test {
         let test = ImuTest::init();
         let integ = ImuIntegrator::init(0.01, 0.01, 0.001, 0.001);
         let (fx, fw) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_prev)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_prev,
+            )
             .unwrap();
-        for r in 0..24 {
-            for c in 0..24 {
+        for r in 0..23 {
+            for c in 0..23 {
                 assert_relative_eq!(fx[(r, c)], if r == c { 1.0 } else { 0.0 }, epsilon = 1e-14);
             }
         }
-        for r in 0..24 {
+        for r in 0..23 {
             for c in 0..12 {
                 assert_relative_eq!(fw[(r, c)], 0.0, epsilon = 1e-14);
             }
@@ -397,7 +410,12 @@ mod test {
         test.imu_curr.gyro = Vec3::new(0.1, 0.2, 0.3);
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
@@ -424,7 +442,12 @@ mod test {
         test.imu_curr.gyro = Vec3::new(0.1, 0.2, 0.3);
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
@@ -447,7 +470,12 @@ mod test {
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let fx_p_v = fx.fixed_view::<3, 3>(3, 6);
@@ -460,18 +488,28 @@ mod test {
     }
 
     #[test]
-    fn error_state_fx_velocity_to_gravity_block_is_i_dt() {
+    fn error_state_fx_velocity_to_gravity_block_maps_s2_tangent() {
         let test = ImuTest::init();
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
+        let canonical_basis = test.gravity_basis();
+        let transported_basis = Mat32::from_columns(&[
+            -canonical_basis.column(1).into_owned(),
+            canonical_basis.column(0).into_owned(),
+        ]);
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &transported_basis,
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        let fx_v_g = fx.fixed_view::<3, 3>(6, 15);
-        let expected = SMat3::identity() * dt;
+        let fx_v_g = fx.fixed_view::<3, 2>(6, 15);
+        let expected = transported_basis * test.state.gravity.norm() * dt;
         for r in 0..3 {
-            for c in 0..3 {
+            for c in 0..2 {
                 assert_relative_eq!(fx_v_g[(r, c)], expected[(r, c)], epsilon = 1e-10);
             }
         }
@@ -486,18 +524,18 @@ mod test {
         test.imu_curr.accel = Vec3::new(1.0, -2.0, 3.0);
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         // Blocks that should have been left as identity (never overwritten):
         // bg -> bg (9..12, 9..12), ba -> ba (12..15, 12..15),
-        // g -> g (15..18, 15..18), unused diagonal (18..24, 18..24)
-        let identity_blocks: &[(usize, usize)] = &[
-            (9, 9),   // gyro_bias -> gyro_bias
-            (12, 12), // accel_bias -> accel_bias
-            (15, 15), // gravity -> gravity
-            (18, 18), // unused
-        ];
+        // bg -> bg and ba -> ba remain Euclidean identity blocks.
+        let identity_blocks: &[(usize, usize)] = &[(9, 9), (12, 12)];
         for &(row, col) in identity_blocks {
             let block = fx.fixed_view::<3, 3>(row, col);
             for r in 0..3 {
@@ -508,6 +546,26 @@ mod test {
                         epsilon = 1e-10,
                     );
                 }
+            }
+        }
+        let gravity_block = fx.fixed_view::<2, 2>(15, 15);
+        for row in 0..2 {
+            for col in 0..2 {
+                assert_relative_eq!(
+                    gravity_block[(row, col)],
+                    if row == col { 1.0 } else { 0.0 },
+                    epsilon = 1e-10
+                );
+            }
+        }
+        let extrinsic_block = fx.fixed_view::<6, 6>(17, 17);
+        for row in 0..6 {
+            for col in 0..6 {
+                assert_relative_eq!(
+                    extrinsic_block[(row, col)],
+                    if row == col { 1.0 } else { 0.0 },
+                    epsilon = 1e-10
+                );
             }
         }
     }
@@ -521,7 +579,12 @@ mod test {
         test.imu_curr.gyro = Vec3::new(0.1, 0.2, 0.3);
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (_, fw) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
@@ -544,7 +607,12 @@ mod test {
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (_, fw) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let expected = SMat3::identity() * dt;
@@ -575,7 +643,7 @@ mod test {
         test.imu_curr.accel = Vec3::new(1.5, 0.3, -2.0);
         let integ = ImuIntegrator::init(0.01, 0.05, 0.001, 0.002);
 
-        let mut cov = SMat24::zeros();
+        let mut cov = SMat23::zeros();
         for i in 0..18 {
             cov[(i, i)] = (i as f64 + 1.0) * 0.001;
         }
@@ -585,11 +653,17 @@ mod test {
         cov[(12, 6)] = -0.00005;
 
         let result = integ
-            .propagate_covariance(&test.state, cov, &test.imu_prev, &test.imu_curr)
+            .propagate_covariance(
+                &test.state,
+                &test.gravity_basis(),
+                cov,
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        for r in 0..24 {
-            for c in 0..24 {
+        for r in 0..23 {
+            for c in 0..23 {
                 assert_relative_eq!(result[(r, c)], result[(c, r)], epsilon = 1e-12);
             }
         }
@@ -605,7 +679,7 @@ mod test {
         test.state.orientation = UnitQuaternion::from_scaled_axis(Vec3::new(0.1, -0.2, 0.15));
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
 
-        let mut cov = SMat24::zeros();
+        let mut cov = SMat23::zeros();
         for i in 0..18 {
             cov[(i, i)] = (i as f64 + 1.0) * 0.001;
         }
@@ -613,15 +687,26 @@ mod test {
         cov[(7, 1)] = 0.0003;
 
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
         let expected = fx * cov * fx.transpose();
         let actual = integ
-            .propagate_covariance(&test.state, cov, &test.imu_prev, &test.imu_curr)
+            .propagate_covariance(
+                &test.state,
+                &test.gravity_basis(),
+                cov,
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        for r in 0..24 {
-            for c in 0..24 {
+        for r in 0..23 {
+            for c in 0..23 {
                 assert_relative_eq!(actual[(r, c)], expected[(r, c)], epsilon = 1e-12);
             }
         }
@@ -632,7 +717,7 @@ mod test {
         let test = ImuTest::init();
         let integ = ImuIntegrator::init(0.01, 0.05, 0.001, 0.002);
 
-        let mut cov = SMat24::zeros();
+        let mut cov = SMat23::zeros();
         for i in 0..18 {
             cov[(i, i)] = (i as f64 + 1.0) * 0.001;
         }
@@ -640,11 +725,17 @@ mod test {
         cov[(7, 1)] = 0.0003;
 
         let result = integ
-            .propagate_covariance(&test.state, cov, &test.imu_prev, &test.imu_prev)
+            .propagate_covariance(
+                &test.state,
+                &test.gravity_basis(),
+                cov,
+                &test.imu_prev,
+                &test.imu_prev,
+            )
             .unwrap();
 
-        for r in 0..24 {
-            for c in 0..24 {
+        for r in 0..23 {
+            for c in 0..23 {
                 assert_relative_eq!(result[(r, c)], cov[(r, c)], epsilon = 1e-14);
             }
         }
@@ -652,13 +743,13 @@ mod test {
 
     // --- finite-difference Jacobian verification ---
 
-    type S18 = SVector<f64, 18>;
+    type S17 = SVector<f64, 17>;
 
     fn skew3(v: &Vec3<f64>) -> SMat3 {
         crate::skew(v)
     }
 
-    fn inject_error_state(nominal: &NavState, dx: &S18) -> NavState {
+    fn inject_error_state(nominal: &NavState, dx: &S17) -> NavState {
         let delta_theta: Vec3<f64> = dx.fixed_rows::<3>(0).into_owned();
         let delta_rot = UnitQuaternion::from_scaled_axis(delta_theta);
         NavState {
@@ -667,15 +758,20 @@ mod test {
             velocity: nominal.velocity + dx.fixed_rows::<3>(6).into_owned(),
             gyro_bias: nominal.gyro_bias + dx.fixed_rows::<3>(9).into_owned(),
             accel_bias: nominal.accel_bias + dx.fixed_rows::<3>(12).into_owned(),
-            gravity: nominal.gravity + dx.fixed_rows::<3>(15).into_owned(),
+            gravity: {
+                let tangent =
+                    gravity_tangent_basis(&nominal.gravity) * dx.fixed_rows::<2>(15).into_owned();
+                let axis = nominal.gravity.normalize().cross(&tangent);
+                UnitQuaternion::from_scaled_axis(axis) * nominal.gravity
+            },
         }
     }
 
-    fn extract_error_state(true_state: &NavState, nominal: &NavState) -> S18 {
+    fn extract_error_state(true_state: &NavState, nominal: &NavState) -> S17 {
         let delta_rot = nominal.orientation.inverse() * true_state.orientation;
         let delta_theta = delta_rot.scaled_axis();
 
-        let mut err = S18::zeros();
+        let mut err = S17::zeros();
         err.fixed_rows_mut::<3>(0).copy_from(&delta_theta);
         err.fixed_rows_mut::<3>(3)
             .copy_from(&(true_state.position - nominal.position));
@@ -685,8 +781,18 @@ mod test {
             .copy_from(&(true_state.gyro_bias - nominal.gyro_bias));
         err.fixed_rows_mut::<3>(12)
             .copy_from(&(true_state.accel_bias - nominal.accel_bias));
-        err.fixed_rows_mut::<3>(15)
-            .copy_from(&(true_state.gravity - nominal.gravity));
+        let u0 = nominal.gravity.normalize();
+        let u1 = true_state.gravity.normalize();
+        let cross = u0.cross(&u1);
+        let sin_theta = cross.norm();
+        let cos_theta = u0.dot(&u1).clamp(-1.0, 1.0);
+        let tangent = if sin_theta < 1e-12 {
+            Vec3::zeros()
+        } else {
+            (u1 - cos_theta * u0) * (sin_theta.atan2(cos_theta) / sin_theta)
+        };
+        err.fixed_rows_mut::<2>(15)
+            .copy_from(&(gravity_tangent_basis(&nominal.gravity).transpose() * tangent));
         err
     }
 
@@ -707,7 +813,12 @@ mod test {
         let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
         let (fx, _) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
         let mut nominal_forward = test.state.clone();
@@ -720,7 +831,7 @@ mod test {
 
         // Test velocity-to-position block (3..6, 6..9) = I * dt
         {
-            let mut dx = S18::zeros();
+            let mut dx = S17::zeros();
             dx[6] = h; // perturb v_x
             let perturbed = inject_error_state(&test.state, &dx);
             let mut fwd = perturbed.clone();
@@ -736,7 +847,7 @@ mod test {
 
         // Test accel_bias-to-velocity block (6..9, 12..15) = -R_mid * dt
         {
-            let mut dx = S18::zeros();
+            let mut dx = S17::zeros();
             dx[12] = h; // perturb ba_x
             let perturbed = inject_error_state(&test.state, &dx);
             let mut fwd = perturbed.clone();
@@ -762,7 +873,7 @@ mod test {
 
         // Test gyro_bias-to-rotation block (0..3, 9..12) = -Jr * dt
         {
-            let mut dx = S18::zeros();
+            let mut dx = S17::zeros();
             dx[9] = h; // perturb bg_x
             let perturbed = inject_error_state(&test.state, &dx);
             let mut fwd = perturbed.clone();
@@ -788,7 +899,7 @@ mod test {
         // Test rotation-to-position block (3..6, 0..3):
         // accel_orientation_jac * 0.5 * dt^2 where accel_orientation_jac = -R_mid * skew(acc_mid)
         {
-            let mut dx = S18::zeros();
+            let mut dx = S17::zeros();
             dx[1] = h; // perturb delta_theta_y
             let perturbed = inject_error_state(&test.state, &dx);
             let mut fwd = perturbed.clone();
@@ -857,7 +968,12 @@ mod test {
             };
 
             let (_, fw) = integ
-                .error_state_transition(&test.state, &imu_meas_prev, &imu_meas_curr)
+                .error_state_transition(
+                    &test.state,
+                    &test.gravity_basis(),
+                    &imu_meas_prev,
+                    &imu_meas_curr,
+                )
                 .unwrap();
 
             // nominal = propagated with noisy IMU
@@ -907,7 +1023,12 @@ mod test {
             };
 
             let (_, fw) = integ
-                .error_state_transition(&test.state, &imu_meas_prev, &imu_meas_curr)
+                .error_state_transition(
+                    &test.state,
+                    &test.gravity_basis(),
+                    &imu_meas_prev,
+                    &imu_meas_curr,
+                )
                 .unwrap();
 
             let mut nom_fwd = test.state.clone();
@@ -950,7 +1071,12 @@ mod test {
         let integ = ImuIntegrator::init(0.01, 0.01, 0.001, 0.001);
         assert!(
             integ
-                .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+                .error_state_transition(
+                    &test.state,
+                    &test.gravity_basis(),
+                    &test.imu_prev,
+                    &test.imu_curr,
+                )
                 .is_err()
         );
     }
@@ -964,7 +1090,8 @@ mod test {
             integ
                 .propagate_covariance(
                     &test.state,
-                    SMat24::identity(),
+                    &test.gravity_basis(),
+                    SMat23::identity(),
                     &test.imu_prev,
                     &test.imu_curr
                 )
@@ -980,14 +1107,20 @@ mod test {
         test.imu_prev.accel = Vec3::new(1.5, 0.3, -2.0);
         test.imu_curr.accel = Vec3::new(1.3, 0.2, 1.0);
 
-        let cov_in = SMat24::identity() * 0.01;
+        let cov_in = SMat23::identity() * 0.01;
         let integ = ImuIntegrator::init(0.1, 0.2, 0.03, 0.04);
         let cov_out = integ
-            .propagate_covariance(&test.state, cov_in, &test.imu_prev, &test.imu_curr)
+            .propagate_covariance(
+                &test.state,
+                &test.gravity_basis(),
+                cov_in,
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        let diag_sum_in: f64 = (0..24).map(|i| cov_in[(i, i)]).sum();
-        let diag_sum_out: f64 = (0..24).map(|i| cov_out[(i, i)]).sum();
+        let diag_sum_in: f64 = (0..23).map(|i| cov_in[(i, i)]).sum();
+        let diag_sum_out: f64 = (0..23).map(|i| cov_out[(i, i)]).sum();
         assert!(diag_sum_out > diag_sum_in);
     }
 
@@ -1001,11 +1134,16 @@ mod test {
 
         let integ = ImuIntegrator::init(0.01, 0.01, 0.001, 0.001);
         let (fx, fw) = integ
-            .error_state_transition(&test.state, &test.imu_prev, &test.imu_curr)
+            .error_state_transition(
+                &test.state,
+                &test.gravity_basis(),
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        // F_x extrinsic block (18..24, 18..24) should be identity
-        let fx_ext = fx.fixed_view::<6, 6>(18, 18);
+        // F_x extrinsic block (17..23, 17..23) should be identity.
+        let fx_ext = fx.fixed_view::<6, 6>(17, 17);
         for r in 0..6 {
             for c in 0..6 {
                 assert_relative_eq!(
@@ -1016,22 +1154,21 @@ mod test {
             }
         }
 
-        // F_x cross-terms with extrinsic (18..24, 0..18) should be zero
-        for row in 18..24 {
-            for col in 0..18 {
+        // F_x cross-terms with extrinsic and core state should be zero.
+        for row in 17..23 {
+            for col in 0..17 {
                 assert_relative_eq!(fx[(row, col)], 0.0, epsilon = 1e-14);
             }
         }
 
-        // F_x cross-terms with extrinsic (0..18, 18..24) should be zero
-        for row in 0..18 {
-            for col in 18..24 {
+        for row in 0..17 {
+            for col in 17..23 {
                 assert_relative_eq!(fx[(row, col)], 0.0, epsilon = 1e-14);
             }
         }
 
         // F_w should have no noise injection into extrinsic blocks
-        for row in 18..24 {
+        for row in 17..23 {
             for col in 0..12 {
                 assert_relative_eq!(fw[(row, col)], 0.0, epsilon = 1e-14);
             }
@@ -1039,19 +1176,25 @@ mod test {
 
         // Covariance propagation: extrinsic block should be unchanged
         // when there is no cross-covariance with the core state
-        let mut cov_in = SMat24::zeros();
-        for i in 0..18 {
+        let mut cov_in = SMat23::zeros();
+        for i in 0..17 {
             cov_in[(i, i)] = 0.01;
         }
-        for i in 18..24 {
+        for i in 17..23 {
             cov_in[(i, i)] = 0.05;
         }
         let cov_out = integ
-            .propagate_covariance(&test.state, cov_in, &test.imu_prev, &test.imu_curr)
+            .propagate_covariance(
+                &test.state,
+                &test.gravity_basis(),
+                cov_in,
+                &test.imu_prev,
+                &test.imu_curr,
+            )
             .unwrap();
 
-        let cov_ext_out = cov_out.fixed_view::<6, 6>(18, 18);
-        let cov_ext_in = cov_in.fixed_view::<6, 6>(18, 18);
+        let cov_ext_out = cov_out.fixed_view::<6, 6>(17, 17);
+        let cov_ext_in = cov_in.fixed_view::<6, 6>(17, 17);
         for r in 0..6 {
             for c in 0..6 {
                 assert_relative_eq!(cov_ext_out[(r, c)], cov_ext_in[(r, c)], epsilon = 1e-14);

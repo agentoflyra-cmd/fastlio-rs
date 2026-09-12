@@ -967,6 +967,7 @@ version = "0.1.0"
 dependencies = [
  "fastlio-map",
  "fastlio-types",
+ "hashbrown 0.16.1",
  "nalgebra",
  "slotmap",
 ]

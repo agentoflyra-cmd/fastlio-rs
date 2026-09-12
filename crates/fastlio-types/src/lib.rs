@@ -3,10 +3,29 @@ pub mod imu;
 pub mod point_cloud;
 pub mod time_stamp;
 
+pub type Vec2<T> = nalgebra::Vector2<T>;
 pub type Vec3<T> = nalgebra::Vector3<T>;
 pub type Vec4<T> = nalgebra::Vector4<T>;
 pub type Mat3<T> = nalgebra::Matrix3<T>;
 pub type Mat4<T> = nalgebra::Matrix4<T>;
+pub type Mat32 = nalgebra::SMatrix<f64, 3, 2>;
+
+/// Builds an orthonormal world-frame basis for the tangent plane at `gravity`.
+///
+/// Estimator state must carry and transport this basis after initialization;
+/// rebuilding it after each gravity update changes the two tangent coordinates.
+pub fn gravity_tangent_basis(gravity: &Vec3<f64>) -> Mat32 {
+    let u = gravity.normalize();
+    let reference = if (1.0 - u.x * u.x).sqrt() > 1e-3 {
+        Vec3::x()
+    } else {
+        Vec3::z()
+    };
+    let b1 = (reference - u * u.dot(&reference)).normalize();
+    let b2 = u.cross(&b1);
+    Mat32::from_columns(&[b1, b2])
+}
+pub type Mat2<T> = nalgebra::Matrix2<T>;
 
 use anyhow::Result;
 pub use ekfstate::*;

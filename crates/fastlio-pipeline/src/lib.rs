@@ -1,10 +1,15 @@
 use anyhow::{Result, anyhow};
-use fastlio_estimator::{iekf::IekfState, optimizer::IekfConfig};
+use fastlio_estimator::{
+    iekf::IekfState,
+    optimizer::{IekfConfig, ObservationDiagnostics},
+};
 use fastlio_imu::ImuIntegrator;
 use fastlio_map::surfel::SurfelMap;
 use fastlio_pointcloud::preprocess::preprocess;
-use fastlio_types::{Config, ImuSample, LidarImuExtrinsic, MeasureGroup, PointXYZI, Vec3};
-use nalgebra::{Rotation3, UnitQuaternion};
+use fastlio_types::{
+    Config, ImuSample, LidarImuExtrinsic, MeasureGroup, PointXYZI, Vec3, gravity_tangent_basis,
+};
+use nalgebra::{Rotation3, SMatrix, UnitQuaternion};
 
 use crate::deskew::{build_motion_segments, deskew};
 
@@ -97,9 +102,23 @@ impl ImuInitializer {
     }
 }
 
-// TODO(pipeline): report initializing/bootstrap/tracking/tracking-lost mode,
-// effective observations, IEKF iterations, map size, and per-stage timings.
-pub struct PipelineFrameSummary {}
+// TODO(pipeline): report bootstrap/tracking-lost mode, effective observations,
+// map size, and per-stage timings.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineFrameSummary {
+    pub tracking: bool,
+    pub iekf_iterations: usize,
+    pub iekf_observations_first: usize,
+    pub iekf_observations_last: usize,
+    pub iekf_mean_abs_residual: f64,
+    pub iekf_max_abs_residual: f64,
+    pub observation_diagnostics: ObservationDiagnostics,
+    pub iekf_final_rotation_delta_norm: f64,
+    pub iekf_final_position_delta_norm: f64,
+    pub iekf_final_velocity_delta_norm: f64,
+    pub iekf_final_accel_bias_delta_norm: f64,
+    pub iekf_final_gravity_delta_norm: f64,
+}
 
 /// Patch `group_imu` so that its first and last samples coincide with the
 /// LiDAR scan begin/end times, and return the IMU sample to carry into the
@@ -180,6 +199,7 @@ pub struct MainPipeline {
     pub inital_group_count: usize,
     pub last_imu_for_deskew: Option<ImuSample>,
     pub initializer: ImuInitializer,
+    initial_gravity: Option<Vec3<f64>>,
 }
 
 impl MainPipeline {
@@ -202,6 +222,7 @@ impl MainPipeline {
             inital_group_count: 10,
             last_imu_for_deskew: None,
             initializer: ImuInitializer::default(),
+            initial_gravity: None,
         }
     }
 
@@ -221,7 +242,7 @@ impl MainPipeline {
         if !self.initialized {
             self.initializer.accumulate(&imu_for_initialize);
             if self.initializer.group_count < self.inital_group_count {
-                return Ok(PipelineFrameSummary {});
+                return Ok(PipelineFrameSummary::default());
             }
 
             let initialization = self.initializer.finish()?;
@@ -244,11 +265,14 @@ impl MainPipeline {
             }
             self.initialized = true;
             self.filter.state.gravity = initialization.gravity;
+            self.initial_gravity = Some(initialization.gravity);
+            self.filter.covariance = initialized_covariance();
+            self.filter.gravity_basis = gravity_tangent_basis(&self.filter.state.gravity);
             self.filter.state.orientation = initialization.orientation;
             self.filter.state.gyro_bias = initialization.gyro_bias;
             self.imu_integrator
                 .set_accel_scale(initialization.accel_scale)?;
-            return Ok(PipelineFrameSummary {});
+            return Ok(PipelineFrameSummary::default());
         }
 
         let previous_state = self.filter.state.clone();
@@ -260,6 +284,7 @@ impl MainPipeline {
             let imu_curr = &imu_pair[1];
             predict_covariance = self.imu_integrator.propagate_covariance(
                 &predict_state,
+                &self.filter.gravity_basis,
                 predict_covariance,
                 imu_prev,
                 imu_curr,
@@ -276,7 +301,20 @@ impl MainPipeline {
         deskew(&mut group.lidar, &segments, &self.extrinsic)?;
         let pointcloud = preprocess(&self.config.preprocess, group.lidar)?;
 
-        if !self.map.is_empty() {
+        let (
+            tracking,
+            iekf_iterations,
+            iekf_observations_first,
+            iekf_observations_last,
+            iekf_mean_abs_residual,
+            iekf_max_abs_residual,
+            observation_diagnostics,
+            iekf_final_rotation_delta_norm,
+            iekf_final_position_delta_norm,
+            iekf_final_velocity_delta_norm,
+            iekf_final_accel_bias_delta_norm,
+            iekf_final_gravity_delta_norm,
+        ) = if !self.map.is_empty() {
             let iekf_summary = self
                 .filter
                 .update(
@@ -290,7 +328,40 @@ impl MainPipeline {
             if self.config.common.debug_mode {
                 eprintln!("{:?}", iekf_summary);
             }
-        }
+            (
+                true,
+                iekf_summary.iterations,
+                iekf_summary.observations.first().copied().unwrap_or(0),
+                iekf_summary.observations.last().copied().unwrap_or(0),
+                iekf_summary.mean_abs_residual,
+                iekf_summary.max_abs_residual,
+                iekf_summary.observation_diagnostics,
+                iekf_summary.final_rotation_delta_norm,
+                iekf_summary.final_position_delta_norm,
+                iekf_summary.final_velocity_delta_norm,
+                iekf_summary.final_accel_bias_delta_norm,
+                iekf_summary.final_gravity_delta_norm,
+            )
+        } else {
+            (
+                false,
+                0,
+                0,
+                0,
+                0.0,
+                0.0,
+                ObservationDiagnostics {
+                    input_points: pointcloud.point_cloud.len(),
+                    no_association: pointcloud.point_cloud.len(),
+                    ..ObservationDiagnostics::default()
+                },
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            )
+        };
 
         let map_points = pointcloud.point_cloud.iter().map(|p| {
             let point_i = self.extrinsic.transform_point(&p.to_vec3_f64());
@@ -305,7 +376,20 @@ impl MainPipeline {
 
         self.map.insert(map_points)?;
 
-        Ok(PipelineFrameSummary {})
+        Ok(PipelineFrameSummary {
+            tracking,
+            iekf_iterations,
+            iekf_observations_first,
+            iekf_observations_last,
+            iekf_mean_abs_residual,
+            iekf_max_abs_residual,
+            observation_diagnostics,
+            iekf_final_rotation_delta_norm,
+            iekf_final_position_delta_norm,
+            iekf_final_velocity_delta_norm,
+            iekf_final_accel_bias_delta_norm,
+            iekf_final_gravity_delta_norm,
+        })
     }
 }
 
@@ -318,6 +402,28 @@ fn build_extrinsic_from_config(config: &Config) -> LidarImuExtrinsic {
         rotation: quat,
         translation: t,
     }
+}
+
+fn initialized_covariance() -> SMatrix<f64, 23, 23> {
+    let mut covariance = SMatrix::<f64, 23, 23>::zeros();
+
+    for index in 0..3 {
+        covariance[(index, index)] = 1.0; // orientation, rad^2
+        covariance[(3 + index, 3 + index)] = 1.0; // position, m^2
+        covariance[(6 + index, 6 + index)] = 1.0; // velocity, (m/s)^2
+        covariance[(9 + index, 9 + index)] = 1.0e-4; // gyro bias, (rad/s)^2
+        covariance[(12 + index, 12 + index)] = 1.0e-3; // accel bias, (m/s^2)^2
+    }
+
+    for index in 15..17 {
+        covariance[(index, index)] = 1.0e-6; // gravity direction on S2, rad^2
+    }
+
+    for index in 17..23 {
+        covariance[(index, index)] = 1.0e-5; // fixed extrinsic placeholder
+    }
+
+    covariance
 }
 
 #[cfg(test)]
@@ -490,5 +596,28 @@ mod tests {
 
         // The sample saved for the next frame is still the unified tail.
         assert!(approx_eq(saved.unwrap().time_stamp_sec, 1.108000, 1e-12));
+    }
+
+    #[test]
+    fn initialized_covariance_uses_s2_gravity_direction_units() {
+        let covariance = initialized_covariance();
+
+        for index in 0..3 {
+            assert!(approx_eq(covariance[(index, index)], 1.0, 1e-15));
+            assert!(approx_eq(covariance[(3 + index, 3 + index)], 1.0, 1e-15));
+            assert!(approx_eq(covariance[(6 + index, 6 + index)], 1.0, 1e-15));
+            assert!(approx_eq(covariance[(9 + index, 9 + index)], 1.0e-4, 1e-15));
+            assert!(approx_eq(
+                covariance[(12 + index, 12 + index)],
+                1.0e-3,
+                1e-15
+            ));
+        }
+        assert!(approx_eq(covariance[(15, 15)], 1.0e-6, 1e-15));
+        assert!(approx_eq(covariance[(16, 16)], 1.0e-6, 1e-15));
+
+        for index in 17..23 {
+            assert!(approx_eq(covariance[(index, index)], 1.0e-5, 1e-15));
+        }
     }
 }

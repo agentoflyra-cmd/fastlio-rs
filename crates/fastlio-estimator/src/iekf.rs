@@ -1,33 +1,109 @@
-// use anyhow::{anyhow, Result};
-use crate::{optimizer::symmetric, skew};
+use crate::{
+    optimizer::{LinearizedObservation, symmetric},
+    skew,
+};
 use fastlio_map::surfel::SurfelMap;
-use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
+use fastlio_types::{
+    LidarImuExtrinsic, Mat2, Mat3, Mat32, NavState, PointXYZI, Vec2, Vec3, gravity_tangent_basis,
+};
 use nalgebra::{SMatrix, SVector, UnitQuaternion};
 
-use crate::optimizer::{IekfConfig, IekfUpdateError, build_observations, linear_update};
+use crate::optimizer::{IekfConfig, IekfUpdateError, ObservationDiagnostics, build_observations};
+
+pub(crate) fn gravity_box_plus(
+    gravity: &Vec3<f64>,
+    gravity_basis: &Mat32,
+    error_gravity: &SVector<f64, 2>,
+) -> (Vec3<f64>, Mat32) {
+    let g_norm = gravity.norm();
+    let u = gravity / g_norm;
+    let v = gravity_basis * error_gravity;
+
+    if v.norm_squared() < 1e-20 {
+        return (*gravity, *gravity_basis);
+    }
+
+    let rotvec = u.cross(&v);
+    let rotation = UnitQuaternion::from_scaled_axis(rotvec);
+    let gravity_next = rotation * gravity;
+    let basis_next = rotation.to_rotation_matrix().matrix() * gravity_basis;
+    (gravity_next, basis_next)
+}
+
+pub(crate) fn gravity_box_minus(
+    gravity_iter: &Vec3<f64>,
+    gravity: &Vec3<f64>,
+    gravity_basis: &Mat32,
+) -> Vec2<f64> {
+    let u0 = gravity / gravity.norm(); // base / prior
+    let u1 = gravity_iter / gravity_iter.norm(); // target / iter
+
+    let cross = u0.cross(&u1);
+    let sin_theta = cross.norm();
+    let cos_theta = u0.dot(&u1).clamp(-1.0, 1.0);
+
+    if sin_theta < 1e-10 {
+        // same direction
+        if cos_theta > 0.0 {
+            return Vec2::zeros();
+        }
+
+        // antipodal: log map is not unique
+        panic!("S2 box_minus undefined near antipodal gravity");
+    }
+
+    let theta = sin_theta.atan2(cos_theta);
+
+    // unit tangent direction at u0 toward u1
+    let tangent_dir = (u1 - cos_theta * u0) / sin_theta;
+
+    // angular tangent vector, units = rad
+    let tangent = tangent_dir * theta;
+
+    gravity_basis.transpose() * tangent
+}
+
 /// ```text
 /// [delta_theta_i, delta_P_wi, delta_v, delta_bg, delta_ba, delta_g, delta_theta_li, delta_P_li]
 /// ```
-pub(crate) fn box_plus(state: &NavState, error_state: &SVector<f64, 24>) -> NavState {
+pub(crate) fn box_plus(
+    state: &NavState,
+    gravity_basis: &Mat32,
+    error_state: &SVector<f64, 23>,
+) -> (NavState, Mat32) {
     let delta_theta = error_state.fixed_rows::<3>(0).into_owned();
     let delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta);
 
-    NavState {
+    let (gravity, gravity_basis) = gravity_box_plus(
+        &state.gravity,
+        gravity_basis,
+        &error_state.fixed_rows::<2>(15).into_owned(),
+    );
+    let state = NavState {
         position: state.position + error_state.fixed_rows::<3>(3).into_owned(),
         orientation: state.orientation * delta_rotation,
         velocity: state.velocity + error_state.fixed_rows::<3>(6).into_owned(),
         gyro_bias: state.gyro_bias + error_state.fixed_rows::<3>(9).into_owned(),
         accel_bias: state.accel_bias + error_state.fixed_rows::<3>(12).into_owned(),
-        gravity: state.gravity + error_state.fixed_rows::<3>(15).into_owned(),
-    }
+        gravity,
+    };
+    (state, gravity_basis)
 }
 
-pub(crate) fn box_minus(state_iter: &NavState, state: &NavState) -> SVector<f64, 24> {
+pub(crate) fn box_minus(
+    state_iter: &NavState,
+    state: &NavState,
+    gravity_basis: &Mat32,
+) -> SVector<f64, 23> {
     let theta_iter = state_iter.orientation;
     let theta = state.orientation;
     let dtheta = (theta.inverse() * theta_iter).scaled_axis();
 
-    let mut dx = SVector::<f64, 24>::zeros();
+    let grav_iter = state_iter.gravity;
+    let grav = state.gravity;
+    let dg = gravity_box_minus(&grav_iter, &grav, gravity_basis);
+
+    let mut dx = SVector::<f64, 23>::zeros();
     dx.fixed_rows_mut::<3>(0).copy_from(&dtheta);
     dx.fixed_rows_mut::<3>(3)
         .copy_from(&(state_iter.position - state.position));
@@ -37,8 +113,7 @@ pub(crate) fn box_minus(state_iter: &NavState, state: &NavState) -> SVector<f64,
         .copy_from(&(state_iter.gyro_bias - state.gyro_bias));
     dx.fixed_rows_mut::<3>(12)
         .copy_from(&(state_iter.accel_bias - state.accel_bias));
-    dx.fixed_rows_mut::<3>(15)
-        .copy_from(&(state_iter.gravity - state.gravity));
+    dx.fixed_rows_mut::<2>(15).copy_from(&dg);
     dx
 }
 
@@ -47,19 +122,33 @@ pub struct IekfUpdateSummary {
     pub iterations: usize,
     pub observations: Vec<usize>,
     pub converged: bool,
-    pub final_delta: SVector<f64, 24>,
+    pub final_delta: SVector<f64, 23>,
+    /// Total gravity-direction correction from the predicted state to the
+    /// final iterate, expressed in the predicted gravity tangent basis.
+    pub gravity_correction: Vec2<f64>,
+    pub mean_abs_residual: f64,
+    pub max_abs_residual: f64,
+    pub observation_diagnostics: ObservationDiagnostics,
+    pub final_position_delta_norm: f64,
+    pub final_rotation_delta_norm: f64,
+    pub final_velocity_delta_norm: f64,
+    pub final_accel_bias_delta_norm: f64,
+    pub final_gravity_delta_norm: f64,
 }
 
 pub struct IekfState {
     pub state: NavState,
-    pub covariance: SMatrix<f64, 24, 24>,
+    pub gravity_basis: Mat32,
+    pub covariance: SMatrix<f64, 23, 23>,
 }
 
 impl Default for IekfState {
     fn default() -> Self {
+        let state = NavState::default();
         Self {
-            state: NavState::default(),
-            covariance: SMatrix::<f64, 24, 24>::identity() * 0.1,
+            gravity_basis: gravity_tangent_basis(&state.gravity),
+            state,
+            covariance: SMatrix::<f64, 23, 23>::identity() * 0.1,
         }
     }
 }
@@ -72,7 +161,7 @@ fn navstate_is_finite(state: &NavState) -> bool {
         && state.gravity.iter().all(|value| value.is_finite())
 }
 
-fn matrix_is_finite(matrix: &SMatrix<f64, 24, 24>) -> bool {
+fn matrix_is_finite(matrix: &SMatrix<f64, 23, 23>) -> bool {
     matrix.iter().all(|value| value.is_finite())
 }
 
@@ -96,26 +185,74 @@ fn so3_right_jacobian(phi: &Vec3<f64>) -> Mat3<f64> {
 }
 
 #[inline]
-fn reset_covariance(
-    covariance: &SMatrix<f64, 24, 24>,
-    injected_error: &SVector<f64, 24>,
-) -> SMatrix<f64, 24, 24> {
-    let dtheta = injected_error.fixed_rows::<3>(0).into_owned();
-    let jr = so3_right_jacobian(&dtheta);
+fn s2_prior_jacobian(eta: &Vec2<f64>) -> Mat2<f64> {
+    let r2 = eta.norm_squared();
 
-    let mut g = SMatrix::<f64, 24, 24>::identity();
+    if r2 < 1e-10 {
+        return Mat2::identity();
+    }
+
+    let r = r2.sqrt();
+    let h = r.sin() / r;
+    h * Mat2::identity() + (1.0 - h) * (eta * eta.transpose()) / r2
+}
+
+#[inline]
+fn reset_covariance(
+    covariance: &SMatrix<f64, 23, 23>,
+    injected_error: &SVector<f64, 23>,
+) -> SMatrix<f64, 23, 23> {
+    let dtheta = injected_error.fixed_rows::<3>(0).into_owned();
+    let dg = injected_error.fixed_rows::<2>(15).into_owned();
+    let jr = so3_right_jacobian(&dtheta);
+    let jg = s2_prior_jacobian(&dg);
+
+    let mut g = SMatrix::<f64, 23, 23>::identity();
     g.fixed_view_mut::<3, 3>(0, 0).copy_from(&jr);
+    g.fixed_view_mut::<2, 2>(15, 15).copy_from(&jg);
 
     symmetric(&(g * covariance * g.transpose()))
 }
 
+#[inline]
+fn accumulate_residual_stats(observations: &[LinearizedObservation]) -> (usize, f64, f64) {
+    let mut count = 0usize;
+    let mut sum = 0.0;
+    let mut max: f64 = 0.0;
+
+    for obs in observations {
+        match obs {
+            LinearizedObservation::Plane(o) => {
+                let r = o.residual.abs();
+                count += 1;
+                sum += r;
+                max = max.max(r);
+            }
+            LinearizedObservation::Line(o) => {
+                let r0 = o.residual0.abs();
+                let r1 = o.residual1.abs();
+                count += 2;
+                sum += r0 + r1;
+                max = max.max(r0).max(r1);
+            }
+        }
+    }
+
+    (count, sum, max)
+}
+
 impl IekfState {
-    pub fn new(state: NavState, covariance: SMatrix<f64, 24, 24>) -> Result<Self, IekfUpdateError> {
+    pub fn new(state: NavState, covariance: SMatrix<f64, 23, 23>) -> Result<Self, IekfUpdateError> {
         if !navstate_is_finite(&state) || !matrix_is_finite(&covariance) {
             return Err(IekfUpdateError::InvalidInput);
         }
 
-        Ok(Self { state, covariance })
+        let gravity_basis = gravity_tangent_basis(&state.gravity);
+        Ok(Self {
+            state,
+            gravity_basis,
+            covariance,
+        })
     }
     pub fn update(
         &mut self,
@@ -125,9 +262,11 @@ impl IekfState {
         config: &IekfConfig,
     ) -> Result<IekfUpdateSummary, IekfUpdateError> {
         let state_prior = self.state.clone();
+        let gravity_basis_prior = self.gravity_basis;
         let p_prior = self.covariance;
 
         let mut state_iter = state_prior.clone();
+        let mut gravity_basis_iter = gravity_basis_prior;
         let mut p_final = p_prior;
         let mut observations = Vec::new();
 
@@ -135,6 +274,9 @@ impl IekfState {
         let mut converge_flag = false;
         let mut observations_len_vec = Vec::new();
         let mut final_error = SVector::zeros();
+        let mut mean_abs_residual = 0.0;
+        let mut max_abs_residual = 0.0;
+        let mut observation_diagnostics = ObservationDiagnostics::default();
 
         for _ in 0..config.max_iterations {
             real_iterations += 1;
@@ -148,6 +290,16 @@ impl IekfState {
             )?;
             let observations_len = observations.len();
             observations_len_vec.push(observations_len);
+            observation_diagnostics =
+                ObservationDiagnostics::from_observations(points.len(), &observations);
+            if observations_len > 0 {
+                let (residual_count, residual_sum, residual_max) =
+                    accumulate_residual_stats(&observations);
+                if residual_count > 0 {
+                    mean_abs_residual = residual_sum / residual_count as f64;
+                    max_abs_residual = residual_max;
+                }
+            }
 
             if observations_len < config.min_observations {
                 return Err(IekfUpdateError::NotEnoughObservations {
@@ -156,10 +308,18 @@ impl IekfState {
                 });
             }
 
-            let (error_state, p_work) =
-                linear_update(&state_prior, &state_iter, &p_prior, &observations, config)?;
+            let (error_state, p_work) = crate::optimizer::linear_update(
+                &state_prior,
+                &gravity_basis_prior,
+                &gravity_basis_iter,
+                &state_iter,
+                &p_prior,
+                &observations,
+                config,
+            )?;
 
-            state_iter = box_plus(&state_iter, &error_state);
+            (state_iter, gravity_basis_iter) =
+                box_plus(&state_iter, &gravity_basis_iter, &error_state);
             p_final = p_work;
             final_error = error_state;
             if final_error.norm() < config.min_delta_norm {
@@ -168,16 +328,26 @@ impl IekfState {
             }
         }
 
+        let total_error = box_minus(&state_iter, &state_prior, &gravity_basis_prior);
         let summary = IekfUpdateSummary {
             iterations: real_iterations,
             observations: observations_len_vec,
             converged: converge_flag,
             final_delta: final_error,
+            gravity_correction: total_error.fixed_rows::<2>(15).into_owned(),
+            mean_abs_residual,
+            max_abs_residual,
+            observation_diagnostics,
+            final_position_delta_norm: final_error.fixed_rows::<3>(3).norm(),
+            final_rotation_delta_norm: final_error.fixed_rows::<3>(0).norm(),
+            final_velocity_delta_norm: final_error.fixed_rows::<3>(6).norm(),
+            final_accel_bias_delta_norm: final_error.fixed_rows::<3>(12).norm(),
+            final_gravity_delta_norm: final_error.fixed_rows::<2>(15).norm(),
         };
 
         self.state = state_iter;
+        self.gravity_basis = gravity_basis_iter;
         self.covariance = reset_covariance(&p_final, &final_error);
-        // self.covariance = p_final;
         Ok(summary)
     }
 }
@@ -204,8 +374,9 @@ mod test {
     #[test]
     fn box_plus_zero_delta_preserves_state() {
         let state = make_state();
-        let zero = SVector::<f64, 24>::zeros();
-        let out = box_plus(&state, &zero);
+        let zero = SVector::<f64, 23>::zeros();
+        let basis = gravity_tangent_basis(&state.gravity);
+        let (out, out_basis) = box_plus(&state, &basis, &zero);
 
         assert_eq!(out.position, state.position);
         assert!(
@@ -216,25 +387,27 @@ mod test {
         assert_eq!(out.gyro_bias, state.gyro_bias);
         assert_eq!(out.accel_bias, state.accel_bias);
         assert_eq!(out.gravity, state.gravity);
+        assert_eq!(out_basis, basis);
     }
 
     #[test]
-    fn box_plus_adds_translation_velocity_bias_gravity() {
+    fn box_plus_adds_euclidean_blocks_and_retracts_gravity_on_s2() {
         let state = make_state();
         let dp = Vec3::new(0.1, -0.2, 0.3);
         let dv = Vec3::new(0.5, 0.5, 0.5);
         let dbg = Vec3::new(0.01, 0.01, 0.01);
         let dba = Vec3::new(0.02, 0.02, 0.02);
-        let dg = Vec3::new(1.0, 0.0, 0.5);
+        let dg = Vec2::new(0.1, -0.05);
 
-        let mut delta = SVector::<f64, 24>::zeros();
+        let mut delta = SVector::<f64, 23>::zeros();
         delta.fixed_rows_mut::<3>(3).copy_from(&dp); // position
         delta.fixed_rows_mut::<3>(6).copy_from(&dv); // velocity
         delta.fixed_rows_mut::<3>(9).copy_from(&dbg); // gyro_bias
         delta.fixed_rows_mut::<3>(12).copy_from(&dba); // accel_bias
-        delta.fixed_rows_mut::<3>(15).copy_from(&dg); // gravity
+        delta.fixed_rows_mut::<2>(15).copy_from(&dg); // gravity
 
-        let out = box_plus(&state, &delta);
+        let basis = gravity_tangent_basis(&state.gravity);
+        let (out, out_basis) = box_plus(&state, &basis, &delta);
 
         assert_eq!(out.position, state.position + dp);
         assert!(
@@ -244,7 +417,10 @@ mod test {
         assert_eq!(out.velocity, state.velocity + dv);
         assert_eq!(out.gyro_bias, state.gyro_bias + dbg);
         assert_eq!(out.accel_bias, state.accel_bias + dba);
-        assert_eq!(out.gravity, state.gravity + dg);
+        assert!((out.gravity.norm() - state.gravity.norm()).abs() < 1e-12);
+        assert!((gravity_box_minus(&out.gravity, &state.gravity, &basis) - dg).norm() < 1e-12);
+        assert!((out_basis.transpose() * out.gravity).norm() < 1e-12);
+        assert!((out_basis.transpose() * out_basis - Mat2::identity()).norm() < 1e-12);
     }
 
     #[test]
@@ -253,10 +429,11 @@ mod test {
         // A pure rotation about the z-axis in the IMU tangent space.
         let delta_theta = Vec3::new(0.0, 0.0, 0.3);
 
-        let mut delta = SVector::<f64, 24>::zeros();
+        let mut delta = SVector::<f64, 23>::zeros();
         delta.fixed_rows_mut::<3>(0).copy_from(&delta_theta);
 
-        let out = box_plus(&state, &delta);
+        let basis = gravity_tangent_basis(&state.gravity);
+        let (out, _) = box_plus(&state, &basis, &delta);
         // Right-perturbation: R_out = R_wi * Exp(delta_theta)
         let expected = state.orientation * UnitQuaternion::from_scaled_axis(delta_theta);
 
@@ -275,7 +452,8 @@ mod test {
     #[test]
     fn box_minus_zero_between_same_state() {
         let state = make_state();
-        let dx = box_minus(&state, &state);
+        let basis = gravity_tangent_basis(&state.gravity);
+        let dx = box_minus(&state, &state, &basis);
         assert!(
             dx.norm() < 1e-12,
             "box_minus(same, same) must be the zero error state, got norm={}",
@@ -289,7 +467,7 @@ mod test {
 
         // A local perturbation in every error-state block that box_plus knows
         // about (rotation, position, velocity, gyro/accel bias, gravity).
-        let mut dx = SVector::<f64, 24>::zeros();
+        let mut dx = SVector::<f64, 23>::zeros();
         dx.fixed_rows_mut::<3>(0)
             .copy_from(&Vec3::new(0.02, -0.03, 0.04));
         dx.fixed_rows_mut::<3>(3)
@@ -300,11 +478,12 @@ mod test {
             .copy_from(&Vec3::new(0.01, 0.02, 0.03));
         dx.fixed_rows_mut::<3>(12)
             .copy_from(&Vec3::new(0.03, 0.02, 0.01));
-        dx.fixed_rows_mut::<3>(15)
-            .copy_from(&Vec3::new(0.5, 0.0, -0.5));
+        dx.fixed_rows_mut::<2>(15)
+            .copy_from(&Vec2::new(0.05, -0.04));
 
-        let state_perturbed = box_plus(&state, &dx);
-        let dx_round = box_minus(&state_perturbed, &state);
+        let basis = gravity_tangent_basis(&state.gravity);
+        let (state_perturbed, _) = box_plus(&state, &basis, &dx);
+        let dx_round = box_minus(&state_perturbed, &state, &basis);
 
         // Rotation is exact for right-perturbation: the recovered angle axis
         // must reproduce the injected delta.
@@ -316,7 +495,7 @@ mod test {
                 dx_round[i]
             );
         }
-        for i in 3..18 {
+        for i in 3..17 {
             assert!(
                 (dx_round[i] - dx[i]).abs() < 1e-9,
                 "vector block [{i}]: injected={:.12}, round-trip={:.12}",
@@ -388,12 +567,118 @@ mod test {
         }
     }
 
+    #[test]
+    fn s2_reset_jacobian_matches_finite_difference() {
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-6;
+
+        let gravity = Vec3::new(0.0, 0.0, -9.81);
+        let eta = Vec2::new(0.2, -0.15);
+        let gravity_basis = gravity_tangent_basis(&gravity);
+        let (gravity_after_injection, basis_after_injection) =
+            gravity_box_plus(&gravity, &gravity_basis, &eta);
+        let analytic = s2_prior_jacobian(&eta);
+
+        // Reset map:
+        // q(epsilon) = (g boxplus (eta + epsilon))
+        //              boxminus (g boxplus eta).
+        for column in 0..2 {
+            let mut epsilon = Vec2::zeros();
+            epsilon[column] = FD_EPS;
+
+            let (gravity_plus, _) = gravity_box_plus(&gravity, &gravity_basis, &(eta + epsilon));
+            let (gravity_minus, _) = gravity_box_plus(&gravity, &gravity_basis, &(eta - epsilon));
+            let q_plus = gravity_box_minus(
+                &gravity_plus,
+                &gravity_after_injection,
+                &basis_after_injection,
+            );
+            let q_minus = gravity_box_minus(
+                &gravity_minus,
+                &gravity_after_injection,
+                &basis_after_injection,
+            );
+            let finite_difference = (q_plus - q_minus) / (2.0 * FD_EPS);
+            let analytic_column = analytic.column(column);
+
+            assert!(
+                (finite_difference - analytic_column).norm() < FD_TOL,
+                "J_q column {column} does not match finite difference: analytic={}, fd={}, diff_norm={}",
+                analytic_column.transpose(),
+                finite_difference.transpose(),
+                (finite_difference - analytic_column).norm()
+            );
+        }
+    }
+
+    #[test]
+    fn s2_reset_jacobian_matches_after_two_non_collinear_basis_transports() {
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-6;
+
+        let gravity_prior = Vec3::new(2.4, -1.7, -9.2).normalize() * 9.81;
+        let gravity_basis_prior = gravity_tangent_basis(&gravity_prior);
+        let (gravity_after_first, gravity_basis_after_first) = gravity_box_plus(
+            &gravity_prior,
+            &gravity_basis_prior,
+            &Vec2::new(0.20, -0.12),
+        );
+        let (gravity_iter, gravity_basis_iter) = gravity_box_plus(
+            &gravity_after_first,
+            &gravity_basis_after_first,
+            &Vec2::new(-0.08, 0.17),
+        );
+
+        let injected_error = Vec2::new(0.07, -0.11);
+        let (gravity_after_injection, gravity_basis_after_injection) =
+            gravity_box_plus(&gravity_iter, &gravity_basis_iter, &injected_error);
+        let analytic = s2_prior_jacobian(&injected_error);
+
+        // The posterior covariance before reset describes the additive IEKF
+        // correction around `injected_error` in the accumulated iter basis.
+        for column in 0..2 {
+            let mut epsilon = Vec2::zeros();
+            epsilon[column] = FD_EPS;
+
+            let (gravity_plus, _) = gravity_box_plus(
+                &gravity_iter,
+                &gravity_basis_iter,
+                &(injected_error + epsilon),
+            );
+            let (gravity_minus, _) = gravity_box_plus(
+                &gravity_iter,
+                &gravity_basis_iter,
+                &(injected_error - epsilon),
+            );
+            let reset_error_plus = gravity_box_minus(
+                &gravity_plus,
+                &gravity_after_injection,
+                &gravity_basis_after_injection,
+            );
+            let reset_error_minus = gravity_box_minus(
+                &gravity_minus,
+                &gravity_after_injection,
+                &gravity_basis_after_injection,
+            );
+            let finite_difference = (reset_error_plus - reset_error_minus) / (2.0 * FD_EPS);
+            let analytic_column = analytic.column(column);
+
+            assert!(
+                (finite_difference - analytic_column).norm() < FD_TOL,
+                "S2 reset column {column} after accumulated basis transport does not match finite difference: analytic={}, fd={}, diff_norm={}",
+                analytic_column.transpose(),
+                finite_difference.transpose(),
+                (finite_difference - analytic_column).norm()
+            );
+        }
+    }
+
     // ---------------------------------------------------------------
     // Reset covariance (orientation error injection)
     // ---------------------------------------------------------------
 
-    fn diagonal_covariance_with_cross(base: f64) -> SMatrix<f64, 24, 24> {
-        let mut p = SMatrix::<f64, 24, 24>::identity() * base;
+    fn diagonal_covariance_with_cross(base: f64) -> SMatrix<f64, 23, 23> {
+        let mut p = SMatrix::<f64, 23, 23>::identity() * base;
         // orientation <-> position cross terms, symmetric by construction.
         let cross = [(0usize, 3usize, 0.02), (1, 4, -0.01), (2, 5, 0.03)];
         for (i, j, v) in cross {
@@ -406,7 +691,7 @@ mod test {
     #[test]
     fn reset_covariance_zero_injection_is_unchanged() {
         let p = diagonal_covariance_with_cross(0.1);
-        let zero = SVector::<f64, 24>::zeros();
+        let zero = SVector::<f64, 23>::zeros();
         let p_reset = reset_covariance(&p, &zero);
         let diff = (p_reset - p).norm();
         assert!(
@@ -419,7 +704,7 @@ mod test {
     fn reset_covariance_transforms_orientation_cross_blocks() {
         let p = diagonal_covariance_with_cross(0.1);
         let dtheta = Vec3::new(0.05, -0.1, 0.2);
-        let mut injected = SVector::<f64, 24>::zeros();
+        let mut injected = SVector::<f64, 23>::zeros();
         injected.fixed_rows_mut::<3>(0).copy_from(&dtheta);
 
         let p_reset = reset_covariance(&p, &injected);
@@ -433,25 +718,25 @@ mod test {
             "orientation-orientation block must transform as J_r P J_r^T"
         );
 
-        // Cross rows 0..3 vs cols 3..24 scale by J_r on the left.
-        let got_tr = p_reset.fixed_view::<3, 21>(0, 3);
-        let exp_tr = jr * p.fixed_view::<3, 21>(0, 3);
+        // Cross rows 0..3 vs cols 3..23 scale by J_r on the left.
+        let got_tr = p_reset.fixed_view::<3, 20>(0, 3);
+        let exp_tr = jr * p.fixed_view::<3, 20>(0, 3);
         assert!(
             (got_tr - exp_tr).norm() < 1e-9,
             "orientation-to-other block must transform as J_r P"
         );
 
-        // Cross cols 0..3 vs rows 3..24 scale by J_r^T on the right.
-        let got_bl = p_reset.fixed_view::<21, 3>(3, 0);
-        let exp_bl = p.fixed_view::<21, 3>(3, 0) * jr.transpose();
+        // Cross cols 0..3 vs rows 3..23 scale by J_r^T on the right.
+        let got_bl = p_reset.fixed_view::<20, 3>(3, 0);
+        let exp_bl = p.fixed_view::<20, 3>(3, 0) * jr.transpose();
         assert!(
             (got_bl - exp_bl).norm() < 1e-9,
             "other-to-orientation block must transform as P J_r^T"
         );
 
         // Blocks with no orientation component are untouched.
-        let got_br = p_reset.fixed_view::<21, 21>(3, 3);
-        let exp_br = p.fixed_view::<21, 21>(3, 3);
+        let got_br = p_reset.fixed_view::<20, 20>(3, 3);
+        let exp_br = p.fixed_view::<20, 20>(3, 3);
         assert!(
             (got_br - exp_br).norm() < 1e-12,
             "orientation-free blocks must be unchanged"
@@ -461,7 +746,7 @@ mod test {
     #[test]
     fn reset_covariance_remains_symmetric_and_spd() {
         let p = diagonal_covariance_with_cross(0.1);
-        let mut injected = SVector::<f64, 24>::zeros();
+        let mut injected = SVector::<f64, 23>::zeros();
         injected
             .fixed_rows_mut::<3>(0)
             .copy_from(&Vec3::new(0.08, -0.05, 0.12));
