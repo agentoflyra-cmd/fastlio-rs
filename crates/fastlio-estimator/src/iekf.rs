@@ -1,6 +1,7 @@
 // use anyhow::{anyhow, Result};
+use crate::{optimizer::symmetric, skew};
 use fastlio_map::surfel::SurfelMap;
-use fastlio_types::{LidarImuExtrinsic, NavState, PointXYZI};
+use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
 use nalgebra::{SMatrix, SVector, UnitQuaternion};
 
 use crate::optimizer::{IekfConfig, IekfUpdateError, build_observations, linear_update};
@@ -46,7 +47,7 @@ pub struct IekfUpdateSummary {
     pub iterations: usize,
     pub observations: Vec<usize>,
     pub converged: bool,
-    pub final_delta_norm: f64,
+    pub final_delta: SVector<f64, 24>,
 }
 
 pub struct IekfState {
@@ -75,6 +76,39 @@ fn matrix_is_finite(matrix: &SMatrix<f64, 24, 24>) -> bool {
     matrix.iter().all(|value| value.is_finite())
 }
 
+#[inline]
+fn so3_right_jacobian(phi: &Vec3<f64>) -> Mat3<f64> {
+    let mut jacobian = Mat3::<f64>::identity();
+    let theta = phi.norm();
+    let theta2 = phi.norm_squared();
+    let theta3 = theta * theta2;
+    let theta_hat = skew(phi);
+    let theta_hat2 = theta_hat * theta_hat;
+
+    if theta >= 1e-6 {
+        jacobian -= (1.0 - theta.cos()) / theta2 * theta_hat;
+        jacobian += (theta - theta.sin()) / theta3 * theta_hat2;
+    } else {
+        jacobian -= 0.5 * theta_hat;
+        jacobian += 1.0 / 6.0 * theta_hat2;
+    }
+    jacobian
+}
+
+#[inline]
+fn reset_covariance(
+    covariance: &SMatrix<f64, 24, 24>,
+    injected_error: &SVector<f64, 24>,
+) -> SMatrix<f64, 24, 24> {
+    let dtheta = injected_error.fixed_rows::<3>(0).into_owned();
+    let jr = so3_right_jacobian(&dtheta);
+
+    let mut g = SMatrix::<f64, 24, 24>::identity();
+    g.fixed_view_mut::<3, 3>(0, 0).copy_from(&jr);
+
+    symmetric(&(g * covariance * g.transpose()))
+}
+
 impl IekfState {
     pub fn new(state: NavState, covariance: SMatrix<f64, 24, 24>) -> Result<Self, IekfUpdateError> {
         if !navstate_is_finite(&state) || !matrix_is_finite(&covariance) {
@@ -100,7 +134,7 @@ impl IekfState {
         let mut real_iterations = 0;
         let mut converge_flag = false;
         let mut observations_len_vec = Vec::new();
-        let mut final_norm = 0.0;
+        let mut final_error = SVector::zeros();
 
         for _ in 0..config.max_iterations {
             real_iterations += 1;
@@ -127,8 +161,8 @@ impl IekfState {
 
             state_iter = box_plus(&state_iter, &error_state);
             p_final = p_work;
-            final_norm = error_state.norm();
-            if final_norm < config.min_delta_norm {
+            final_error = error_state;
+            if final_error.norm() < config.min_delta_norm {
                 converge_flag = true;
                 break;
             }
@@ -138,13 +172,12 @@ impl IekfState {
             iterations: real_iterations,
             observations: observations_len_vec,
             converged: converge_flag,
-            final_delta_norm: final_norm,
+            final_delta: final_error,
         };
 
         self.state = state_iter;
-        // TODO(iekf): transform p_final with the reset Jacobian after injecting
-        // the right-multiplicative orientation error into the nominal state.
-        self.covariance = p_final;
+        self.covariance = reset_covariance(&p_final, &final_error);
+        // self.covariance = p_final;
         Ok(summary)
     }
 }
@@ -291,5 +324,163 @@ mod test {
                 dx_round[i]
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // SO(3) right Jacobian
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn so3_right_jacobian_zero_is_identity() {
+        let jr = so3_right_jacobian(&Vec3::zeros());
+        let diff = (jr - Mat3::<f64>::identity()).norm();
+        assert!(
+            diff < 1e-12,
+            "J_r(0) must be exactly the identity, got diff={diff}"
+        );
+    }
+
+    #[test]
+    fn so3_right_jacobian_tiny_angle_is_finite() {
+        // Below the `theta >= 1e-6` closed-form threshold the series branch
+        // runs; it must stay finite and reduce to identity as theta -> 0.
+        let phi = Vec3::new(1e-9, -2e-9, 3e-9);
+        let jr = so3_right_jacobian(&phi);
+        assert!(jr.iter().all(|v| v.is_finite()), "J_r must stay finite");
+        let diff = (jr - Mat3::<f64>::identity()).norm();
+        assert!(
+            diff < 1e-5,
+            "tiny-angle J_r must be close to identity, got diff={diff}"
+        );
+    }
+
+    #[test]
+    fn so3_right_jacobian_matches_finite_difference() {
+        // Defining property: for small delta,
+        //   log(Exp(phi)^{-1} * Exp(phi + delta)) ~= J_r(phi) * delta.
+        // Column j of J_r is the derivative of that log-map w.r.t. delta_j.
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-5;
+
+        let phi = Vec3::new(0.4, -0.3, 0.6);
+        let r_inv = UnitQuaternion::from_scaled_axis(phi).inverse();
+        let jr = so3_right_jacobian(&phi);
+
+        for j in 0..3 {
+            let mut dp = Vec3::zeros();
+            dp[j] = FD_EPS;
+            let mut dm = Vec3::zeros();
+            dm[j] = -FD_EPS;
+
+            let v_plus = (r_inv * UnitQuaternion::from_scaled_axis(phi + dp)).scaled_axis();
+            let v_minus = (r_inv * UnitQuaternion::from_scaled_axis(phi + dm)).scaled_axis();
+            let fd_col = (v_plus - v_minus) / (2.0 * FD_EPS);
+
+            for i in 0..3 {
+                assert!(
+                    (jr[(i, j)] - fd_col[i]).abs() < FD_TOL,
+                    "J_r[{i},{j}]: analytic={:.8}, fd={:.8}, diff={}",
+                    jr[(i, j)],
+                    fd_col[i],
+                    (jr[(i, j)] - fd_col[i]).abs()
+                );
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Reset covariance (orientation error injection)
+    // ---------------------------------------------------------------
+
+    fn diagonal_covariance_with_cross(base: f64) -> SMatrix<f64, 24, 24> {
+        let mut p = SMatrix::<f64, 24, 24>::identity() * base;
+        // orientation <-> position cross terms, symmetric by construction.
+        let cross = [(0usize, 3usize, 0.02), (1, 4, -0.01), (2, 5, 0.03)];
+        for (i, j, v) in cross {
+            p[(i, j)] = v;
+            p[(j, i)] = v;
+        }
+        p
+    }
+
+    #[test]
+    fn reset_covariance_zero_injection_is_unchanged() {
+        let p = diagonal_covariance_with_cross(0.1);
+        let zero = SVector::<f64, 24>::zeros();
+        let p_reset = reset_covariance(&p, &zero);
+        let diff = (p_reset - p).norm();
+        assert!(
+            diff < 1e-12,
+            "zero injection must be an identity reset, got diff={diff}"
+        );
+    }
+
+    #[test]
+    fn reset_covariance_transforms_orientation_cross_blocks() {
+        let p = diagonal_covariance_with_cross(0.1);
+        let dtheta = Vec3::new(0.05, -0.1, 0.2);
+        let mut injected = SVector::<f64, 24>::zeros();
+        injected.fixed_rows_mut::<3>(0).copy_from(&dtheta);
+
+        let p_reset = reset_covariance(&p, &injected);
+        let jr = so3_right_jacobian(&dtheta);
+
+        // Orientation block (0..3) is conjugated by J_r.
+        let got_tt = p_reset.fixed_view::<3, 3>(0, 0);
+        let exp_tt = jr * p.fixed_view::<3, 3>(0, 0) * jr.transpose();
+        assert!(
+            (got_tt - exp_tt).norm() < 1e-9,
+            "orientation-orientation block must transform as J_r P J_r^T"
+        );
+
+        // Cross rows 0..3 vs cols 3..24 scale by J_r on the left.
+        let got_tr = p_reset.fixed_view::<3, 21>(0, 3);
+        let exp_tr = jr * p.fixed_view::<3, 21>(0, 3);
+        assert!(
+            (got_tr - exp_tr).norm() < 1e-9,
+            "orientation-to-other block must transform as J_r P"
+        );
+
+        // Cross cols 0..3 vs rows 3..24 scale by J_r^T on the right.
+        let got_bl = p_reset.fixed_view::<21, 3>(3, 0);
+        let exp_bl = p.fixed_view::<21, 3>(3, 0) * jr.transpose();
+        assert!(
+            (got_bl - exp_bl).norm() < 1e-9,
+            "other-to-orientation block must transform as P J_r^T"
+        );
+
+        // Blocks with no orientation component are untouched.
+        let got_br = p_reset.fixed_view::<21, 21>(3, 3);
+        let exp_br = p.fixed_view::<21, 21>(3, 3);
+        assert!(
+            (got_br - exp_br).norm() < 1e-12,
+            "orientation-free blocks must be unchanged"
+        );
+    }
+
+    #[test]
+    fn reset_covariance_remains_symmetric_and_spd() {
+        let p = diagonal_covariance_with_cross(0.1);
+        let mut injected = SVector::<f64, 24>::zeros();
+        injected
+            .fixed_rows_mut::<3>(0)
+            .copy_from(&Vec3::new(0.08, -0.05, 0.12));
+
+        let p_reset = reset_covariance(&p, &injected);
+
+        let asym = (p_reset - p_reset.transpose()).norm();
+        assert!(
+            asym < 1e-12,
+            "reset covariance must stay symmetric, asym={asym}"
+        );
+
+        assert!(
+            p_reset.cholesky().is_some(),
+            "reset covariance must remain SPD"
+        );
+        assert!(
+            p_reset.iter().all(|v| v.is_finite()),
+            "reset covariance must remain finite"
+        );
     }
 }

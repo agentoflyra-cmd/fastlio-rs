@@ -30,10 +30,16 @@
 //!   `NavState` used to build the Jacobian.
 
 use fastlio_map::surfel::SurfelObservation;
-use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI};
+use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
 use nalgebra::SMatrix;
 pub mod iekf;
 pub mod optimizer;
+
+#[inline]
+pub(crate) fn skew(vec3: &Vec3<f64>) -> Mat3<f64> {
+    let (x, y, z) = (vec3.x, vec3.y, vec3.z);
+    Mat3::new(0.0, -z, y, z, 0.0, -x, -y, x, 0.0)
+}
 
 /// Linearize a point-to-plane residual with respect to the 24D error state.
 ///

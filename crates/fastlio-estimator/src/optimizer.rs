@@ -1,6 +1,6 @@
-use crate::{iekf::box_minus, linearize_point_to_plane_observation};
+use crate::{iekf::box_minus, linearize_point_to_plane_observation, skew};
 use fastlio_map::surfel::{SurfelMap, SurfelObservation};
-use fastlio_types::{LidarImuExtrinsic, NavState, PointXYZI, Vec3};
+use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
 use nalgebra::{SMatrix, SVector};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,31 +111,58 @@ pub(crate) fn transform_point(state: &NavState, point: &Vec3<f64>) -> Vec3<f64> 
     r * point + t
 }
 
+#[inline]
+fn so3_right_jacobian_inverse(phi: &Vec3<f64>) -> Mat3<f64> {
+    let theta = phi.norm();
+    let theta2 = phi.norm_squared();
+
+    let phi_hat = skew(phi);
+    let phi_hat2 = phi_hat * phi_hat;
+
+    if theta >= 1e-6 {
+        let a = 1.0 / theta2 - (1.0 + theta.cos()) / (2.0 * theta * theta.sin());
+
+        Mat3::identity() + 0.5 * phi_hat + a * phi_hat2
+    } else {
+        Mat3::identity() + 0.5 * phi_hat + (1.0 / 12.0) * phi_hat2
+    }
+}
+
+#[inline]
+fn prior_error_jacobian(state_iter: &NavState, state: &NavState) -> SMatrix<f64, 24, 24> {
+    let prior_error = box_minus(state_iter, state);
+    let mut jacobian = SMatrix::<f64, 24, 24>::identity();
+    let phi = prior_error.fixed_rows::<3>(0).into_owned();
+    jacobian
+        .fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&so3_right_jacobian_inverse(&phi));
+    jacobian
+}
+
 pub(crate) fn linear_update(
     state: &NavState,
     state_iter: &NavState,
     covariance: &SMatrix<f64, 24, 24>,
     observations: &[LinearizedObservation],
-    config: &IekfConfig,
+    _config: &IekfConfig,
 ) -> Result<(SVector<f64, 24>, SMatrix<f64, 24, 24>), IekfUpdateError> {
     let p_chol = covariance.cholesky().ok_or(IekfUpdateError::NotSpd)?;
     let l = p_chol.l();
 
     // Current IEKF linear solve is written in whitened information form.
-    //
-    // P_prior = L L^T, dx = L y.
-    // `prior_error` is the local error from the prior state to the current
-    // iteration state. The solved `dx` is then interpreted as a correction on
-    // the current iteration state.
     let prior_error = box_minus(state_iter, state);
+    let prior_error_jacobian = prior_error_jacobian(state_iter, state);
 
-    // L * e_white = prior_error.
-    let e_white = l
+    let b_prior = l
         .solve_lower_triangular(&prior_error)
         .ok_or(IekfUpdateError::SolveFailed)?;
 
-    let mut information = SMatrix::<f64, 24, 24>::identity();
-    let mut rhs = -e_white;
+    let a_prior = l
+        .solve_lower_triangular(&prior_error_jacobian)
+        .ok_or(IekfUpdateError::SolveFailed)?;
+
+    let mut information = a_prior.transpose() * a_prior;
+    let mut rhs = -a_prior.transpose() * b_prior;
 
     for obs in observations {
         if !obs.residual.is_finite() || !obs.variance.is_finite() || obs.variance <= 0.0 {
@@ -143,30 +170,21 @@ pub(crate) fn linear_update(
         }
 
         let w = 1.0 / obs.variance;
+        let h = obs.jacobian;
 
-        // 1x24
-        let j = obs.jacobian * l;
-
-        information += j.transpose() * w * j;
-        rhs -= j.transpose() * w * obs.residual;
+        information += h.transpose() * w * h;
+        rhs -= h.transpose() * w * obs.residual;
     }
 
-    information += SMatrix::<f64, 24, 24>::identity() * config.damping;
-
-    let information = symmetric(&information);
-    let chol = information.cholesky().ok_or(IekfUpdateError::NotSpd)?;
-
-    let y = chol.solve(&rhs);
-    let dx = l * y;
-    // TODO(iekf): consider storing the posterior covariance factor directly:
-    // P_post = L A^-1 L^T = (L C^-T)(L C^-T)^T, where A = C C^T.
-    // The current covariance form is simpler for API/tests, but forms A^-1.
-    let a_inv = chol.inverse();
-    let post_covariance = l * a_inv * l.transpose();
+    let chol = symmetric(&information)
+        .cholesky()
+        .ok_or(IekfUpdateError::NotSpd)?;
+    let dx = chol.solve(&rhs);
+    let post_covariance = chol.inverse();
     Ok((dx, post_covariance))
 }
 
-fn symmetric(covariance: &SMatrix<f64, 24, 24>) -> SMatrix<f64, 24, 24> {
+pub(crate) fn symmetric(covariance: &SMatrix<f64, 24, 24>) -> SMatrix<f64, 24, 24> {
     (covariance.transpose() + covariance) / 2.0
 }
 
@@ -350,11 +368,59 @@ mod tests {
             (back.velocity - state.velocity).norm() < TOL,
             "velocity not pulled back to prior"
         );
-        // With no observations the covariance is unchanged.
+        // The returned covariance is expressed in the current iterate's tangent
+        // space, so the prior covariance is transported by J_prior.
+        let j_prior = prior_error_jacobian(&state_iter, &state);
+        let p_inv = covariance
+            .try_inverse()
+            .expect("test covariance must be invertible");
+        let expected_post = (j_prior.transpose() * p_inv * j_prior)
+            .try_inverse()
+            .expect("transported information matrix must be invertible");
         assert!(
-            (post - covariance).norm() < 1e-6,
-            "covariance must be unchanged with no observations"
+            (post - expected_post).norm() < 1e-9,
+            "covariance must match the prior expressed in the iterate tangent space"
         );
+    }
+
+    #[test]
+    fn prior_error_jacobian_matches_finite_difference() {
+        const FD_EPS: f64 = 1e-7;
+        const FD_TOL: f64 = 1e-6;
+
+        let state = make_state();
+        let mut offset = SVector::<f64, 24>::zeros();
+        offset
+            .fixed_rows_mut::<3>(0)
+            .copy_from(&Vec3::new(0.4, -0.3, 0.6));
+        offset
+            .fixed_rows_mut::<3>(3)
+            .copy_from(&Vec3::new(0.2, -0.1, 0.3));
+        offset
+            .fixed_rows_mut::<3>(6)
+            .copy_from(&Vec3::new(-0.4, 0.1, 0.2));
+        let state_iter = box_plus(&state, &offset);
+        let analytic = prior_error_jacobian(&state_iter, &state);
+
+        // NavState currently owns the first 18 dimensions. The reserved
+        // extrinsic blocks (18..24) remain fixed and are not implemented by
+        // box_plus, so they cannot be validated through this state-level map.
+        for column in 0..18 {
+            let mut delta_plus = SVector::<f64, 24>::zeros();
+            let mut delta_minus = SVector::<f64, 24>::zeros();
+            delta_plus[column] = FD_EPS;
+            delta_minus[column] = -FD_EPS;
+
+            let error_plus = box_minus(&box_plus(&state_iter, &delta_plus), &state);
+            let error_minus = box_minus(&box_plus(&state_iter, &delta_minus), &state);
+            let finite_difference = (error_plus - error_minus) / (2.0 * FD_EPS);
+            let analytic_column = analytic.column(column);
+
+            assert!(
+                (finite_difference - analytic_column).norm() < FD_TOL,
+                "J_prior column {column} does not match finite difference"
+            );
+        }
     }
 
     // ---------------------------------------------------------------
