@@ -471,7 +471,7 @@ mod test {
 #[cfg(test)]
 mod surfel_test {
     use crate::VoxelKey;
-    use crate::surfel::SurfelMap;
+    use crate::surfel::{SurfelAssociationCovariance, SurfelMap, SurfelRankMode};
     use crate::types::{GeometryClass, Surfel};
     use fastlio_types::{Mat3, PointXYZI, SurfelConfig, SurfelMapConfig, Vec3};
     use smallvec::SmallVec;
@@ -482,6 +482,14 @@ mod surfel_test {
             y,
             z,
             intensity: 0.0,
+        }
+    }
+
+    fn association_covariance(stddev: f64) -> SurfelAssociationCovariance {
+        SurfelAssociationCovariance {
+            point_covariance_w: Mat3::identity() * stddev.powi(2),
+            plane_normal_variance: 0.0,
+            line_normal_variance: 0.0,
         }
     }
 
@@ -788,6 +796,49 @@ mod surfel_test {
         .unwrap();
         assert_eq!(only_surfel(&map).count, 4);
         assert_none(&map, &pt(0.1, 0.1, 0.0));
+        assert!(
+            map.query_surfel(
+                &pt(0.1, 0.1, 0.0),
+                association_covariance(0.01),
+                SurfelRankMode::Mahalanobis,
+            )
+            .expect("query must not error")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn query_surfel_returns_mature_nearby_surfel() {
+        let mut map = SurfelMap::new(map_config(), surfel_config(|c| c.growing_radius = 3.5));
+        map.insert(plane_cluster(Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0)).into_iter())
+            .unwrap();
+
+        let observation = map
+            .query_surfel(
+                &pt(0.0, 0.0, 0.0),
+                association_covariance(0.01),
+                SurfelRankMode::Mahalanobis,
+            )
+            .expect("query must not error")
+            .expect("mature surfel expected");
+        assert!(
+            observation
+                .covariance_w
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        assert!(observation.covariance_w[(0, 0)] > 0.0);
+        assert!(observation.best_score < 1e-8);
+        assert!(observation.second_best_score.is_none());
+
+        let rejected = map
+            .query_surfel(
+                &pt(0.0, 0.0, 2.5),
+                association_covariance(0.01),
+                SurfelRankMode::Mahalanobis,
+            )
+            .expect("query must not error");
+        assert!(rejected.is_none());
     }
 
     #[test]

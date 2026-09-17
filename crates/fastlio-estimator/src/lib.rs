@@ -25,13 +25,13 @@
 //! Preconditions for the math kernels in this crate:
 //! - point coordinates are finite and already expressed in the frame named by
 //!   the argument (`point_i` in `I`, `point_l` in `L`);
-//! - `SurfelObservation::norm_w` is finite, unit length, and expressed in `W`;
+//! - `SurfelPlaneObservation::norm_w` is finite, unit length, and expressed in `W`;
 //! - the observation was produced at the same linearization point as the
 //!   `NavState` used to build the Jacobian.
 
-use fastlio_map::surfel::{SurfelLineObservation, SurfelObservation};
+use fastlio_map::surfel::{SurfelLineObservation, SurfelObservation, SurfelPlaneObservation};
 use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
-use nalgebra::SVector;
+use nalgebra::{SMatrix, SVector};
 pub mod iekf;
 pub mod optimizer;
 
@@ -58,7 +58,7 @@ pub(crate) fn skew(vec3: &Vec3<f64>) -> Mat3<f64> {
 pub fn linearize_point_to_plane_observation(
     state: &NavState,
     point_i: &PointXYZI,
-    obs: &SurfelObservation,
+    obs: &SurfelPlaneObservation,
 ) -> SVector<f64, 23> {
     let r_wi = state.orientation.to_rotation_matrix();
     let r_wi = r_wi.matrix();
@@ -74,6 +74,28 @@ pub fn linearize_point_to_line_observation(
     let r_wi = state.orientation.to_rotation_matrix();
     let r_wi = r_wi.matrix();
     line_helper(point_i, surfel_line_observation, r_wi)
+}
+
+pub fn linearized_point_to_surfel_observation(
+    state: &NavState,
+    point_i: &PointXYZI,
+    _obs: &SurfelObservation,
+) -> SMatrix<f64, 3, 23> {
+    let r_wi = state.orientation.to_rotation_matrix();
+    let r_wi = r_wi.matrix();
+
+    let skew_p = skew_helper(point_i);
+
+    let mut h = SMatrix::<f64, 3, 23>::zeros();
+
+    let j_theta = -r_wi * skew_p;
+    let j_position = Mat3::identity();
+
+    h.fixed_view_mut::<3, 3>(0, 0).copy_from(&j_theta);
+
+    h.fixed_view_mut::<3, 3>(0, 3).copy_from(&j_position);
+
+    h
 }
 
 #[inline]
@@ -99,7 +121,7 @@ fn line_helper(
 }
 
 #[inline]
-fn helper(point_i: &PointXYZI, obs: &SurfelObservation, r_wi: &Mat3<f64>) -> SVector<f64, 23> {
+fn helper(point_i: &PointXYZI, obs: &SurfelPlaneObservation, r_wi: &Mat3<f64>) -> SVector<f64, 23> {
     let skew_p = skew_helper(point_i);
     let mut h = SVector::<f64, 23>::zeros();
     let j_theta = -(obs.norm_w.transpose() * r_wi * skew_p);
@@ -133,7 +155,7 @@ pub fn linearize_point_to_plane_observation_with_extrinsic(
     extrinsic: &LidarImuExtrinsic,
     point_i: &PointXYZI,
     point_l: &PointXYZI,
-    obs: &SurfelObservation,
+    obs: &SurfelPlaneObservation,
 ) -> SVector<f64, 23> {
     let r_wi = state.orientation.to_rotation_matrix();
     let r_wi = r_wi.matrix();
@@ -197,8 +219,8 @@ mod tests {
         sm.insert(())
     }
 
-    fn make_obs(norm_w: Vec3<f64>, mean_w: Vec3<f64>) -> SurfelObservation {
-        SurfelObservation::new(
+    fn make_obs(norm_w: Vec3<f64>, mean_w: Vec3<f64>) -> SurfelPlaneObservation {
+        SurfelPlaneObservation::new(
             dummy_surfel_id(),
             mean_w,
             norm_w,
@@ -222,7 +244,7 @@ mod tests {
 
     /// Signed residual: r = norm_w^T * (p_W - mean_w)
     /// where p_W = R_WI * p_I + t_WI.
-    fn signed_residual(state: &NavState, point_i: &PointXYZI, obs: &SurfelObservation) -> f64 {
+    fn signed_residual(state: &NavState, point_i: &PointXYZI, obs: &SurfelPlaneObservation) -> f64 {
         let r_wi = state.orientation.to_rotation_matrix();
         let p_w = r_wi * point_i.to_vec3_f64() + state.position;
         obs.norm_w.dot(&(p_w - obs.mean_w))
@@ -239,7 +261,7 @@ mod tests {
         state: &NavState,
         extrinsic: &LidarImuExtrinsic,
         point_l: &PointXYZI,
-        obs: &SurfelObservation,
+        obs: &SurfelPlaneObservation,
     ) -> f64 {
         let p_l = point_l.to_vec3_f64();
         let p_i = extrinsic.rotation * p_l + extrinsic.translation;

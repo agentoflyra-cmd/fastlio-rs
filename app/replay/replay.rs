@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
 use camino::Utf8PathBuf;
 use fastlio_dataset::{ReadStats, SensorEvent, read_mcap_events};
-use fastlio_map::{surfel::SurfelMap, types::GeometryClass};
+use fastlio_estimator::optimizer::SurfelMeasurementSpectrumMode;
+use fastlio_map::{
+    surfel::{SurfelMap, SurfelRankMode},
+    types::GeometryClass,
+};
 use fastlio_pipeline::{MainPipeline, PipelineFrameSummary, synchronizer::MeasurementSynchronizer};
 use fastlio_types::{NavState, read_from_config_path};
 use pcd_rs::{DataKind, PcdSerialize, WriterInit};
 use ringbuffer_spsc::{RingBufferReader, RingBufferWriter, ringbuffer};
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -38,27 +43,49 @@ struct ReplayArgs {
     playback_rate: f64,
     channel_capacity: usize,
     storm_mode: bool,
+    surfel_rank_mode: Option<SurfelRankMode>,
+    surfel_measurement_spectrum_mode: Option<SurfelMeasurementSpectrumMode>,
+    rhs_visualization_window: Option<(f64, f64)>,
 }
 
 impl ReplayArgs {
     fn parse(args: &[String]) -> Result<Self> {
         if args.len() < 3 {
             bail!(
-                "usage: {} <bag.mcap> <config.yaml> [playback_rate] [channel_capacity] [trajectory.csv] [surfel-map.pcd] [--storm]",
+                "usage: {} <bag.mcap> <config.yaml> [playback_rate] [channel_capacity] [trajectory.csv] [surfel-map.pcd] [--storm] [--surfel-rank=mahalanobis|euclidean|combined:<beta>] [--surfel-update=full|hard:<tau>] [--rhs-visualization-window=<start_sec>:<end_sec>]",
                 args.first().map(String::as_str).unwrap_or("fastlio-replay")
             );
         }
-        let storm_mode = args[3..].iter().any(|arg| arg == "--storm");
-        if let Some(option) = args[3..]
-            .iter()
-            .find(|arg| arg.starts_with("--") && arg.as_str() != "--storm")
-        {
-            bail!("unknown replay option `{option}`");
+        let mut storm_mode = false;
+        let mut surfel_rank_mode = None;
+        let mut surfel_measurement_spectrum_mode = None;
+        let mut rhs_visualization_window = None;
+        let mut positional = Vec::new();
+        for arg in &args[3..] {
+            if arg == "--storm" {
+                storm_mode = true;
+            } else if let Some(value) = arg.strip_prefix("--surfel-rank=") {
+                if surfel_rank_mode.is_some() {
+                    bail!("--surfel-rank may only be specified once");
+                }
+                surfel_rank_mode = Some(parse_surfel_rank_mode(value)?);
+            } else if let Some(value) = arg.strip_prefix("--surfel-update=") {
+                if surfel_measurement_spectrum_mode.is_some() {
+                    bail!("--surfel-update may only be specified once");
+                }
+                surfel_measurement_spectrum_mode =
+                    Some(parse_surfel_measurement_spectrum_mode(value)?);
+            } else if let Some(value) = arg.strip_prefix("--rhs-visualization-window=") {
+                if rhs_visualization_window.is_some() {
+                    bail!("--rhs-visualization-window may only be specified once");
+                }
+                rhs_visualization_window = Some(parse_rhs_visualization_window(value)?);
+            } else if arg.starts_with("--") {
+                bail!("unknown replay option `{arg}`");
+            } else {
+                positional.push(arg);
+            }
         }
-        let positional: Vec<_> = args[3..]
-            .iter()
-            .filter(|arg| arg.as_str() != "--storm")
-            .collect();
         if positional.len() > 4 {
             bail!("too many replay arguments");
         }
@@ -92,7 +119,63 @@ impl ReplayArgs {
             playback_rate,
             channel_capacity,
             storm_mode,
+            surfel_rank_mode,
+            surfel_measurement_spectrum_mode,
+            rhs_visualization_window,
         })
+    }
+}
+
+fn parse_rhs_visualization_window(value: &str) -> Result<(f64, f64)> {
+    let Some((start, end)) = value.split_once(':') else {
+        bail!("--rhs-visualization-window must be <start_sec>:<end_sec>");
+    };
+    let start = start
+        .parse::<f64>()
+        .context("invalid RHS visualization start time")?;
+    let end = end
+        .parse::<f64>()
+        .context("invalid RHS visualization end time")?;
+    if !start.is_finite() || !end.is_finite() || end <= start {
+        bail!("RHS visualization window requires finite end_sec > start_sec");
+    }
+    Ok((start, end))
+}
+
+fn parse_surfel_measurement_spectrum_mode(value: &str) -> Result<SurfelMeasurementSpectrumMode> {
+    if value == "full" {
+        return Ok(SurfelMeasurementSpectrumMode::FullRank);
+    }
+    let Some(tau) = value.strip_prefix("hard:") else {
+        bail!("invalid --surfel-update `{value}`");
+    };
+    let max_variance_ratio = tau
+        .parse::<f64>()
+        .context("hard update tau must be a number")?;
+    if !max_variance_ratio.is_finite() || max_variance_ratio <= 1.0 {
+        bail!("hard update tau must be finite and greater than 1");
+    }
+    Ok(SurfelMeasurementSpectrumMode::HardTruncation { max_variance_ratio })
+}
+
+fn parse_surfel_rank_mode(value: &str) -> Result<SurfelRankMode> {
+    match value {
+        "mahalanobis" => Ok(SurfelRankMode::Mahalanobis),
+        "euclidean" => Ok(SurfelRankMode::EuclideanSquared),
+        _ => {
+            let Some(weight) = value.strip_prefix("combined:") else {
+                bail!("invalid --surfel-rank `{value}`");
+            };
+            let centroid_distance_weight = weight
+                .parse::<f64>()
+                .context("combined rank beta must be a number")?;
+            if !centroid_distance_weight.is_finite() || centroid_distance_weight < 0.0 {
+                bail!("combined rank beta must be finite and non-negative");
+            }
+            Ok(SurfelRankMode::Combined {
+                centroid_distance_weight,
+            })
+        }
     }
 }
 
@@ -106,6 +189,14 @@ struct SurfelPcdPoint {
     normal_y: f32,
     normal_z: f32,
     class_id: f32,
+}
+
+#[derive(PcdSerialize)]
+struct ColoredSurfelPcdPoint {
+    x: f32,
+    y: f32,
+    z: f32,
+    rgb: u32,
 }
 
 #[derive(Clone)]
@@ -353,18 +444,52 @@ fn write_trajectory(path: &Utf8PathBuf, rows: &[TrajectoryRow]) -> Result<()> {
     let mut writer = BufWriter::new(
         File::create(path).with_context(|| format!("failed to create trajectory `{path}`"))?,
     );
-    writeln!(
+    write!(
         writer,
-        "timestamp_sec,px,py,pz,qx,qy,qz,qw,vx,vy,vz,tracking,iekf_iterations,iekf_observations_first,iekf_observations_last,iekf_mean_abs_residual,iekf_max_abs_residual,iekf_final_rotation_delta_norm,iekf_final_position_delta_norm,iekf_final_velocity_delta_norm,iekf_final_accel_bias_delta_norm,iekf_final_gravity_delta_norm,obs_input_points,obs_accepted,obs_plane_accepted,obs_line_accepted,obs_no_association,obs_residual_abs_mean,obs_residual_abs_p50,obs_residual_abs_p90,obs_residual_abs_p95,obs_residual_abs_p99,obs_residual_abs_max,obs_line_residual_abs_p95,obs_line_distance_p95"
+        "timestamp_sec,px,py,pz,qx,qy,qz,qw,vx,vy,vz,tracking,iekf_iterations,iekf_observations_first,iekf_observations_last,iekf_mean_abs_residual,iekf_max_abs_residual,iekf_final_rotation_delta_norm,iekf_final_position_delta_norm,iekf_final_velocity_delta_norm,iekf_final_accel_bias_delta_norm,iekf_final_gravity_delta_norm,obs_input_points,obs_accepted,obs_no_association,obs_residual_abs_mean,obs_residual_abs_p50,obs_residual_abs_p90,obs_residual_abs_p95,obs_residual_abs_p99,obs_residual_abs_max,surfel_query_best_score_p50,surfel_query_best_score_p95,surfel_query_second_best_score_p50,surfel_query_second_best_score_p95,surfel_query_second_best_count,surfel_query_score_margin_p05,surfel_query_score_margin_p50,surfel_query_best_over_second_p95,surfel_query_ambiguous_fraction,obs_rotation_info_eigenvalue_0,obs_rotation_info_eigenvalue_1,obs_rotation_info_eigenvalue_2,obs_rotation_info_eigenvector_r0_c0,obs_rotation_info_eigenvector_r0_c1,obs_rotation_info_eigenvector_r0_c2,obs_rotation_info_eigenvector_r1_c0,obs_rotation_info_eigenvector_r1_c1,obs_rotation_info_eigenvector_r1_c2,obs_rotation_info_eigenvector_r2_c0,obs_rotation_info_eigenvector_r2_c1,obs_rotation_info_eigenvector_r2_c2,obs_rotation_info_condition_number,obs_rotation_info_trace,obs_rotation_position_info_r0_c0,obs_rotation_position_info_r0_c1,obs_rotation_position_info_r0_c2,obs_rotation_position_info_r1_c0,obs_rotation_position_info_r1_c1,obs_rotation_position_info_r1_c2,obs_rotation_position_info_r2_c0,obs_rotation_position_info_r2_c1,obs_rotation_position_info_r2_c2,obs_measurement_spectrum_rotation_trace_0,obs_measurement_spectrum_rotation_trace_1,obs_measurement_spectrum_rotation_trace_2,obs_measurement_spectrum_rotation_trace_fraction_0,obs_measurement_spectrum_rotation_trace_fraction_1,obs_measurement_spectrum_rotation_trace_fraction_2,obs_measurement_spectrum_eigenvalue_mean_0,obs_measurement_spectrum_eigenvalue_mean_1,obs_measurement_spectrum_eigenvalue_mean_2,obs_measurement_spectrum_surfel_axis_alignment_0,obs_measurement_spectrum_surfel_axis_alignment_1,obs_measurement_spectrum_surfel_axis_alignment_2,obs_measurement_spectrum_k0_axis_bin_fraction_x,obs_measurement_spectrum_k0_axis_bin_fraction_y,obs_measurement_spectrum_k0_axis_bin_fraction_z,obs_measurement_spectrum_k0_axis_concentration,obs_measurement_spectrum_k0_axis_dominant_world_0,obs_measurement_spectrum_k0_axis_dominant_world_1,obs_measurement_spectrum_k0_axis_dominant_world_2,obs_first_rotation_measurement_rhs_imu_0,obs_first_rotation_measurement_rhs_imu_1,obs_first_rotation_measurement_rhs_imu_2,obs_rotation_measurement_rhs_imu_0,obs_rotation_measurement_rhs_imu_1,obs_rotation_measurement_rhs_imu_2,obs_first_rotation_measurement_rhs_world_0,obs_first_rotation_measurement_rhs_world_1,obs_first_rotation_measurement_rhs_world_2,obs_rotation_measurement_rhs_world_0,obs_rotation_measurement_rhs_world_1,obs_rotation_measurement_rhs_world_2,obs_first_rotation_rhs_world_window_1s_0,obs_first_rotation_rhs_world_window_1s_1,obs_first_rotation_rhs_world_window_1s_2,obs_first_rotation_rhs_world_window_1s_count,obs_first_rotation_rhs_info_eigenbasis_0,obs_first_rotation_rhs_info_eigenbasis_1,obs_first_rotation_rhs_info_eigenbasis_2,obs_rotation_rhs_info_eigenbasis_0,obs_rotation_rhs_info_eigenbasis_1,obs_rotation_rhs_info_eigenbasis_2,obs_first_spectral_rotation_rhs_r0_c0,obs_first_spectral_rotation_rhs_r0_c1,obs_first_spectral_rotation_rhs_r0_c2,obs_first_spectral_rotation_rhs_r1_c0,obs_first_spectral_rotation_rhs_r1_c1,obs_first_spectral_rotation_rhs_r1_c2,obs_first_spectral_rotation_rhs_r2_c0,obs_first_spectral_rotation_rhs_r2_c1,obs_first_spectral_rotation_rhs_r2_c2,obs_spectral_rotation_rhs_r0_c0,obs_spectral_rotation_rhs_r0_c1,obs_spectral_rotation_rhs_r0_c2,obs_spectral_rotation_rhs_r1_c0,obs_spectral_rotation_rhs_r1_c1,obs_spectral_rotation_rhs_r1_c2,obs_spectral_rotation_rhs_r2_c0,obs_spectral_rotation_rhs_r2_c1,obs_spectral_rotation_rhs_r2_c2"
     )?;
+    for rank in 0..fastlio_estimator::optimizer::TOP_ROTATION_RHS_SURFELS {
+        write!(
+            writer,
+            ",obs_first_top_rotation_rhs_{rank}_sample_count,obs_first_top_rotation_rhs_{rank}_mean_w_0,obs_first_top_rotation_rhs_{rank}_mean_w_1,obs_first_top_rotation_rhs_{rank}_mean_w_2,obs_first_top_rotation_rhs_{rank}_k0_axis_w_0,obs_first_top_rotation_rhs_{rank}_k0_axis_w_1,obs_first_top_rotation_rhs_{rank}_k0_axis_w_2,obs_first_top_rotation_rhs_{rank}_world_0,obs_first_top_rotation_rhs_{rank}_world_1,obs_first_top_rotation_rhs_{rank}_world_2,obs_first_top_rotation_rhs_{rank}_world_norm,obs_first_top_rotation_rhs_{rank}_residual_norm_mean,obs_first_top_rotation_rhs_{rank}_best_score_mean,obs_first_top_rotation_rhs_{rank}_second_best_score_mean,obs_first_top_rotation_rhs_{rank}_second_best_score_count"
+        )?;
+    }
+    for rank in 0..fastlio_estimator::optimizer::TOP_ROTATION_RHS_VOXELS {
+        write!(
+            writer,
+            ",obs_first_top_rotation_rhs_voxel_{rank}_sample_count,obs_first_top_rotation_rhs_voxel_{rank}_min_w_0,obs_first_top_rotation_rhs_voxel_{rank}_min_w_1,obs_first_top_rotation_rhs_voxel_{rank}_min_w_2,obs_first_top_rotation_rhs_voxel_{rank}_world_0,obs_first_top_rotation_rhs_voxel_{rank}_world_1,obs_first_top_rotation_rhs_voxel_{rank}_world_2,obs_first_top_rotation_rhs_voxel_{rank}_world_norm,obs_first_top_rotation_rhs_voxel_{rank}_residual_norm_mean,obs_first_top_rotation_rhs_voxel_{rank}_best_score_mean,obs_first_top_rotation_rhs_voxel_{rank}_second_best_score_mean,obs_first_top_rotation_rhs_voxel_{rank}_second_best_score_count"
+        )?;
+    }
+    write!(
+        writer,
+        ",iekf_total_rotation_correction_imu_0,iekf_total_rotation_correction_imu_1,iekf_total_rotation_correction_imu_2,iekf_total_rotation_correction_world_0,iekf_total_rotation_correction_world_1,iekf_total_rotation_correction_world_2,iekf_total_rotation_correction_norm"
+    )?;
+    writeln!(writer)?;
+    let mut first_rotation_rhs_world_window = VecDeque::new();
+    let mut first_rotation_rhs_world_window_sum = fastlio_types::Vec3::zeros();
     for row in rows {
         let p = row.state.position;
         let v = row.state.velocity;
         let q = row.state.orientation.quaternion();
         let obs = row.frame_summary.observation_diagnostics;
-        writeln!(
+        while first_rotation_rhs_world_window
+            .front()
+            .is_some_and(|(timestamp_sec, _)| *timestamp_sec < row.timestamp_sec - 1.0)
+        {
+            let (_, rhs) = first_rotation_rhs_world_window.pop_front().unwrap();
+            first_rotation_rhs_world_window_sum -= rhs;
+        }
+        if row.frame_summary.tracking {
+            let rhs = row
+                .frame_summary
+                .first_observation_diagnostics
+                .rotation_measurement_rhs_world;
+            first_rotation_rhs_world_window_sum += rhs;
+            first_rotation_rhs_world_window.push_back((row.timestamp_sec, rhs));
+        }
+        write!(
             writer,
-            "{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},{},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            "{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{:.9},{},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12}",
             row.timestamp_sec,
             p.x,
             p.y,
@@ -389,8 +514,6 @@ fn write_trajectory(path: &Utf8PathBuf, rows: &[TrajectoryRow]) -> Result<()> {
             row.frame_summary.iekf_final_gravity_delta_norm,
             obs.input_points,
             obs.accepted_observations,
-            obs.plane_accepted,
-            obs.line_accepted,
             obs.no_association,
             obs.residual_abs_mean,
             obs.residual_abs_p50,
@@ -398,9 +521,176 @@ fn write_trajectory(path: &Utf8PathBuf, rows: &[TrajectoryRow]) -> Result<()> {
             obs.residual_abs_p95,
             obs.residual_abs_p99,
             obs.residual_abs_max,
-            obs.line_residual_abs_p95,
-            obs.line_distance_p95,
+            obs.surfel_query_best_score_p50,
+            obs.surfel_query_best_score_p95,
+            obs.surfel_query_second_best_score_p50,
+            obs.surfel_query_second_best_score_p95,
+            obs.surfel_query_second_best_count,
+            obs.surfel_query_score_margin_p05,
+            obs.surfel_query_score_margin_p50,
+            obs.surfel_query_best_over_second_p95,
+            obs.surfel_query_ambiguous_fraction,
         )?;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            obs.rotation_information_eigenvalues[0],
+            obs.rotation_information_eigenvalues[1],
+            obs.rotation_information_eigenvalues[2],
+            obs.rotation_information_eigenvectors[(0, 0)],
+            obs.rotation_information_eigenvectors[(0, 1)],
+            obs.rotation_information_eigenvectors[(0, 2)],
+            obs.rotation_information_eigenvectors[(1, 0)],
+            obs.rotation_information_eigenvectors[(1, 1)],
+            obs.rotation_information_eigenvectors[(1, 2)],
+            obs.rotation_information_eigenvectors[(2, 0)],
+            obs.rotation_information_eigenvectors[(2, 1)],
+            obs.rotation_information_eigenvectors[(2, 2)],
+            obs.rotation_information_condition_number,
+            obs.rotation_information_trace,
+            obs.rotation_position_information[(0, 0)],
+            obs.rotation_position_information[(0, 1)],
+            obs.rotation_position_information[(0, 2)],
+            obs.rotation_position_information[(1, 0)],
+            obs.rotation_position_information[(1, 1)],
+            obs.rotation_position_information[(1, 2)],
+            obs.rotation_position_information[(2, 0)],
+            obs.rotation_position_information[(2, 1)],
+            obs.rotation_position_information[(2, 2)],
+        )?;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            obs.measurement_spectrum_rotation_trace[0],
+            obs.measurement_spectrum_rotation_trace[1],
+            obs.measurement_spectrum_rotation_trace[2],
+            obs.measurement_spectrum_rotation_trace_fraction[0],
+            obs.measurement_spectrum_rotation_trace_fraction[1],
+            obs.measurement_spectrum_rotation_trace_fraction[2],
+            obs.measurement_spectrum_eigenvalue_mean[0],
+            obs.measurement_spectrum_eigenvalue_mean[1],
+            obs.measurement_spectrum_eigenvalue_mean[2],
+            obs.measurement_spectrum_surfel_axis_alignment[0],
+            obs.measurement_spectrum_surfel_axis_alignment[1],
+            obs.measurement_spectrum_surfel_axis_alignment[2],
+        )?;
+        let first = row.frame_summary.first_observation_diagnostics;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            obs.measurement_spectrum_k0_axis_bin_fraction[0],
+            obs.measurement_spectrum_k0_axis_bin_fraction[1],
+            obs.measurement_spectrum_k0_axis_bin_fraction[2],
+            obs.measurement_spectrum_k0_axis_concentration,
+            obs.measurement_spectrum_k0_axis_dominant_world[0],
+            obs.measurement_spectrum_k0_axis_dominant_world[1],
+            obs.measurement_spectrum_k0_axis_dominant_world[2],
+        )?;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{},",
+            first.rotation_measurement_rhs[0],
+            first.rotation_measurement_rhs[1],
+            first.rotation_measurement_rhs[2],
+            obs.rotation_measurement_rhs[0],
+            obs.rotation_measurement_rhs[1],
+            obs.rotation_measurement_rhs[2],
+            first.rotation_measurement_rhs_world[0],
+            first.rotation_measurement_rhs_world[1],
+            first.rotation_measurement_rhs_world[2],
+            obs.rotation_measurement_rhs_world[0],
+            obs.rotation_measurement_rhs_world[1],
+            obs.rotation_measurement_rhs_world[2],
+            first_rotation_rhs_world_window_sum[0],
+            first_rotation_rhs_world_window_sum[1],
+            first_rotation_rhs_world_window_sum[2],
+            first_rotation_rhs_world_window.len(),
+        )?;
+        write!(
+            writer,
+            "{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            first.rotation_measurement_rhs_in_information_eigenbasis[0],
+            first.rotation_measurement_rhs_in_information_eigenbasis[1],
+            first.rotation_measurement_rhs_in_information_eigenbasis[2],
+            obs.rotation_measurement_rhs_in_information_eigenbasis[0],
+            obs.rotation_measurement_rhs_in_information_eigenbasis[1],
+            obs.rotation_measurement_rhs_in_information_eigenbasis[2],
+        )?;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            first.measurement_spectrum_rotation_rhs[(0, 0)],
+            first.measurement_spectrum_rotation_rhs[(0, 1)],
+            first.measurement_spectrum_rotation_rhs[(0, 2)],
+            first.measurement_spectrum_rotation_rhs[(1, 0)],
+            first.measurement_spectrum_rotation_rhs[(1, 1)],
+            first.measurement_spectrum_rotation_rhs[(1, 2)],
+            first.measurement_spectrum_rotation_rhs[(2, 0)],
+            first.measurement_spectrum_rotation_rhs[(2, 1)],
+            first.measurement_spectrum_rotation_rhs[(2, 2)],
+            obs.measurement_spectrum_rotation_rhs[(0, 0)],
+            obs.measurement_spectrum_rotation_rhs[(0, 1)],
+            obs.measurement_spectrum_rotation_rhs[(0, 2)],
+            obs.measurement_spectrum_rotation_rhs[(1, 0)],
+            obs.measurement_spectrum_rotation_rhs[(1, 1)],
+            obs.measurement_spectrum_rotation_rhs[(1, 2)],
+            obs.measurement_spectrum_rotation_rhs[(2, 0)],
+            obs.measurement_spectrum_rotation_rhs[(2, 1)],
+            obs.measurement_spectrum_rotation_rhs[(2, 2)],
+        )?;
+        for contributor in first.top_rotation_rhs_surfels {
+            write!(
+                writer,
+                ",{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+                contributor.sample_count,
+                contributor.mean_w[0],
+                contributor.mean_w[1],
+                contributor.mean_w[2],
+                contributor.k0_axis_w[0],
+                contributor.k0_axis_w[1],
+                contributor.k0_axis_w[2],
+                contributor.rhs_world[0],
+                contributor.rhs_world[1],
+                contributor.rhs_world[2],
+                contributor.rhs_world.norm(),
+                contributor.residual_norm_mean,
+                contributor.best_score_mean,
+                contributor.second_best_score_mean,
+                contributor.second_best_score_count,
+            )?;
+        }
+        for contributor in first.top_rotation_rhs_voxels {
+            write!(
+                writer,
+                ",{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+                contributor.sample_count,
+                contributor.voxel_min_w[0],
+                contributor.voxel_min_w[1],
+                contributor.voxel_min_w[2],
+                contributor.rhs_world[0],
+                contributor.rhs_world[1],
+                contributor.rhs_world[2],
+                contributor.rhs_world.norm(),
+                contributor.residual_norm_mean,
+                contributor.best_score_mean,
+                contributor.second_best_score_mean,
+                contributor.second_best_score_count,
+            )?;
+        }
+        let total_rotation_correction_world =
+            row.frame_summary.iekf_total_rotation_correction_world;
+        write!(
+            writer,
+            ",{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            row.frame_summary.iekf_total_rotation_correction_imu[0],
+            row.frame_summary.iekf_total_rotation_correction_imu[1],
+            row.frame_summary.iekf_total_rotation_correction_imu[2],
+            total_rotation_correction_world[0],
+            total_rotation_correction_world[1],
+            total_rotation_correction_world[2],
+            total_rotation_correction_world.norm(),
+        )?;
+        writeln!(writer)?;
     }
     Ok(())
 }
@@ -436,6 +726,96 @@ fn write_surfel_map(path: &Utf8PathBuf, map: &SurfelMap) -> Result<()> {
             normal_y: surfel.eigenvectors[(1, 0)] as f32,
             normal_z: surfel.eigenvectors[(2, 0)] as f32,
             class_id,
+        })?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+fn write_rotation_rhs_peak_voxel_visualization(
+    map_path: &Utf8PathBuf,
+    map: &SurfelMap,
+    rows: &[TrajectoryRow],
+    time_window: (f64, f64),
+) -> Result<()> {
+    const PEAK_FRAME_COUNT: usize = 3;
+    const VOXEL_SIZE_M: f64 = 1.0;
+    const DEFAULT_RGB: u32 = 0x8a_8a_8a;
+    const PEAK_RGB: u32 = 0xf0_3b_3b;
+
+    let mut window = VecDeque::new();
+    let mut window_sum = fastlio_types::Vec3::zeros();
+    let mut peaks = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        while window
+            .front()
+            .is_some_and(|(timestamp_sec, _)| *timestamp_sec < row.timestamp_sec - 1.0)
+        {
+            let (_, rhs) = window.pop_front().unwrap();
+            window_sum -= rhs;
+        }
+        if row.frame_summary.tracking
+            && row.timestamp_sec >= time_window.0
+            && row.timestamp_sec <= time_window.1
+        {
+            let rhs = row
+                .frame_summary
+                .first_observation_diagnostics
+                .rotation_measurement_rhs_world;
+            window_sum += rhs;
+            window.push_back((row.timestamp_sec, rhs));
+            peaks.push((window_sum.norm(), index));
+        }
+    }
+    peaks.sort_by(|left, right| right.0.total_cmp(&left.0));
+
+    let mut peak_voxels = HashSet::new();
+    for (_, index) in peaks.into_iter().take(PEAK_FRAME_COUNT) {
+        for voxel in rows[index]
+            .frame_summary
+            .first_observation_diagnostics
+            .top_rotation_rhs_voxels
+        {
+            if voxel.sample_count > 0 {
+                peak_voxels.insert((
+                    voxel.voxel_min_w[0] as i32,
+                    voxel.voxel_min_w[1] as i32,
+                    voxel.voxel_min_w[2] as i32,
+                ));
+            }
+        }
+    }
+
+    let visualization_path = map_path.with_extension("rhs-peak-voxels.pcd");
+    let mut writer = WriterInit {
+        width: map.surfels().count() as u64,
+        height: 1,
+        viewpoint: Default::default(),
+        data_kind: DataKind::Binary,
+        schema: None,
+        version: None,
+    }
+    .create::<ColoredSurfelPcdPoint, _>(&visualization_path)
+    .with_context(|| {
+        format!("failed to create RHS voxel visualization PCD `{visualization_path}`")
+    })?;
+
+    for surfel in map.surfels() {
+        let voxel = (
+            (surfel.mean_w[0] / VOXEL_SIZE_M).floor() as i32,
+            (surfel.mean_w[1] / VOXEL_SIZE_M).floor() as i32,
+            (surfel.mean_w[2] / VOXEL_SIZE_M).floor() as i32,
+        );
+        let rgb = if peak_voxels.contains(&voxel) {
+            PEAK_RGB
+        } else {
+            DEFAULT_RGB
+        };
+        writer.push(&ColoredSurfelPcdPoint {
+            x: surfel.mean_w[0] as f32,
+            y: surfel.mean_w[1] as f32,
+            z: surfel.mean_w[2] as f32,
+            rgb,
         })?;
     }
     writer.finish()?;
@@ -495,12 +875,26 @@ fn main() -> Result<()> {
         storm_mode: args.storm_mode,
     };
     let mut pipeline = MainPipeline::new(pipeline_config);
+    if let Some(rank_mode) = args.surfel_rank_mode {
+        pipeline.set_surfel_rank_mode(rank_mode);
+    }
+    if let Some(spectrum_mode) = args.surfel_measurement_spectrum_mode {
+        pipeline.set_surfel_measurement_spectrum_mode(spectrum_mode);
+    }
     let stats = run_spsc(args.bag_path, &mut pipeline, replay_config.clone())?;
     if let Some(path) = &args.trajectory_path {
         write_trajectory(path, &stats.trajectory)?;
     }
     if let Some(path) = &args.surfel_map_path {
         write_surfel_map(path, &pipeline.map)?;
+        if let Some(time_window) = args.rhs_visualization_window {
+            write_rotation_rhs_peak_voxel_visualization(
+                path,
+                &pipeline.map,
+                &stats.trajectory,
+                time_window,
+            )?;
+        }
     }
     print_summary(&stats, &replay_config);
     Ok(())
@@ -542,11 +936,25 @@ mod tests {
             "trajectory.csv".into(),
             "surfel-map.pcd".into(),
             "--storm".into(),
+            "--surfel-rank=combined:0.5".into(),
+            "--surfel-update=hard:5".into(),
         ];
         let parsed = ReplayArgs::parse(&args).unwrap();
         assert!(parsed.storm_mode);
         assert_eq!(parsed.playback_rate, 2.0);
         assert_eq!(parsed.channel_capacity, 64);
+        assert_eq!(
+            parsed.surfel_rank_mode,
+            Some(SurfelRankMode::Combined {
+                centroid_distance_weight: 0.5,
+            })
+        );
+        assert_eq!(
+            parsed.surfel_measurement_spectrum_mode,
+            Some(SurfelMeasurementSpectrumMode::HardTruncation {
+                max_variance_ratio: 5.0,
+            })
+        );
         assert_eq!(
             parsed.surfel_map_path.as_deref(),
             Some("surfel-map.pcd".into())
@@ -602,12 +1010,15 @@ mod tests {
         let header = lines.next().unwrap();
         let row = lines.next().unwrap();
         assert_eq!(header.split(',').count(), row.split(',').count());
-        assert!(header.contains("obs_plane_accepted"));
-        assert!(header.contains("obs_line_accepted"));
         assert!(header.contains("obs_no_association"));
         assert!(header.contains("obs_residual_abs_p95"));
-        assert!(header.contains("obs_line_residual_abs_p95"));
-        assert!(header.contains("obs_line_distance_p95"));
+        assert!(header.contains("surfel_query_best_score_p95"));
+        assert!(header.contains("surfel_query_second_best_score_p95"));
+        assert!(header.contains("surfel_query_score_margin_p05"));
+        assert!(header.contains("surfel_query_best_over_second_p95"));
+        assert!(header.contains("surfel_query_ambiguous_fraction"));
+        assert!(header.contains("obs_rotation_info_eigenvalue_0"));
+        assert!(header.contains("obs_rotation_position_info_r2_c2"));
         assert!(!header.contains("obs_extra_line_added"));
         assert!(!header.contains("obs_plane_score_mean"));
         assert!(!header.contains("gravity_variance"));

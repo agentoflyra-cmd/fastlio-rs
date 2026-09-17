@@ -1,5 +1,5 @@
 use crate::{
-    optimizer::{LinearizedObservation, symmetric},
+    optimizer::{LinearizedObservation, build_surfel_observation, symmetric},
     skew,
 };
 use fastlio_map::surfel::SurfelMap;
@@ -8,7 +8,7 @@ use fastlio_types::{
 };
 use nalgebra::{SMatrix, SVector, UnitQuaternion};
 
-use crate::optimizer::{IekfConfig, IekfUpdateError, ObservationDiagnostics, build_observations};
+use crate::optimizer::{IekfConfig, IekfUpdateError, ObservationDiagnostics};
 
 pub(crate) fn gravity_box_plus(
     gravity: &Vec3<f64>,
@@ -126,8 +126,14 @@ pub struct IekfUpdateSummary {
     /// Total gravity-direction correction from the predicted state to the
     /// final iterate, expressed in the predicted gravity tangent basis.
     pub gravity_correction: Vec2<f64>,
+    /// Total right-attitude correction from predicted state to final iterate,
+    /// expressed in the predicted IMU tangent frame.
+    pub total_rotation_correction_imu: Vec3<f64>,
+    /// The same total correction expressed as a world-frame rotation vector.
+    pub total_rotation_correction_world: Vec3<f64>,
     pub mean_abs_residual: f64,
     pub max_abs_residual: f64,
+    pub first_observation_diagnostics: ObservationDiagnostics,
     pub observation_diagnostics: ObservationDiagnostics,
     pub final_position_delta_norm: f64,
     pub final_rotation_delta_norm: f64,
@@ -235,6 +241,14 @@ fn accumulate_residual_stats(observations: &[LinearizedObservation]) -> (usize, 
                 sum += r0 + r1;
                 max = max.max(r0).max(r1);
             }
+            LinearizedObservation::Surfel(o) => {
+                let r0 = o.residual.x;
+                let r1 = o.residual.y;
+                let r2 = o.residual.z;
+                count += 3;
+                sum += r0 + r1 + r2;
+                max = max.max(r0).max(r1).max(r2);
+            }
         }
     }
 
@@ -277,21 +291,37 @@ impl IekfState {
         let mut mean_abs_residual = 0.0;
         let mut max_abs_residual = 0.0;
         let mut observation_diagnostics = ObservationDiagnostics::default();
+        let mut first_observation_diagnostics = ObservationDiagnostics::default();
 
         for _ in 0..config.max_iterations {
             real_iterations += 1;
-            build_observations(
+            let surfel_query_diagnostics = build_surfel_observation(
                 &state_iter,
                 points,
                 map,
                 extrinsic,
                 config,
+                real_iterations == 1,
                 &mut observations,
             )?;
             let observations_len = observations.len();
             observations_len_vec.push(observations_len);
-            observation_diagnostics =
-                ObservationDiagnostics::from_observations(points.len(), &observations);
+            if real_iterations == 1 {
+                observation_diagnostics = ObservationDiagnostics::from_observations(
+                    points.len(),
+                    &observations,
+                    &surfel_query_diagnostics,
+                );
+                observation_diagnostics.rotation_measurement_rhs_world =
+                    state_iter.orientation * observation_diagnostics.rotation_measurement_rhs;
+                for contributor in &mut observation_diagnostics.top_rotation_rhs_surfels {
+                    contributor.rhs_world = state_iter.orientation * contributor.rhs_imu;
+                }
+                for contributor in &mut observation_diagnostics.top_rotation_rhs_voxels {
+                    contributor.rhs_world = state_iter.orientation * contributor.rhs_imu;
+                }
+                first_observation_diagnostics = observation_diagnostics;
+            }
             if observations_len > 0 {
                 let (residual_count, residual_sum, residual_max) =
                     accumulate_residual_stats(&observations);
@@ -329,14 +359,20 @@ impl IekfState {
         }
 
         let total_error = box_minus(&state_iter, &state_prior, &gravity_basis_prior);
+        let total_rotation_correction_imu = total_error.fixed_rows::<3>(0).into_owned();
+        let total_rotation_correction_world =
+            state_prior.orientation * total_rotation_correction_imu;
         let summary = IekfUpdateSummary {
             iterations: real_iterations,
             observations: observations_len_vec,
             converged: converge_flag,
             final_delta: final_error,
             gravity_correction: total_error.fixed_rows::<2>(15).into_owned(),
+            total_rotation_correction_imu,
+            total_rotation_correction_world,
             mean_abs_residual,
             max_abs_residual,
+            first_observation_diagnostics,
             observation_diagnostics,
             final_position_delta_norm: final_error.fixed_rows::<3>(3).norm(),
             final_rotation_delta_norm: final_error.fixed_rows::<3>(0).norm(),

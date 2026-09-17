@@ -19,6 +19,55 @@ pub struct SurfelMap {
     surfel_config: SurfelConfig,
 }
 
+#[derive(Debug, Clone)]
+pub struct SurfelObservation {
+    pub surfel_id: SurfelID,
+    pub mean_w: Vec3<f64>,
+    pub covariance_w: Mat3<f64>,
+    pub eigenvectors: Mat3<f64>,
+    pub eigenvalues: Vec3<f64>,
+    pub best_score: f64,
+    pub second_best_score: Option<f64>,
+}
+
+/// World-frame uncertainty model used only while associating a point with a
+/// surfel. Geometry-specific terms widen the capture range only in constrained
+/// directions; they are not measurement noise for the IEKF.
+#[derive(Debug, Clone, Copy)]
+pub struct SurfelAssociationCovariance {
+    pub point_covariance_w: Mat3<f64>,
+    pub plane_normal_variance: f64,
+    pub line_normal_variance: f64,
+}
+
+/// Candidate ranking policy after a surfel has passed the Mahalanobis gate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SurfelRankMode {
+    Mahalanobis,
+    EuclideanSquared,
+    Combined { centroid_distance_weight: f64 },
+}
+
+impl SurfelAssociationCovariance {
+    fn covariance_for(&self, surfel: &Surfel, config: &SurfelConfig) -> Mat3<f64> {
+        let mut covariance = self.point_covariance_w;
+        match surfel.geometry_class(config) {
+            GeometryClass::Plane => {
+                let normal = surfel.eigenvectors.column(0);
+                covariance += self.plane_normal_variance * normal * normal.transpose();
+            }
+            GeometryClass::Line => {
+                let normal0 = surfel.eigenvectors.column(0);
+                let normal1 = surfel.eigenvectors.column(1);
+                covariance += self.line_normal_variance
+                    * (normal0 * normal0.transpose() + normal1 * normal1.transpose());
+            }
+            GeometryClass::Scatter | GeometryClass::Degenerate | GeometryClass::Growing => {}
+        }
+        covariance
+    }
+}
+
 /// A planar surface observation returned by [`SurfelMap::query`].
 ///
 /// It describes the *plane* attached to the best-matching planar surfel
@@ -39,7 +88,7 @@ pub struct SurfelMap {
 /// eigenvector) and must not be depended upon; use its absolute value or
 /// align it against a known reference.
 #[derive(Debug, Clone)]
-pub struct SurfelObservation {
+pub struct SurfelPlaneObservation {
     pub surfel_id: SurfelID,
     pub mean_w: Vec3<f64>,
     pub norm_w: Vec3<f64>,
@@ -49,7 +98,7 @@ pub struct SurfelObservation {
     pub signed_residual: f64,
 }
 
-impl SurfelObservation {
+impl SurfelPlaneObservation {
     pub fn new(
         surfel_id: SurfelID,
         mean_w: Vec3<f64>,
@@ -107,7 +156,7 @@ impl SurfelMap {
         }
     }
 
-    pub fn query_plane(&self, point: &PointXYZI) -> Result<Option<SurfelObservation>> {
+    pub fn query_plane(&self, point: &PointXYZI) -> Result<Option<SurfelPlaneObservation>> {
         let radius = self.surfel_map_config.search_radius;
         if !point.is_valid() {
             return Ok(None);
@@ -165,7 +214,7 @@ impl SurfelMap {
             let plane_distance = score as f64;
             let planarity = surfel.planarity();
             let signed_residual = norm_w.dot(&(point.to_vec3_f64() - mean_w));
-            Ok(Some(SurfelObservation::new(
+            Ok(Some(SurfelPlaneObservation::new(
                 best_id,
                 mean_w,
                 norm_w,
@@ -272,6 +321,90 @@ impl SurfelMap {
                 linearity,
                 second_best_distance,
                 ambiguity_ratio,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn query_surfel(
+        &self,
+        point: &PointXYZI,
+        association_covariance: SurfelAssociationCovariance,
+        rank_mode: SurfelRankMode,
+    ) -> Result<Option<SurfelObservation>> {
+        let radius = self.surfel_map_config.search_radius;
+        if !point.is_valid() {
+            return Ok(None);
+        }
+        let mut voxel_key = VoxelKey::new(point, self.surfel_map_config.voxel_size)?;
+        let x = voxel_key.x;
+        let y = voxel_key.y;
+        let z = voxel_key.z;
+        let candidate_ids = (x - radius..=x + radius)
+            .flat_map(move |x| {
+                (y - radius..=y + radius).flat_map(move |y| {
+                    (z - radius..=z + radius).map(move |z| {
+                        voxel_key.x = x;
+                        voxel_key.y = y;
+                        voxel_key.z = z;
+                        voxel_key.pack()
+                    })
+                })
+            })
+            .filter_map(|v| self.buckets.get(&v))
+            .flat_map(|buckets| buckets.iter().copied())
+            .filter_map(|id| self.surfels.get(id).map(|surfel| (id, surfel)));
+
+        let mut best: Option<(SurfelID, f64)> = None;
+        let mut second_best: Option<(SurfelID, f64)> = None;
+        let mut seen = HashSet::new();
+        for (id, surfel) in candidate_ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if surfel.is_growing(self.surfel_config.min_mature_surfel_count) || surfel.count < 2 {
+                continue;
+            }
+            let point_w_covariance =
+                association_covariance.covariance_for(surfel, &self.surfel_config);
+            let Some((_, _, score)) = surfel.surfel_score(point, &point_w_covariance) else {
+                continue;
+            };
+            if score > self.surfel_config.max_mahalanobis_distance.powi(2) as f64 {
+                continue;
+            }
+
+            let delta = point.to_vec3_f64() - surfel.mean_w;
+            let voxel_size = self.surfel_map_config.voxel_size as f64;
+            let centroid_distance_squared = delta.norm_squared() / voxel_size.powi(2);
+            let rank_score = match rank_mode {
+                SurfelRankMode::Mahalanobis => score,
+                SurfelRankMode::EuclideanSquared => centroid_distance_squared,
+                SurfelRankMode::Combined {
+                    centroid_distance_weight,
+                } => score + centroid_distance_weight * centroid_distance_squared,
+            };
+
+            if best.is_none_or(|(_, best_score)| rank_score < best_score) {
+                second_best = best;
+                best = Some((id, rank_score));
+            } else if second_best.is_none_or(|(_, second_score)| rank_score < second_score) {
+                second_best = Some((id, rank_score));
+            }
+        }
+        if let Some((best_id, best_score)) = best {
+            let surfel = self.surfels.get(best_id).expect(
+                "UnexpectedError: on query: Logically, there should be no missing value here.",
+            );
+            Ok(Some(SurfelObservation {
+                surfel_id: best_id,
+                mean_w: surfel.mean_w,
+                covariance_w: surfel.m2 / (surfel.count - 1) as f64,
+                eigenvalues: surfel.eigenvalues,
+                eigenvectors: surfel.eigenvectors,
+                best_score,
+                second_best_score: second_best.map(|(_, score)| score),
             }))
         } else {
             Ok(None)

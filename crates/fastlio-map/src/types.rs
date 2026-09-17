@@ -137,7 +137,7 @@ impl Surfel {
         )
     }
 
-    pub fn mahalanobis_squared(&self, point: &PointXYZI, config: &SurfelConfig) -> f32 {
+    pub fn mahalanobis_squared(&self, point: &PointXYZI, config: &SurfelConfig) -> f64 {
         let delta = point.to_vec3_f64() - self.mean_w;
         let d0 = self.eigenvectors.column(0).dot(&delta);
         let d1 = self.eigenvectors.column(1).dot(&delta);
@@ -148,12 +148,26 @@ impl Surfel {
         let l1 = self.eigenvalues[1].max(covariance_floor);
         let l2 = self.eigenvalues[2].max(covariance_floor);
 
-        (d0 * d0 / l0 + d1 * d1 / l1 + d2 * d2 / l2) as f32
+        d0 * d0 / l0 + d1 * d1 / l1 + d2 * d2 / l2
     }
 
     pub fn within_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
         let support_sigma = config.max_mahalanobis_distance;
-        self.mahalanobis_squared(point, config) <= support_sigma * support_sigma
+        self.mahalanobis_squared(point, config) as f32 <= support_sigma * support_sigma
+    }
+
+    pub fn surfel_score(
+        &self,
+        point_w: &PointXYZI,
+        point_w_variance: &Mat3<f64>,
+    ) -> Option<(Mat3<f64>, Mat3<f64>, f64)> {
+        let delta = point_w.to_vec3_f64() - self.mean_w;
+        let covariance = self.m2 / (self.count - 1) as f64 + point_w_variance;
+        let chol = covariance.cholesky()?;
+        let l = chol.l();
+        let y = l.solve_lower_triangular(&delta)?;
+        let score = y.dot(&y);
+        Some((covariance, l, score))
     }
 
     pub fn within_tangent_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {

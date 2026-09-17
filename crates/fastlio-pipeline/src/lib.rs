@@ -1,10 +1,10 @@
 use anyhow::{Result, anyhow};
 use fastlio_estimator::{
     iekf::IekfState,
-    optimizer::{IekfConfig, ObservationDiagnostics},
+    optimizer::{IekfConfig, ObservationDiagnostics, SurfelMeasurementSpectrumMode},
 };
 use fastlio_imu::ImuIntegrator;
-use fastlio_map::surfel::SurfelMap;
+use fastlio_map::surfel::{SurfelMap, SurfelRankMode};
 use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
     Config, ImuSample, LidarImuExtrinsic, MeasureGroup, PointXYZI, Vec3, gravity_tangent_basis,
@@ -112,7 +112,10 @@ pub struct PipelineFrameSummary {
     pub iekf_observations_last: usize,
     pub iekf_mean_abs_residual: f64,
     pub iekf_max_abs_residual: f64,
+    pub first_observation_diagnostics: ObservationDiagnostics,
     pub observation_diagnostics: ObservationDiagnostics,
+    pub iekf_total_rotation_correction_imu: Vec3<f64>,
+    pub iekf_total_rotation_correction_world: Vec3<f64>,
     pub iekf_final_rotation_delta_norm: f64,
     pub iekf_final_position_delta_norm: f64,
     pub iekf_final_velocity_delta_norm: f64,
@@ -200,6 +203,7 @@ pub struct MainPipeline {
     pub last_imu_for_deskew: Option<ImuSample>,
     pub initializer: ImuInitializer,
     initial_gravity: Option<Vec3<f64>>,
+    iekf_config: IekfConfig,
 }
 
 impl MainPipeline {
@@ -223,7 +227,22 @@ impl MainPipeline {
             last_imu_for_deskew: None,
             initializer: ImuInitializer::default(),
             initial_gravity: None,
+            iekf_config: IekfConfig::default(),
         }
+    }
+
+    /// Overrides the scan-to-map candidate ranking policy for replay AB runs.
+    pub fn set_surfel_rank_mode(&mut self, rank_mode: SurfelRankMode) {
+        self.iekf_config.association_rank_mode = rank_mode;
+    }
+
+    /// Overrides only the measurement-rank policy after a surfel has already
+    /// been associated with a scan point.
+    pub fn set_surfel_measurement_spectrum_mode(
+        &mut self,
+        spectrum_mode: SurfelMeasurementSpectrumMode,
+    ) {
+        self.iekf_config.measurement_spectrum_mode = spectrum_mode;
     }
 
     pub fn process_measure_group(
@@ -308,7 +327,10 @@ impl MainPipeline {
             iekf_observations_last,
             iekf_mean_abs_residual,
             iekf_max_abs_residual,
+            first_observation_diagnostics,
             observation_diagnostics,
+            iekf_total_rotation_correction_imu,
+            iekf_total_rotation_correction_world,
             iekf_final_rotation_delta_norm,
             iekf_final_position_delta_norm,
             iekf_final_velocity_delta_norm,
@@ -321,7 +343,7 @@ impl MainPipeline {
                     &pointcloud.point_cloud,
                     &self.extrinsic,
                     &self.map,
-                    &IekfConfig::default(),
+                    &self.iekf_config,
                 )
                 .map_err(|e| anyhow!("IekfUpdateError: {:?}", e))?;
 
@@ -335,7 +357,10 @@ impl MainPipeline {
                 iekf_summary.observations.last().copied().unwrap_or(0),
                 iekf_summary.mean_abs_residual,
                 iekf_summary.max_abs_residual,
+                iekf_summary.first_observation_diagnostics,
                 iekf_summary.observation_diagnostics,
+                iekf_summary.total_rotation_correction_imu,
+                iekf_summary.total_rotation_correction_world,
                 iekf_summary.final_rotation_delta_norm,
                 iekf_summary.final_position_delta_norm,
                 iekf_summary.final_velocity_delta_norm,
@@ -355,6 +380,13 @@ impl MainPipeline {
                     no_association: pointcloud.point_cloud.len(),
                     ..ObservationDiagnostics::default()
                 },
+                ObservationDiagnostics {
+                    input_points: pointcloud.point_cloud.len(),
+                    no_association: pointcloud.point_cloud.len(),
+                    ..ObservationDiagnostics::default()
+                },
+                Vec3::zeros(),
+                Vec3::zeros(),
                 0.0,
                 0.0,
                 0.0,
@@ -383,7 +415,10 @@ impl MainPipeline {
             iekf_observations_last,
             iekf_mean_abs_residual,
             iekf_max_abs_residual,
+            first_observation_diagnostics,
             observation_diagnostics,
+            iekf_total_rotation_correction_imu,
+            iekf_total_rotation_correction_world,
             iekf_final_rotation_delta_norm,
             iekf_final_position_delta_norm,
             iekf_final_velocity_delta_norm,
