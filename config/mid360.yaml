@@ -29,10 +29,10 @@ surfel_map_config:
     search_radius: 0
 
 surfel_config:
-    growing_radius: 0.8
+    growing_radius: 0.4
     min_mature_surfel_count: 8
     max_planarity_ratio: 0.10
-    min_plane_spread_eigenvalue: 0.025
+    min_plane_spread_eigenvalue: 0.005
     max_mahalanobis_distance: 2.0
                    
 # publish:

@@ -451,7 +451,7 @@ fn initialized_covariance() -> SMatrix<f64, 23, 23> {
     }
 
     for index in 15..17 {
-        covariance[(index, index)] = 1.0e-6; // gravity direction on S2, rad^2
+        covariance[(index, index)] = 1.0e-5; // gravity direction on S2, rad^2
     }
 
     for index in 17..23 {

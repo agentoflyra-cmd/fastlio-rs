@@ -105,12 +105,12 @@ impl MeasurementSynchronizer {
     fn try_build_group(&mut self) {
         // lidar frame must exist here, so unwrap is safe here.
         let lidar = self.lidar_buffer.pop_front().unwrap();
-        let mut start_idx = 0;
-        while start_idx + 1 < self.imu_buffer.len()
-            && self.imu_buffer[start_idx + 1].time_stamp_sec < lidar.base_timestamp_sec
-        {
-            start_idx += 1;
-        }
+        // let mut start_idx = 0;
+        // while start_idx + 1 < self.imu_buffer.len()
+        //     && self.imu_buffer[start_idx + 1].time_stamp_sec < lidar.base_timestamp_sec
+        // {
+        //     start_idx += 1;
+        // }
         let mut end_idx = 0;
         while end_idx < self.imu_buffer.len()
             && self.imu_buffer[end_idx].time_stamp_sec + TIME_EPS_SEC < lidar.end_timestamp_sec()
@@ -118,9 +118,9 @@ impl MeasurementSynchronizer {
             end_idx += 1;
         }
 
-        self.imu_buffer.drain(..start_idx);
+        // self.imu_buffer.drain(..start_idx);
 
-        let end_idx = end_idx - start_idx;
+        // let end_idx = end_idx - start_idx;
         let end_imu = self.imu_buffer[end_idx].clone();
         let mut imu: Vec<ImuSample> = self.imu_buffer.drain(..end_idx).collect();
 

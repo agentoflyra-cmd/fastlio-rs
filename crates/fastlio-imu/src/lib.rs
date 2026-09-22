@@ -167,16 +167,24 @@ impl ImuIntegrator {
         let delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta);
         let half_delta_rotation = UnitQuaternion::from_scaled_axis(delta_theta * 0.5);
 
+        let e_mat = half_delta_rotation.to_rotation_matrix();
+        let e_matrix = e_mat.matrix();
+
         let r_mid = state_at_k.orientation * half_delta_rotation;
         let r_mid_mat = r_mid.to_rotation_matrix();
         let r_mid_matrix = r_mid_mat.matrix();
 
         let acc_skew = skew(&acc_mid);
-        let accel_orientation_jac = -(r_mid_matrix * acc_skew);
+        let accel_orientation_jac = -(r_mid_matrix * acc_skew) * e_matrix.transpose();
 
         let jr = so3_right_jacobian(&delta_theta);
         let delta_rotation_inv = delta_rotation.inverse().to_rotation_matrix();
         let ar = delta_rotation_inv.matrix();
+
+        let phi_half = delta_theta * 0.5;
+        let jr_half = so3_right_jacobian(&phi_half);
+
+        let gyro_bias_accel_jac = r_mid_matrix * acc_skew * jr_half;
 
         let mut fx = SMat23::identity();
         // R
@@ -188,6 +196,8 @@ impl ImuIntegrator {
             .copy_from(&(accel_orientation_jac * 0.5 * dt2));
         fx.fixed_view_mut::<3, 3>(3, 6)
             .copy_from(&(SMat3::identity() * dt));
+        fx.fixed_view_mut::<3, 3>(3, 9)
+            .copy_from(&(gyro_bias_accel_jac * 0.25 * dt * dt2));
         fx.fixed_view_mut::<3, 3>(3, 12)
             .copy_from(&(-(r_mid_matrix * 0.5 * dt2)));
         fx.fixed_view_mut::<3, 2>(3, 15)
@@ -196,6 +206,8 @@ impl ImuIntegrator {
         // v
         fx.fixed_view_mut::<3, 3>(6, 0)
             .copy_from(&(accel_orientation_jac * dt));
+        fx.fixed_view_mut::<3, 3>(6, 9)
+            .copy_from(&(gyro_bias_accel_jac * dt2 * 0.5));
         fx.fixed_view_mut::<3, 3>(6, 12)
             .copy_from(&(-(r_mid_matrix * dt)));
         fx.fixed_view_mut::<3, 2>(6, 15)
@@ -745,10 +757,6 @@ mod test {
 
     type S17 = SVector<f64, 17>;
 
-    fn skew3(v: &Vec3<f64>) -> SMat3 {
-        crate::skew(v)
-    }
-
     fn inject_error_state(nominal: &NavState, dx: &S17) -> NavState {
         let delta_theta: Vec3<f64> = dx.fixed_rows::<3>(0).into_owned();
         let delta_rot = UnitQuaternion::from_scaled_axis(delta_theta);
@@ -804,123 +812,54 @@ mod test {
         test.state.gyro_bias = Vec3::new(0.01, -0.02, 0.005);
         test.state.accel_bias = Vec3::new(0.05, 0.03, -0.02);
         test.imu_prev.time_stamp_sec = 1.0;
-        test.imu_curr.time_stamp_sec = 1.05;
         test.imu_prev.gyro = Vec3::new(0.05, -0.03, 0.07);
         test.imu_curr.gyro = Vec3::new(0.06, -0.04, 0.08);
         test.imu_prev.accel = Vec3::new(1.5, 0.3, -2.0);
         test.imu_curr.accel = Vec3::new(1.3, 0.2, 1.0);
 
-        let dt = test.imu_curr.time_stamp_sec - test.imu_prev.time_stamp_sec;
         let integ = ImuIntegrator::init(0.0, 0.0, 0.0, 0.0);
-        let (fx, _) = integ
-            .error_state_transition(
-                &test.state,
-                &test.gravity_basis(),
-                &test.imu_prev,
-                &test.imu_curr,
-            )
-            .unwrap();
-
-        let mut nominal_forward = test.state.clone();
-        integ
-            .propagate_nominal_state_mut(&mut nominal_forward, &test.imu_prev, &test.imu_curr)
-            .unwrap();
-
-        let h = 1e-5;
-        let cmp_eps = 1e-4;
-
-        // Test velocity-to-position block (3..6, 6..9) = I * dt
-        {
-            let mut dx = S17::zeros();
-            dx[6] = h; // perturb v_x
-            let perturbed = inject_error_state(&test.state, &dx);
-            let mut fwd = perturbed.clone();
-            integ
-                .propagate_nominal_state_mut(&mut fwd, &test.imu_prev, &test.imu_curr)
+        let h = 1e-6;
+        for dt in [0.005, 0.05] {
+            test.imu_curr.time_stamp_sec = test.imu_prev.time_stamp_sec + dt;
+            let (fx, _) = integ
+                .error_state_transition(
+                    &test.state,
+                    &test.gravity_basis(),
+                    &test.imu_prev,
+                    &test.imu_curr,
+                )
                 .unwrap();
-            let err = extract_error_state(&fwd, &nominal_forward);
-            let block = fx.fixed_view::<3, 3>(3, 6);
-            assert_relative_eq!(err[3], block[(0, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[4], block[(1, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[5], block[(2, 0)] * h, epsilon = cmp_eps);
-        }
-
-        // Test accel_bias-to-velocity block (6..9, 12..15) = -R_mid * dt
-        {
-            let mut dx = S17::zeros();
-            dx[12] = h; // perturb ba_x
-            let perturbed = inject_error_state(&test.state, &dx);
-            let mut fwd = perturbed.clone();
+            let mut nominal_forward = test.state.clone();
             integ
-                .propagate_nominal_state_mut(&mut fwd, &test.imu_prev, &test.imu_curr)
+                .propagate_nominal_state_mut(&mut nominal_forward, &test.imu_prev, &test.imu_curr)
                 .unwrap();
-            let err = extract_error_state(&fwd, &nominal_forward);
-            let block = fx.fixed_view::<3, 3>(6, 12);
 
-            let omega_mid = 0.5 * (test.imu_prev.gyro + test.imu_curr.gyro) - test.state.gyro_bias;
-            let half_delta = UnitQuaternion::from_scaled_axis(omega_mid * dt * 0.5);
-            let r_mid_rot = (test.state.orientation * half_delta).to_rotation_matrix();
-            let r_mid_mat = r_mid_rot.matrix();
-            let expected_3x3 = -(r_mid_mat * dt);
+            // Differentiate the propagated state in the output error tangent,
+            // including all axes of the pose, velocity, biases and S2 gravity.
+            for col in 0..17 {
+                let mut dx = S17::zeros();
+                dx[col] = h;
+                let mut plus = inject_error_state(&test.state, &dx);
+                let mut minus = inject_error_state(&test.state, &(-dx));
+                integ
+                    .propagate_nominal_state_mut(&mut plus, &test.imu_prev, &test.imu_curr)
+                    .unwrap();
+                integ
+                    .propagate_nominal_state_mut(&mut minus, &test.imu_prev, &test.imu_curr)
+                    .unwrap();
+                let numerical = (extract_error_state(&plus, &nominal_forward)
+                    - extract_error_state(&minus, &nominal_forward))
+                    / (2.0 * h);
 
-            assert_relative_eq!(err[6], expected_3x3[(0, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[7], expected_3x3[(1, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[8], expected_3x3[(2, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(block[(0, 0)], expected_3x3[(0, 0)], epsilon = 1e-10);
-            assert_relative_eq!(block[(1, 0)], expected_3x3[(1, 0)], epsilon = 1e-10);
-            assert_relative_eq!(block[(2, 0)], expected_3x3[(2, 0)], epsilon = 1e-10);
-        }
-
-        // Test gyro_bias-to-rotation block (0..3, 9..12) = -Jr * dt
-        {
-            let mut dx = S17::zeros();
-            dx[9] = h; // perturb bg_x
-            let perturbed = inject_error_state(&test.state, &dx);
-            let mut fwd = perturbed.clone();
-            integ
-                .propagate_nominal_state_mut(&mut fwd, &test.imu_prev, &test.imu_curr)
-                .unwrap();
-            let err = extract_error_state(&fwd, &nominal_forward);
-            let block = fx.fixed_view::<3, 3>(0, 9);
-
-            let omega_mid = 0.5 * (test.imu_prev.gyro + test.imu_curr.gyro) - test.state.gyro_bias;
-            let delta_theta = omega_mid * dt;
-            let jr = crate::so3_right_jacobian(&delta_theta);
-            let expected_3x3 = -(jr * dt);
-
-            assert_relative_eq!(err[0], expected_3x3[(0, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[1], expected_3x3[(1, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(err[2], expected_3x3[(2, 0)] * h, epsilon = cmp_eps);
-            assert_relative_eq!(block[(0, 0)], expected_3x3[(0, 0)], epsilon = 1e-10);
-            assert_relative_eq!(block[(1, 0)], expected_3x3[(1, 0)], epsilon = 1e-10);
-            assert_relative_eq!(block[(2, 0)], expected_3x3[(2, 0)], epsilon = 1e-10);
-        }
-
-        // Test rotation-to-position block (3..6, 0..3):
-        // accel_orientation_jac * 0.5 * dt^2 where accel_orientation_jac = -R_mid * skew(acc_mid)
-        {
-            let mut dx = S17::zeros();
-            dx[1] = h; // perturb delta_theta_y
-            let perturbed = inject_error_state(&test.state, &dx);
-            let mut fwd = perturbed.clone();
-            integ
-                .propagate_nominal_state_mut(&mut fwd, &test.imu_prev, &test.imu_curr)
-                .unwrap();
-            let _err = extract_error_state(&fwd, &nominal_forward);
-            let block = fx.fixed_view::<3, 3>(3, 0);
-
-            let acc_mid = 0.5 * (test.imu_prev.accel + test.imu_curr.accel) - test.state.accel_bias;
-            let omega_mid = 0.5 * (test.imu_prev.gyro + test.imu_curr.gyro) - test.state.gyro_bias;
-            let half_delta = UnitQuaternion::from_scaled_axis(omega_mid * dt * 0.5);
-            let r_mid_rot = (test.state.orientation * half_delta).to_rotation_matrix();
-            let r_mid_mat = r_mid_rot.matrix();
-            let accel_orientation_jac = -(r_mid_mat * skew3(&acc_mid));
-            let expected_3x3 = accel_orientation_jac * 0.5 * dt * dt;
-
-            // Verify analytical block
-            assert_relative_eq!(block[(0, 1)], expected_3x3[(0, 1)], epsilon = 1e-10);
-            assert_relative_eq!(block[(1, 1)], expected_3x3[(1, 1)], epsilon = 1e-10);
-            assert_relative_eq!(block[(2, 1)], expected_3x3[(2, 1)], epsilon = 1e-10);
+                for row in 0..17 {
+                    let analytic = fx[(row, col)];
+                    assert!(
+                        (numerical[row] - analytic).abs() < 1e-8,
+                        "dt={dt}, Fx[{row},{col}]: analytic={analytic}, numerical={}",
+                        numerical[row],
+                    );
+                }
+            }
         }
     }
 
