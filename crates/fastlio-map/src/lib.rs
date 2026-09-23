@@ -471,7 +471,7 @@ mod test {
 #[cfg(test)]
 mod surfel_test {
     use crate::VoxelKey;
-    use crate::surfel::{SurfelAssociationCovariance, SurfelMap, SurfelRankMode};
+    use crate::surfel::SurfelMap;
     use crate::types::{GeometryClass, Surfel};
     use fastlio_types::{Mat3, PointXYZI, SurfelConfig, SurfelMapConfig, Vec3};
     use smallvec::SmallVec;
@@ -485,12 +485,8 @@ mod surfel_test {
         }
     }
 
-    fn association_covariance(stddev: f64) -> SurfelAssociationCovariance {
-        SurfelAssociationCovariance {
-            point_covariance_w: Mat3::identity() * stddev.powi(2),
-            plane_normal_variance: 0.0,
-            line_normal_variance: 0.0,
-        }
+    fn association_covariance(stddev: f64) -> Mat3<f64> {
+        Mat3::identity() * stddev.powi(2)
     }
 
     fn map_config() -> SurfelMapConfig {
@@ -797,13 +793,9 @@ mod surfel_test {
         assert_eq!(only_surfel(&map).count, 4);
         assert_none(&map, &pt(0.1, 0.1, 0.0));
         assert!(
-            map.query_surfel(
-                &pt(0.1, 0.1, 0.0),
-                association_covariance(0.01),
-                SurfelRankMode::Mahalanobis,
-            )
-            .expect("query must not error")
-            .is_none()
+            map.query_surfel(&pt(0.1, 0.1, 0.0), association_covariance(0.01),)
+                .expect("query must not error")
+                .is_none()
         );
     }
 
@@ -814,11 +806,7 @@ mod surfel_test {
             .unwrap();
 
         let observation = map
-            .query_surfel(
-                &pt(0.0, 0.0, 0.0),
-                association_covariance(0.01),
-                SurfelRankMode::Mahalanobis,
-            )
+            .query_surfel(&pt(0.0, 0.0, 0.0), association_covariance(0.01))
             .expect("query must not error")
             .expect("mature surfel expected");
         assert!(
@@ -832,11 +820,7 @@ mod surfel_test {
         assert!(observation.second_best_score.is_none());
 
         let rejected = map
-            .query_surfel(
-                &pt(0.0, 0.0, 2.5),
-                association_covariance(0.01),
-                SurfelRankMode::Mahalanobis,
-            )
+            .query_surfel(&pt(0.0, 0.0, 2.5), association_covariance(0.01))
             .expect("query must not error");
         assert!(rejected.is_none());
     }

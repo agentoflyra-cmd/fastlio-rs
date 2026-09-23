@@ -30,44 +30,6 @@ pub struct SurfelObservation {
     pub second_best_score: Option<f64>,
 }
 
-/// World-frame uncertainty model used only while associating a point with a
-/// surfel. Geometry-specific terms widen the capture range only in constrained
-/// directions; they are not measurement noise for the IEKF.
-#[derive(Debug, Clone, Copy)]
-pub struct SurfelAssociationCovariance {
-    pub point_covariance_w: Mat3<f64>,
-    pub plane_normal_variance: f64,
-    pub line_normal_variance: f64,
-}
-
-/// Candidate ranking policy after a surfel has passed the Mahalanobis gate.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SurfelRankMode {
-    Mahalanobis,
-    EuclideanSquared,
-    Combined { centroid_distance_weight: f64 },
-}
-
-impl SurfelAssociationCovariance {
-    fn covariance_for(&self, surfel: &Surfel, config: &SurfelConfig) -> Mat3<f64> {
-        let mut covariance = self.point_covariance_w;
-        match surfel.geometry_class(config) {
-            GeometryClass::Plane => {
-                let normal = surfel.eigenvectors.column(0);
-                covariance += self.plane_normal_variance * normal * normal.transpose();
-            }
-            GeometryClass::Line => {
-                let normal0 = surfel.eigenvectors.column(0);
-                let normal1 = surfel.eigenvectors.column(1);
-                covariance += self.line_normal_variance
-                    * (normal0 * normal0.transpose() + normal1 * normal1.transpose());
-            }
-            GeometryClass::Scatter | GeometryClass::Degenerate | GeometryClass::Growing => {}
-        }
-        covariance
-    }
-}
-
 /// A planar surface observation returned by [`SurfelMap::query`].
 ///
 /// It describes the *plane* attached to the best-matching planar surfel
@@ -330,8 +292,7 @@ impl SurfelMap {
     pub fn query_surfel(
         &self,
         point: &PointXYZI,
-        association_covariance: SurfelAssociationCovariance,
-        rank_mode: SurfelRankMode,
+        point_w_covariance: Mat3<f64>,
     ) -> Result<Option<SurfelObservation>> {
         let radius = self.surfel_map_config.search_radius;
         if !point.is_valid() {
@@ -366,8 +327,6 @@ impl SurfelMap {
             if surfel.is_growing(self.surfel_config.min_mature_surfel_count) || surfel.count < 2 {
                 continue;
             }
-            let point_w_covariance =
-                association_covariance.covariance_for(surfel, &self.surfel_config);
             let Some((_, _, score)) = surfel.surfel_score(point, &point_w_covariance) else {
                 continue;
             };
@@ -375,22 +334,11 @@ impl SurfelMap {
                 continue;
             }
 
-            let delta = point.to_vec3_f64() - surfel.mean_w;
-            let voxel_size = self.surfel_map_config.voxel_size as f64;
-            let centroid_distance_squared = delta.norm_squared() / voxel_size.powi(2);
-            let rank_score = match rank_mode {
-                SurfelRankMode::Mahalanobis => score,
-                SurfelRankMode::EuclideanSquared => centroid_distance_squared,
-                SurfelRankMode::Combined {
-                    centroid_distance_weight,
-                } => score + centroid_distance_weight * centroid_distance_squared,
-            };
-
-            if best.is_none_or(|(_, best_score)| rank_score < best_score) {
+            if best.is_none_or(|(_, best_score)| score < best_score) {
                 second_best = best;
-                best = Some((id, rank_score));
-            } else if second_best.is_none_or(|(_, second_score)| rank_score < second_score) {
-                second_best = Some((id, rank_score));
+                best = Some((id, score));
+            } else if second_best.is_none_or(|(_, second_score)| score < second_score) {
+                second_best = Some((id, score));
             }
         }
         if let Some((best_id, best_score)) = best {

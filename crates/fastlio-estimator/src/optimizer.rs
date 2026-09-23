@@ -1,60 +1,10 @@
 use crate::{
     iekf::{box_minus, gravity_box_plus},
-    linearize_point_to_line_observation, linearize_point_to_plane_observation,
     linearized_point_to_surfel_observation, skew,
 };
-use fastlio_map::surfel::{
-    SurfelAssociationCovariance, SurfelID, SurfelLineObservation, SurfelMap, SurfelObservation,
-    SurfelPlaneObservation, SurfelRankMode,
-};
+use fastlio_map::surfel::SurfelMap;
 use fastlio_types::{LidarImuExtrinsic, Mat2, Mat3, Mat32, NavState, PointXYZI, Vec2, Vec3};
 use nalgebra::{SMatrix, SVector};
-use std::collections::HashMap;
-
-pub const TOP_ROTATION_RHS_SURFELS: usize = 3;
-pub const TOP_ROTATION_RHS_VOXELS: usize = 3;
-const ROTATION_RHS_VOXEL_SIZE_M: f64 = 1.0;
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SurfelRotationRhsContributor {
-    pub sample_count: usize,
-    pub mean_w: Vec3<f64>,
-    pub k0_axis_w: Vec3<f64>,
-    pub rhs_imu: Vec3<f64>,
-    pub rhs_world: Vec3<f64>,
-    pub residual_norm_mean: f64,
-    pub best_score_mean: f64,
-    pub second_best_score_mean: f64,
-    pub second_best_score_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct SurfelRotationRhsAccumulator {
-    contributor: SurfelRotationRhsContributor,
-    residual_norm_sum: f64,
-    best_score_sum: f64,
-    second_best_score_sum: f64,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RotationRhsVoxelContributor {
-    pub sample_count: usize,
-    pub voxel_min_w: Vec3<f64>,
-    pub rhs_imu: Vec3<f64>,
-    pub rhs_world: Vec3<f64>,
-    pub residual_norm_mean: f64,
-    pub best_score_mean: f64,
-    pub second_best_score_mean: f64,
-    pub second_best_score_count: usize,
-}
-
-#[derive(Debug, Clone)]
-struct RotationRhsVoxelAccumulator {
-    contributor: RotationRhsVoxelContributor,
-    residual_norm_sum: f64,
-    best_score_sum: f64,
-    second_best_score_sum: f64,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IekfUpdateError {
@@ -66,23 +16,7 @@ pub enum IekfUpdateError {
     MapQueryFailed { context: String },
 }
 
-/// Controls how many covariance-spectrum directions of an already associated
-/// surfel participate in the IEKF measurement update.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SurfelMeasurementSpectrumMode {
-    /// Preserve the current full-rank point-to-surfel likelihood.
-    FullRank,
-    /// Keep only directions whose actual measurement variance is within this
-    /// factor of the smallest variance direction.
-    HardTruncation { max_variance_ratio: f64 },
-}
-
-// Line observations carry two scalar residual rows and therefore two 23D
-// Jacobians. Keep the enum inline to avoid per-observation heap allocation in
-// the IEKF hot path.
 pub enum LinearizedObservation {
-    Plane(PlaneLinearizedObservation),
-    Line(LineLinearizedObservation),
     Surfel(SurfelLinearizedObservation),
 }
 
@@ -90,609 +24,6 @@ pub enum LinearizedObservation {
 pub struct SurfelLinearizedObservation {
     pub residual: Vec3<f64>,
     pub jacobian: SMatrix<f64, 3, 23>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LineLinearizedObservation {
-    pub residual0: f64,
-    pub residual1: f64,
-    pub jacobian0: SVector<f64, 23>,
-    pub jacobian1: SVector<f64, 23>,
-    pub variance: f64,
-    pub distance: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct PlaneLinearizedObservation {
-    pub residual: f64,
-    pub jacobian: SVector<f64, 23>,
-    pub variance: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ObservationDiagnostics {
-    pub input_points: usize,
-    pub accepted_observations: usize,
-    pub no_association: usize,
-    pub residual_abs_mean: f64,
-    pub residual_abs_p50: f64,
-    pub residual_abs_p90: f64,
-    pub residual_abs_p95: f64,
-    pub residual_abs_p99: f64,
-    pub residual_abs_max: f64,
-    pub surfel_query_best_score_p50: f64,
-    pub surfel_query_best_score_p95: f64,
-    pub surfel_query_second_best_score_p50: f64,
-    pub surfel_query_second_best_score_p95: f64,
-    pub surfel_query_second_best_count: usize,
-    pub surfel_query_score_margin_p05: f64,
-    pub surfel_query_score_margin_p50: f64,
-    pub surfel_query_best_over_second_p95: f64,
-    pub surfel_query_ambiguous_fraction: f64,
-    /// Eigenvalues of the rotation block of measurement-only information,
-    /// ordered increasingly. The matching eigenvectors are matrix columns.
-    pub rotation_information_eigenvalues: Vec3<f64>,
-    pub rotation_information_eigenvectors: Mat3<f64>,
-    pub rotation_information_condition_number: f64,
-    pub rotation_information_trace: f64,
-    /// Measurement contribution to the linear solve RHS for IMU rotation:
-    /// `-sum(H_R^T W r)`.
-    pub rotation_measurement_rhs: Vec3<f64>,
-    /// `V_R^T b_R`, with columns of `V_R` matching the increasing rotation
-    /// information eigenvalues above.
-    pub rotation_measurement_rhs_in_information_eigenbasis: Vec3<f64>,
-    /// The same RHS expressed in the world frame. The raw RHS above is in the
-    /// right IMU attitude tangent frame.
-    pub rotation_measurement_rhs_world: Vec3<f64>,
-    /// Measurement-only rotation-position information block, expressed in the
-    /// right IMU attitude perturbation and world-frame position coordinates.
-    pub rotation_position_information: Mat3<f64>,
-    /// Trace contributions from the three increasing-eigenvalue directions of
-    /// the actual measurement covariance `Sigma_s + Sigma_p,w`.
-    pub measurement_spectrum_rotation_trace: Vec3<f64>,
-    pub measurement_spectrum_rotation_trace_fraction: Vec3<f64>,
-    /// Columns are the three increasing-variance measurement-spectrum
-    /// contributions to `-sum(H_R^T W r)`.
-    pub measurement_spectrum_rotation_rhs: Mat3<f64>,
-    pub measurement_spectrum_eigenvalue_mean: Vec3<f64>,
-    /// Mean `|u_k^T e_s,k|`, where `u_k` is an actual measurement covariance
-    /// eigenvector and `e_s,k` is the matching sorted surfel support axis.
-    pub measurement_spectrum_surfel_axis_alignment: Vec3<f64>,
-    /// Fraction of the tightest surfel support axes whose largest absolute
-    /// world component is X, Y, or Z. Axis sign is intentionally ignored.
-    pub measurement_spectrum_k0_axis_bin_fraction: Vec3<f64>,
-    /// Largest eigenvalue of the sign-invariant second moment of the tightest
-    /// surfel support axes. One means one dominant undirected axis.
-    pub measurement_spectrum_k0_axis_concentration: f64,
-    /// Principal world direction of that sign-invariant second moment.
-    pub measurement_spectrum_k0_axis_dominant_world: Vec3<f64>,
-    /// Per-surfel net first-iteration rotation RHS contributors, ranked by
-    /// `rhs_world.norm()`. Centroids, rather than ephemeral surfel IDs, are
-    /// exposed as the spatial identifier.
-    pub top_rotation_rhs_surfels: [SurfelRotationRhsContributor; TOP_ROTATION_RHS_SURFELS],
-    /// The same diagnostic aggregated in fixed 1 m world voxels.
-    pub top_rotation_rhs_voxels: [RotationRhsVoxelContributor; TOP_ROTATION_RHS_VOXELS],
-}
-
-impl Default for ObservationDiagnostics {
-    fn default() -> Self {
-        Self {
-            input_points: 0,
-            accepted_observations: 0,
-            no_association: 0,
-            residual_abs_mean: 0.0,
-            residual_abs_p50: 0.0,
-            residual_abs_p90: 0.0,
-            residual_abs_p95: 0.0,
-            residual_abs_p99: 0.0,
-            residual_abs_max: 0.0,
-            surfel_query_best_score_p50: 0.0,
-            surfel_query_best_score_p95: 0.0,
-            surfel_query_second_best_score_p50: 0.0,
-            surfel_query_second_best_score_p95: 0.0,
-            surfel_query_second_best_count: 0,
-            surfel_query_score_margin_p05: 0.0,
-            surfel_query_score_margin_p50: 0.0,
-            surfel_query_best_over_second_p95: 0.0,
-            surfel_query_ambiguous_fraction: 0.0,
-            rotation_information_eigenvalues: Vec3::zeros(),
-            rotation_information_eigenvectors: Mat3::zeros(),
-            rotation_information_condition_number: f64::INFINITY,
-            rotation_information_trace: 0.0,
-            rotation_measurement_rhs: Vec3::zeros(),
-            rotation_measurement_rhs_in_information_eigenbasis: Vec3::zeros(),
-            rotation_measurement_rhs_world: Vec3::zeros(),
-            rotation_position_information: Mat3::zeros(),
-            measurement_spectrum_rotation_trace: Vec3::zeros(),
-            measurement_spectrum_rotation_trace_fraction: Vec3::zeros(),
-            measurement_spectrum_rotation_rhs: Mat3::zeros(),
-            measurement_spectrum_eigenvalue_mean: Vec3::zeros(),
-            measurement_spectrum_surfel_axis_alignment: Vec3::zeros(),
-            measurement_spectrum_k0_axis_bin_fraction: Vec3::zeros(),
-            measurement_spectrum_k0_axis_concentration: 0.0,
-            measurement_spectrum_k0_axis_dominant_world: Vec3::zeros(),
-            top_rotation_rhs_surfels: [SurfelRotationRhsContributor::default();
-                TOP_ROTATION_RHS_SURFELS],
-            top_rotation_rhs_voxels: [RotationRhsVoxelContributor::default();
-                TOP_ROTATION_RHS_VOXELS],
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct SurfelQueryDiagnostics {
-    best_scores: Vec<f64>,
-    second_best_scores: Vec<f64>,
-    paired_score_margins: Vec<f64>,
-    paired_best_over_second: Vec<f64>,
-    measurement_spectrum_rotation_trace: Vec3<f64>,
-    measurement_spectrum_rotation_rhs: Mat3<f64>,
-    measurement_spectrum_eigenvalue_sum: Vec3<f64>,
-    measurement_spectrum_surfel_axis_alignment_sum: Vec3<f64>,
-    measurement_spectrum_count: usize,
-    measurement_spectrum_k0_axis_bin_count: Vec3<f64>,
-    measurement_spectrum_k0_axis_second_moment: Mat3<f64>,
-    surfel_rotation_rhs: HashMap<SurfelID, SurfelRotationRhsAccumulator>,
-    voxel_rotation_rhs: HashMap<(i32, i32, i32), RotationRhsVoxelAccumulator>,
-}
-
-impl SurfelQueryDiagnostics {
-    fn record_match_scores(&mut self, best_score: f64, second_best_score: Option<f64>) {
-        self.best_scores.push(best_score);
-        let Some(second_best_score) = second_best_score else {
-            return;
-        };
-
-        self.second_best_scores.push(second_best_score);
-        self.paired_score_margins
-            .push((second_best_score - best_score).max(0.0));
-        let best_over_second = if second_best_score <= f64::EPSILON {
-            1.0
-        } else {
-            (best_score / second_best_score).clamp(0.0, 1.0)
-        };
-        self.paired_best_over_second.push(best_over_second);
-    }
-
-    fn record_measurement_spectrum(
-        &mut self,
-        measurement_covariance: &Mat3<f64>,
-        jacobian: &SMatrix<f64, 3, 23>,
-        residual: &Vec3<f64>,
-        surfel: &SurfelObservation,
-        attenuation: &Vec3<f64>,
-    ) -> Result<(), IekfUpdateError> {
-        let eigen = measurement_covariance.symmetric_eigen();
-        let (eigenvalues, eigenvectors) = sort_eigenpairs(eigen.eigenvalues, eigen.eigenvectors);
-        let mut rhs_imu = Vec3::zeros();
-        for direction in 0..3 {
-            let variance = eigenvalues[direction];
-            if !variance.is_finite() || variance <= 0.0 {
-                return Err(IekfUpdateError::InvalidObservation);
-            }
-            let direction_w = eigenvectors.column(direction);
-            let projected_residual = direction_w.dot(residual);
-            let mut projected_rotation_jacobian_squared_norm = 0.0;
-            for rotation_col in 0..3 {
-                let projected = direction_w.dot(&jacobian.column(rotation_col));
-                projected_rotation_jacobian_squared_norm += projected * projected;
-            }
-            self.measurement_spectrum_rotation_trace[direction] +=
-                attenuation[direction] * projected_rotation_jacobian_squared_norm / variance;
-            for rotation_col in 0..3 {
-                let projected_jacobian = direction_w.dot(&jacobian.column(rotation_col));
-                let contribution =
-                    -attenuation[direction] * projected_jacobian * projected_residual / variance;
-                self.measurement_spectrum_rotation_rhs[(rotation_col, direction)] += contribution;
-                rhs_imu[rotation_col] += contribution;
-            }
-            self.measurement_spectrum_eigenvalue_sum[direction] += variance;
-            self.measurement_spectrum_surfel_axis_alignment_sum[direction] += direction_w
-                .dot(&surfel.eigenvectors.column(direction))
-                .abs();
-        }
-        let k0_axis = surfel.eigenvectors.column(0);
-        let mut dominant_component = 0;
-        for component in 1..3 {
-            if k0_axis[component].abs() > k0_axis[dominant_component].abs() {
-                dominant_component = component;
-            }
-        }
-        self.measurement_spectrum_k0_axis_bin_count[dominant_component] += 1.0;
-        for row in 0..3 {
-            for column in 0..3 {
-                self.measurement_spectrum_k0_axis_second_moment[(row, column)] +=
-                    k0_axis[row] * k0_axis[column];
-            }
-        }
-        self.measurement_spectrum_count += 1;
-        let entry = self
-            .surfel_rotation_rhs
-            .entry(surfel.surfel_id)
-            .or_insert_with(|| SurfelRotationRhsAccumulator {
-                contributor: SurfelRotationRhsContributor {
-                    mean_w: surfel.mean_w,
-                    k0_axis_w: k0_axis.into_owned(),
-                    ..SurfelRotationRhsContributor::default()
-                },
-                residual_norm_sum: 0.0,
-                best_score_sum: 0.0,
-                second_best_score_sum: 0.0,
-            });
-        entry.contributor.sample_count += 1;
-        entry.contributor.rhs_imu += rhs_imu;
-        entry.residual_norm_sum += residual.norm();
-        entry.best_score_sum += surfel.best_score;
-        if let Some(second_best_score) = surfel.second_best_score {
-            entry.contributor.second_best_score_count += 1;
-            entry.second_best_score_sum += second_best_score;
-        }
-        let voxel_key = (
-            (surfel.mean_w[0] / ROTATION_RHS_VOXEL_SIZE_M).floor() as i32,
-            (surfel.mean_w[1] / ROTATION_RHS_VOXEL_SIZE_M).floor() as i32,
-            (surfel.mean_w[2] / ROTATION_RHS_VOXEL_SIZE_M).floor() as i32,
-        );
-        let voxel_entry = self.voxel_rotation_rhs.entry(voxel_key).or_insert_with(|| {
-            RotationRhsVoxelAccumulator {
-                contributor: RotationRhsVoxelContributor {
-                    voxel_min_w: Vec3::new(
-                        voxel_key.0 as f64 * ROTATION_RHS_VOXEL_SIZE_M,
-                        voxel_key.1 as f64 * ROTATION_RHS_VOXEL_SIZE_M,
-                        voxel_key.2 as f64 * ROTATION_RHS_VOXEL_SIZE_M,
-                    ),
-                    ..RotationRhsVoxelContributor::default()
-                },
-                residual_norm_sum: 0.0,
-                best_score_sum: 0.0,
-                second_best_score_sum: 0.0,
-            }
-        });
-        voxel_entry.contributor.sample_count += 1;
-        voxel_entry.contributor.rhs_imu += rhs_imu;
-        voxel_entry.residual_norm_sum += residual.norm();
-        voxel_entry.best_score_sum += surfel.best_score;
-        if let Some(second_best_score) = surfel.second_best_score {
-            voxel_entry.contributor.second_best_score_count += 1;
-            voxel_entry.second_best_score_sum += second_best_score;
-        }
-        Ok(())
-    }
-}
-
-impl ObservationDiagnostics {
-    pub(crate) fn from_observations(
-        input_points: usize,
-        observations: &[LinearizedObservation],
-        surfel_query: &SurfelQueryDiagnostics,
-    ) -> Self {
-        let accepted_observations = observations.len();
-        if accepted_observations == 0 {
-            return Self {
-                input_points,
-                no_association: input_points,
-                ..Self::default()
-            };
-        }
-
-        let residuals = sorted_abs_residual_rows(observations);
-        let best_scores = sorted_values(&surfel_query.best_scores);
-        let second_best_scores = sorted_values(&surfel_query.second_best_scores);
-        let score_margins = sorted_values(&surfel_query.paired_score_margins);
-        let best_over_second = sorted_values(&surfel_query.paired_best_over_second);
-        let ambiguous_fraction = if best_over_second.is_empty() {
-            0.0
-        } else {
-            best_over_second
-                .iter()
-                .filter(|ratio| **ratio >= 0.9)
-                .count() as f64
-                / best_over_second.len() as f64
-        };
-        let (rotation_information, rotation_position_information, rotation_measurement_rhs) =
-            pose_information_blocks(observations);
-        let rotation_information = (rotation_information + rotation_information.transpose()) * 0.5;
-        let rotation_eigen = rotation_information.symmetric_eigen();
-        let (rotation_eigenvalues, rotation_eigenvectors) =
-            sort_eigenpairs(rotation_eigen.eigenvalues, rotation_eigen.eigenvectors);
-        let min_eigenvalue = rotation_eigenvalues[0];
-        let max_eigenvalue = rotation_eigenvalues[2];
-        let rotation_information_condition_number =
-            if min_eigenvalue > f64::EPSILON && max_eigenvalue.is_finite() {
-                max_eigenvalue / min_eigenvalue
-            } else {
-                f64::INFINITY
-            };
-        let measurement_spectrum_rotation_trace = surfel_query.measurement_spectrum_rotation_trace;
-        let measurement_spectrum_rotation_trace_fraction = if rotation_information.trace() > 0.0 {
-            measurement_spectrum_rotation_trace / rotation_information.trace()
-        } else {
-            Vec3::zeros()
-        };
-        let measurement_spectrum_eigenvalue_mean = if surfel_query.measurement_spectrum_count > 0 {
-            surfel_query.measurement_spectrum_eigenvalue_sum
-                / surfel_query.measurement_spectrum_count as f64
-        } else {
-            Vec3::zeros()
-        };
-        let measurement_spectrum_surfel_axis_alignment =
-            if surfel_query.measurement_spectrum_count > 0 {
-                surfel_query.measurement_spectrum_surfel_axis_alignment_sum
-                    / surfel_query.measurement_spectrum_count as f64
-            } else {
-                Vec3::zeros()
-            };
-        let (
-            measurement_spectrum_k0_axis_bin_fraction,
-            measurement_spectrum_k0_axis_concentration,
-            measurement_spectrum_k0_axis_dominant_world,
-        ) = if surfel_query.measurement_spectrum_count > 0 {
-            let count = surfel_query.measurement_spectrum_count as f64;
-            let axis_moment = surfel_query.measurement_spectrum_k0_axis_second_moment / count;
-            let eigen = axis_moment.symmetric_eigen();
-            let (eigenvalues, eigenvectors) =
-                sort_eigenpairs(eigen.eigenvalues, eigen.eigenvectors);
-            (
-                surfel_query.measurement_spectrum_k0_axis_bin_count / count,
-                eigenvalues[2],
-                eigenvectors.column(2).into_owned(),
-            )
-        } else {
-            (Vec3::zeros(), 0.0, Vec3::zeros())
-        };
-        let rotation_measurement_rhs_in_information_eigenbasis =
-            rotation_eigenvectors.transpose() * rotation_measurement_rhs;
-        let mut top_rotation_rhs_surfels =
-            [SurfelRotationRhsContributor::default(); TOP_ROTATION_RHS_SURFELS];
-        let mut surfel_contributors: Vec<_> =
-            surfel_query.surfel_rotation_rhs.values().cloned().collect();
-        for accumulator in &mut surfel_contributors {
-            let count = accumulator.contributor.sample_count as f64;
-            accumulator.contributor.residual_norm_mean = accumulator.residual_norm_sum / count;
-            accumulator.contributor.best_score_mean = accumulator.best_score_sum / count;
-            accumulator.contributor.second_best_score_mean =
-                if accumulator.contributor.second_best_score_count > 0 {
-                    accumulator.second_best_score_sum
-                        / accumulator.contributor.second_best_score_count as f64
-                } else {
-                    0.0
-                };
-        }
-        surfel_contributors.sort_by(|left, right| {
-            right
-                .contributor
-                .rhs_imu
-                .norm()
-                .total_cmp(&left.contributor.rhs_imu.norm())
-        });
-        for (slot, accumulator) in surfel_contributors
-            .into_iter()
-            .take(TOP_ROTATION_RHS_SURFELS)
-            .enumerate()
-        {
-            top_rotation_rhs_surfels[slot] = accumulator.contributor;
-        }
-        let mut top_rotation_rhs_voxels =
-            [RotationRhsVoxelContributor::default(); TOP_ROTATION_RHS_VOXELS];
-        let mut voxel_contributors: Vec<_> =
-            surfel_query.voxel_rotation_rhs.values().cloned().collect();
-        for accumulator in &mut voxel_contributors {
-            let count = accumulator.contributor.sample_count as f64;
-            accumulator.contributor.residual_norm_mean = accumulator.residual_norm_sum / count;
-            accumulator.contributor.best_score_mean = accumulator.best_score_sum / count;
-            accumulator.contributor.second_best_score_mean =
-                if accumulator.contributor.second_best_score_count > 0 {
-                    accumulator.second_best_score_sum
-                        / accumulator.contributor.second_best_score_count as f64
-                } else {
-                    0.0
-                };
-        }
-        voxel_contributors.sort_by(|left, right| {
-            right
-                .contributor
-                .rhs_imu
-                .norm()
-                .total_cmp(&left.contributor.rhs_imu.norm())
-        });
-        for (slot, accumulator) in voxel_contributors
-            .into_iter()
-            .take(TOP_ROTATION_RHS_VOXELS)
-            .enumerate()
-        {
-            top_rotation_rhs_voxels[slot] = accumulator.contributor;
-        }
-
-        Self {
-            input_points,
-            accepted_observations,
-            no_association: input_points.saturating_sub(accepted_observations),
-            residual_abs_mean: mean(&residuals),
-            residual_abs_p50: percentile(&residuals, 0.50),
-            residual_abs_p90: percentile(&residuals, 0.90),
-            residual_abs_p95: percentile(&residuals, 0.95),
-            residual_abs_p99: percentile(&residuals, 0.99),
-            residual_abs_max: *residuals.last().unwrap_or(&0.0),
-            surfel_query_best_score_p50: percentile(&best_scores, 0.50),
-            surfel_query_best_score_p95: percentile(&best_scores, 0.95),
-            surfel_query_second_best_score_p50: percentile(&second_best_scores, 0.50),
-            surfel_query_second_best_score_p95: percentile(&second_best_scores, 0.95),
-            surfel_query_second_best_count: second_best_scores.len(),
-            surfel_query_score_margin_p05: percentile(&score_margins, 0.05),
-            surfel_query_score_margin_p50: percentile(&score_margins, 0.50),
-            surfel_query_best_over_second_p95: percentile(&best_over_second, 0.95),
-            surfel_query_ambiguous_fraction: ambiguous_fraction,
-            rotation_information_eigenvalues: rotation_eigenvalues,
-            rotation_information_eigenvectors: rotation_eigenvectors,
-            rotation_information_condition_number,
-            rotation_information_trace: rotation_information.trace(),
-            rotation_measurement_rhs,
-            rotation_measurement_rhs_in_information_eigenbasis,
-            rotation_measurement_rhs_world: Vec3::zeros(),
-            rotation_position_information,
-            measurement_spectrum_rotation_trace,
-            measurement_spectrum_rotation_trace_fraction,
-            measurement_spectrum_rotation_rhs: surfel_query.measurement_spectrum_rotation_rhs,
-            measurement_spectrum_eigenvalue_mean,
-            measurement_spectrum_surfel_axis_alignment,
-            measurement_spectrum_k0_axis_bin_fraction,
-            measurement_spectrum_k0_axis_concentration,
-            measurement_spectrum_k0_axis_dominant_world,
-            top_rotation_rhs_surfels,
-            top_rotation_rhs_voxels,
-        }
-    }
-}
-
-/// `nalgebra::symmetric_eigen` does not promise eigenvalue order. Keep the
-/// columns aligned while exposing an increasing spectrum in diagnostics.
-fn sort_eigenpairs(eigenvalues: Vec3<f64>, eigenvectors: Mat3<f64>) -> (Vec3<f64>, Mat3<f64>) {
-    let mut order = [0, 1, 2];
-    order.sort_by(|left, right| eigenvalues[*left].total_cmp(&eigenvalues[*right]));
-
-    let mut sorted_values = Vec3::zeros();
-    let mut sorted_vectors = Mat3::zeros();
-    for (sorted_column, original_column) in order.into_iter().enumerate() {
-        sorted_values[sorted_column] = eigenvalues[original_column];
-        sorted_vectors
-            .column_mut(sorted_column)
-            .copy_from(&eigenvectors.column(original_column));
-    }
-    (sorted_values, sorted_vectors)
-}
-
-/// Accumulate the pose blocks of the measurement information only. Surfel
-/// rows are already whitened, while legacy scalar observations retain their
-/// explicit variance.
-fn pose_information_blocks(
-    observations: &[LinearizedObservation],
-) -> (Mat3<f64>, Mat3<f64>, Vec3<f64>) {
-    let mut rotation_information = Mat3::zeros();
-    let mut rotation_position_information = Mat3::zeros();
-    let mut rotation_measurement_rhs = Vec3::zeros();
-
-    for observation in observations {
-        match observation {
-            LinearizedObservation::Plane(observation) => accumulate_pose_information_row(
-                &mut rotation_information,
-                &mut rotation_position_information,
-                &mut rotation_measurement_rhs,
-                &observation.jacobian,
-                observation.residual,
-                1.0 / observation.variance,
-            ),
-            LinearizedObservation::Line(observation) => {
-                let weight = 1.0 / observation.variance;
-                accumulate_pose_information_row(
-                    &mut rotation_information,
-                    &mut rotation_position_information,
-                    &mut rotation_measurement_rhs,
-                    &observation.jacobian0,
-                    observation.residual0,
-                    weight,
-                );
-                accumulate_pose_information_row(
-                    &mut rotation_information,
-                    &mut rotation_position_information,
-                    &mut rotation_measurement_rhs,
-                    &observation.jacobian1,
-                    observation.residual1,
-                    weight,
-                );
-            }
-            LinearizedObservation::Surfel(observation) => {
-                for row in 0..3 {
-                    for rotation_col in 0..3 {
-                        for position_col in 0..3 {
-                            rotation_information[(rotation_col, position_col)] += observation
-                                .jacobian[(row, rotation_col)]
-                                * observation.jacobian[(row, position_col)];
-                            rotation_position_information[(rotation_col, position_col)] +=
-                                observation.jacobian[(row, rotation_col)]
-                                    * observation.jacobian[(row, position_col + 3)];
-                        }
-                        rotation_measurement_rhs[rotation_col] -=
-                            observation.jacobian[(row, rotation_col)] * observation.residual[row];
-                    }
-                }
-            }
-        }
-    }
-
-    (
-        rotation_information,
-        rotation_position_information,
-        rotation_measurement_rhs,
-    )
-}
-
-fn accumulate_pose_information_row(
-    rotation_information: &mut Mat3<f64>,
-    rotation_position_information: &mut Mat3<f64>,
-    rotation_measurement_rhs: &mut Vec3<f64>,
-    jacobian: &SVector<f64, 23>,
-    residual: f64,
-    weight: f64,
-) {
-    if !weight.is_finite() || weight <= 0.0 {
-        return;
-    }
-    for rotation_col in 0..3 {
-        for position_col in 0..3 {
-            rotation_information[(rotation_col, position_col)] +=
-                weight * jacobian[rotation_col] * jacobian[position_col];
-            rotation_position_information[(rotation_col, position_col)] +=
-                weight * jacobian[rotation_col] * jacobian[position_col + 3];
-        }
-        rotation_measurement_rhs[rotation_col] -= weight * jacobian[rotation_col] * residual;
-    }
-}
-
-fn sorted_values(values: &[f64]) -> Vec<f64> {
-    let mut values = values
-        .iter()
-        .copied()
-        .filter(|value| value.is_finite())
-        .collect::<Vec<_>>();
-    values.sort_by(f64::total_cmp);
-    values
-}
-
-fn sorted_abs_residual_rows(observations: &[LinearizedObservation]) -> Vec<f64> {
-    let mut values = Vec::new();
-    for observation in observations {
-        match observation {
-            LinearizedObservation::Plane(observation) => {
-                values.push(observation.residual.abs());
-            }
-            LinearizedObservation::Line(observation) => {
-                values.push(observation.residual0.abs());
-                values.push(observation.residual1.abs());
-            }
-            LinearizedObservation::Surfel(observation) => {
-                values.push(observation.residual.x.abs());
-                values.push(observation.residual.y.abs());
-                values.push(observation.residual.z.abs());
-            }
-        }
-    }
-    values.retain(|value| value.is_finite());
-    values.sort_by(f64::total_cmp);
-    values
-}
-
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
-}
-
-fn percentile(values: &[f64], p: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let index = ((values.len() - 1) as f64 * p).round() as usize;
-    values[index]
 }
 
 /// Configuration for the current 23D error-state IEKF update.
@@ -704,23 +35,9 @@ pub struct IekfConfig {
     /// Geometry-independent association covariance in the LiDAR frame `L`,
     /// expressed in square meters.
     pub association_point_covariance_l: Mat3<f64>,
-    /// Extra association standard deviation along a planar surfel normal.
-    pub association_plane_normal_stddev: f64,
-    /// Extra association standard deviation along each line surfel's two
-    /// transverse directions.
-    pub association_line_normal_stddev: f64,
-    /// Candidate ranking policy after the Mahalanobis compatibility gate.
-    pub association_rank_mode: SurfelRankMode,
     /// Raw LiDAR point measurement covariance in the LiDAR frame `L`, used
     /// only to whiten the IEKF update and expressed in square meters.
     pub measurement_point_covariance_l: Mat3<f64>,
-    /// Measurement-rank policy after correspondence. This never changes map
-    /// query, compatibility gating, or candidate ranking.
-    pub measurement_spectrum_mode: SurfelMeasurementSpectrumMode,
-    pub measurement_variance_floor: f64,
-    // TODO(iekf): either wire a real robust kernel into the information build
-    // or remove this from the public config before pipeline integration.
-    pub huber_delta: Option<f64>,
     pub min_observations: usize,
 }
 
@@ -731,15 +48,7 @@ impl Default for IekfConfig {
             min_delta_norm: 1.0e-6,
             damping: 1.0e-6,
             association_point_covariance_l: Mat3::identity() * 0.03_f64.powi(2),
-            association_plane_normal_stddev: 0.3,
-            association_line_normal_stddev: 0.3,
-            association_rank_mode: SurfelRankMode::Combined {
-                centroid_distance_weight: 0.25,
-            },
             measurement_point_covariance_l: Mat3::identity() * 0.03_f64.powi(2),
-            measurement_spectrum_mode: SurfelMeasurementSpectrumMode::FullRank,
-            measurement_variance_floor: 1.0e-6,
-            huber_delta: Some(0.1),
             min_observations: 0,
         }
     }
@@ -751,20 +60,13 @@ pub(crate) fn build_surfel_observation(
     map: &SurfelMap,
     extrinsic: &LidarImuExtrinsic,
     config: &IekfConfig,
-    collect_detailed_diagnostics: bool,
     out: &mut Vec<LinearizedObservation>,
-) -> Result<SurfelQueryDiagnostics, IekfUpdateError> {
+) -> Result<(), IekfUpdateError> {
     out.clear();
     let association_point_covariance_w =
         point_covariance_w(state, extrinsic, &config.association_point_covariance_l);
-    let association_covariance = SurfelAssociationCovariance {
-        point_covariance_w: association_point_covariance_w,
-        plane_normal_variance: config.association_plane_normal_stddev.powi(2),
-        line_normal_variance: config.association_line_normal_stddev.powi(2),
-    };
     let measurement_point_covariance_w =
         point_covariance_w(state, extrinsic, &config.measurement_point_covariance_l);
-    let mut diagnostics = SurfelQueryDiagnostics::default();
     for point in points {
         let point_i = extrinsic.transform_point(&point.to_vec3_f64());
         let point_w_vec = transform_point(state, &point_i);
@@ -782,36 +84,16 @@ pub(crate) fn build_surfel_observation(
         };
 
         let observation = map
-            .query_surfel(
-                &point_w,
-                association_covariance,
-                config.association_rank_mode,
-            )
+            .query_surfel(&point_w, association_point_covariance_w)
             .map_err(|e| IekfUpdateError::MapQueryFailed {
                 context: e.to_string(),
             })?;
         if let Some(obs) = observation {
-            if collect_detailed_diagnostics {
-                diagnostics.record_match_scores(obs.best_score, obs.second_best_score);
-            }
             let measurement_covariance = obs.covariance_w + measurement_point_covariance_w;
             let jacobian = linearized_point_to_surfel_observation(state, &point_i, &obs);
             let residual = point_w_vec - obs.mean_w;
-            let (whiten_residual, whiten_jacobian, attenuation) = whiten_surfel_measurement(
-                &measurement_covariance,
-                &residual,
-                &jacobian,
-                config.measurement_spectrum_mode,
-            )?;
-            if collect_detailed_diagnostics {
-                diagnostics.record_measurement_spectrum(
-                    &measurement_covariance,
-                    &jacobian,
-                    &residual,
-                    &obs,
-                    &attenuation,
-                )?;
-            }
+            let (whiten_residual, whiten_jacobian) =
+                whiten_surfel_measurement(&measurement_covariance, &residual, &jacobian)?;
             let surfel_linearized_observation = SurfelLinearizedObservation {
                 residual: whiten_residual,
                 jacobian: whiten_jacobian,
@@ -819,67 +101,26 @@ pub(crate) fn build_surfel_observation(
             out.push(LinearizedObservation::Surfel(surfel_linearized_observation));
         }
     }
-    Ok(diagnostics)
+    Ok(())
 }
 
-/// Whiten one associated surfel residual. The truncation branch uses the
-/// actual measurement covariance spectrum, so a retained row has information
-/// weight `1 / gamma_k` and a discarded row has exactly zero information.
+/// Whiten one associated surfel residual using its full measurement covariance.
 fn whiten_surfel_measurement(
     measurement_covariance: &Mat3<f64>,
     residual: &Vec3<f64>,
     jacobian: &SMatrix<f64, 3, 23>,
-    spectrum_mode: SurfelMeasurementSpectrumMode,
-) -> Result<(Vec3<f64>, SMatrix<f64, 3, 23>, Vec3<f64>), IekfUpdateError> {
-    match spectrum_mode {
-        SurfelMeasurementSpectrumMode::FullRank => {
-            let measurement_chol = measurement_covariance
-                .cholesky()
-                .ok_or(IekfUpdateError::NotSpd)?;
-            let l = measurement_chol.l();
-            let whiten_residual = l
-                .solve_lower_triangular(residual)
-                .ok_or(IekfUpdateError::SolveFailed)?;
-            let whiten_jacobian = l
-                .solve_lower_triangular(jacobian)
-                .ok_or(IekfUpdateError::SolveFailed)?;
-            Ok((whiten_residual, whiten_jacobian, Vec3::repeat(1.0)))
-        }
-        SurfelMeasurementSpectrumMode::HardTruncation { max_variance_ratio } => {
-            if !max_variance_ratio.is_finite() || max_variance_ratio <= 1.0 {
-                return Err(IekfUpdateError::InvalidInput);
-            }
-            let eigen = measurement_covariance.symmetric_eigen();
-            let (eigenvalues, eigenvectors) =
-                sort_eigenpairs(eigen.eigenvalues, eigen.eigenvectors);
-            let min_variance = eigenvalues[0];
-            if !min_variance.is_finite() || min_variance <= 0.0 {
-                return Err(IekfUpdateError::NotSpd);
-            }
-
-            let mut whiten_residual = Vec3::zeros();
-            let mut whiten_jacobian = SMatrix::<f64, 3, 23>::zeros();
-            let mut attenuation = Vec3::zeros();
-            for direction in 0..3 {
-                let variance = eigenvalues[direction];
-                if !variance.is_finite() || variance <= 0.0 {
-                    return Err(IekfUpdateError::NotSpd);
-                }
-                if variance / min_variance >= max_variance_ratio {
-                    continue;
-                }
-                attenuation[direction] = 1.0;
-                let scale = variance.sqrt().recip();
-                let direction_w = eigenvectors.column(direction);
-                whiten_residual[direction] = scale * direction_w.dot(residual);
-                for column in 0..23 {
-                    whiten_jacobian[(direction, column)] =
-                        scale * direction_w.dot(&jacobian.column(column));
-                }
-            }
-            Ok((whiten_residual, whiten_jacobian, attenuation))
-        }
-    }
+) -> Result<(Vec3<f64>, SMatrix<f64, 3, 23>), IekfUpdateError> {
+    let measurement_chol = measurement_covariance
+        .cholesky()
+        .ok_or(IekfUpdateError::NotSpd)?;
+    let l = measurement_chol.l();
+    let whiten_residual = l
+        .solve_lower_triangular(residual)
+        .ok_or(IekfUpdateError::SolveFailed)?;
+    let whiten_jacobian = l
+        .solve_lower_triangular(jacobian)
+        .ok_or(IekfUpdateError::SolveFailed)?;
+    Ok((whiten_residual, whiten_jacobian))
 }
 
 pub(crate) fn point_covariance_w(
@@ -891,98 +132,6 @@ pub(crate) fn point_covariance_w(
     let r_li = extrinsic.rotation.to_rotation_matrix();
     let r_wl = r_wi.matrix() * r_li.matrix();
     r_wl * point_covariance_l * r_wl.transpose()
-}
-
-pub(crate) fn build_class_observations(
-    state: &NavState,
-    points: &[PointXYZI],
-    map: &SurfelMap,
-    extrinsic: &LidarImuExtrinsic,
-    config: &IekfConfig,
-    out: &mut Vec<LinearizedObservation>,
-) -> Result<(), IekfUpdateError> {
-    out.clear();
-    for point in points {
-        let point_i = extrinsic.transform_point(&point.to_vec3_f64());
-        let point_w_vec = transform_point(state, &point_i);
-        let point_w = PointXYZI {
-            x: point_w_vec.x as f32,
-            y: point_w_vec.y as f32,
-            z: point_w_vec.z as f32,
-            intensity: point.intensity,
-        };
-        let point_i = PointXYZI {
-            x: point_i.x as f32,
-            y: point_i.y as f32,
-            z: point_i.z as f32,
-            intensity: point.intensity,
-        };
-
-        let plane_observation =
-            map.query_plane(&point_w)
-                .map_err(|e| IekfUpdateError::MapQueryFailed {
-                    context: e.to_string(),
-                })?;
-        if let Some(plane_observation) = plane_observation {
-            out.push(LinearizedObservation::Plane(
-                build_plane_linearized_observation(state, &point_i, &plane_observation, config),
-            ));
-        } else if let Some(line_observation) =
-            map.query_line(&point_w)
-                .map_err(|e| IekfUpdateError::MapQueryFailed {
-                    context: e.to_string(),
-                })?
-        {
-            out.push(LinearizedObservation::Line(
-                build_line_linearized_observation(state, &point_i, &line_observation, config),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn build_plane_linearized_observation(
-    state: &NavState,
-    point_i: &PointXYZI,
-    surfel_observation: &SurfelPlaneObservation,
-    config: &IekfConfig,
-) -> PlaneLinearizedObservation {
-    let jacobian = linearize_point_to_plane_observation(state, point_i, surfel_observation);
-    let residual = surfel_observation.signed_residual;
-    let variance = build_variance(surfel_observation, config);
-    PlaneLinearizedObservation {
-        jacobian,
-        residual,
-        variance,
-    }
-}
-
-fn build_line_linearized_observation(
-    state: &NavState,
-    point_i: &PointXYZI,
-    surfel_line_observation: &SurfelLineObservation,
-    config: &IekfConfig,
-) -> LineLinearizedObservation {
-    let (jacobian0, jacobian1) =
-        linearize_point_to_line_observation(state, point_i, surfel_line_observation);
-    LineLinearizedObservation {
-        residual0: surfel_line_observation.residual0,
-        residual1: surfel_line_observation.residual1,
-        jacobian0,
-        jacobian1,
-        variance: build_line_variance(surfel_line_observation, config),
-        distance: surfel_line_observation.distance,
-    }
-}
-
-fn build_line_variance(obs: &SurfelLineObservation, config: &IekfConfig) -> f64 {
-    let min_eigenvalue = obs.eigenvalues[1].max(1.0e-3);
-    min_eigenvalue.max(config.measurement_variance_floor)
-}
-
-pub(crate) fn build_variance(obs: &SurfelPlaneObservation, config: &IekfConfig) -> f64 {
-    let min_eigenvalue = obs.eigenvalues[0].max(1.0e-3);
-    min_eigenvalue.max(config.measurement_variance_floor)
 }
 
 pub(crate) fn transform_point(state: &NavState, point: &Vec3<f64>) -> Vec3<f64> {
@@ -1046,22 +195,6 @@ fn prior_error_jacobian(
     jacobian
 }
 
-fn accumulate_row(
-    information: &mut SMatrix<f64, 23, 23>,
-    rhs: &mut SVector<f64, 23>,
-    h: SVector<f64, 23>,
-    residual: f64,
-    variance: f64,
-) -> Result<(), IekfUpdateError> {
-    if !residual.is_finite() || !variance.is_finite() || variance <= 0.0 {
-        return Err(IekfUpdateError::InvalidObservation);
-    }
-    let w = 1.0 / variance;
-    *information += h * w * h.transpose();
-    *rhs -= h * w * residual;
-    Ok(())
-}
-
 fn accumulate_whitened<const M: usize>(
     information: &mut SMatrix<f64, 23, 23>,
     rhs: &mut SVector<f64, 23>,
@@ -1107,36 +240,13 @@ pub(crate) fn linear_update(
     let mut rhs = -a_prior.transpose() * b_prior;
 
     for obs in observations {
-        match obs {
-            LinearizedObservation::Plane(o) => {
-                accumulate_row(
-                    &mut information,
-                    &mut rhs,
-                    o.jacobian,
-                    o.residual,
-                    o.variance,
-                )?;
-            }
-            LinearizedObservation::Line(o) => {
-                accumulate_row(
-                    &mut information,
-                    &mut rhs,
-                    o.jacobian0,
-                    o.residual0,
-                    o.variance,
-                )?;
-                accumulate_row(
-                    &mut information,
-                    &mut rhs,
-                    o.jacobian1,
-                    o.residual1,
-                    o.variance,
-                )?;
-            }
-            LinearizedObservation::Surfel(o) => {
-                accumulate_whitened(&mut information, &mut rhs, &o.jacobian, &o.residual)?;
-            }
-        }
+        let LinearizedObservation::Surfel(observation) = obs;
+        accumulate_whitened(
+            &mut information,
+            &mut rhs,
+            &observation.jacobian,
+            &observation.residual,
+        )?;
     }
 
     let chol = symmetric(&information)
@@ -1150,24 +260,6 @@ pub(crate) fn linear_update(
 pub(crate) fn symmetric(covariance: &SMatrix<f64, 23, 23>) -> SMatrix<f64, 23, 23> {
     (covariance.transpose() + covariance) / 2.0
 }
-
-// reserved
-// fn huber_weight(residual: f64, huber_delta: Option<f64>) -> f64 {
-//     let Some(huber_delta) = huber_delta else {
-//         return 1.0;
-//     };
-
-//     if huber_delta <= 0.0 {
-//         return 1.0;
-//     }
-
-//     let abs_residual = residual.abs();
-//     if abs_residual <= huber_delta {
-//         1.0
-//     } else {
-//         huber_delta / abs_residual
-//     }
-// }
 
 #[cfg(test)]
 mod tests {
@@ -1193,126 +285,9 @@ mod tests {
     fn config_with_zero_damping() -> IekfConfig {
         IekfConfig {
             damping: 0.0,
-            measurement_variance_floor: 1e-12,
             min_observations: 1,
             ..IekfConfig::default()
         }
-    }
-
-    #[test]
-    fn surfel_query_diagnostics_keep_best_second_pairs_together() {
-        let mut query = SurfelQueryDiagnostics::default();
-        query.record_match_scores(1.0, Some(1.0));
-        query.record_match_scores(2.0, Some(4.0));
-        query.record_match_scores(3.0, Some(6.0));
-        query.record_match_scores(0.5, None);
-
-        let observations = [position_z_observation(0.0, 1.0)];
-        let diagnostics = ObservationDiagnostics::from_observations(4, &observations, &query);
-
-        assert_eq!(diagnostics.surfel_query_second_best_count, 3);
-        assert!((diagnostics.surfel_query_score_margin_p05 - 0.0).abs() < TOL);
-        assert!((diagnostics.surfel_query_score_margin_p50 - 2.0).abs() < TOL);
-        assert!((diagnostics.surfel_query_best_over_second_p95 - 1.0).abs() < TOL);
-        assert!((diagnostics.surfel_query_ambiguous_fraction - 1.0 / 3.0).abs() < TOL);
-    }
-
-    #[test]
-    fn pose_information_uses_whitened_surfel_pose_blocks() {
-        let mut jacobian = SMatrix::<f64, 3, 23>::zeros();
-        jacobian[(0, 0)] = 1.0;
-        jacobian[(1, 1)] = 2.0;
-        jacobian[(2, 2)] = 3.0;
-        jacobian[(0, 3)] = 1.0;
-        jacobian[(1, 4)] = 1.0;
-        jacobian[(2, 5)] = 1.0;
-        let observations = [LinearizedObservation::Surfel(SurfelLinearizedObservation {
-            residual: Vec3::zeros(),
-            jacobian,
-        })];
-
-        let diagnostics = ObservationDiagnostics::from_observations(
-            1,
-            &observations,
-            &SurfelQueryDiagnostics::default(),
-        );
-
-        assert!(
-            (diagnostics.rotation_information_eigenvalues - Vec3::new(1.0, 4.0, 9.0)).norm() < TOL
-        );
-        assert!(
-            (diagnostics.rotation_position_information
-                - Mat3::from_diagonal(&Vec3::new(1.0, 2.0, 3.0)))
-            .norm()
-                < TOL
-        );
-        assert!((diagnostics.rotation_information_trace - 14.0).abs() < TOL);
-        assert!((diagnostics.rotation_information_condition_number - 9.0).abs() < TOL);
-    }
-
-    #[test]
-    fn measurement_spectrum_decomposes_rotation_information_by_covariance_direction() {
-        let mut jacobian = SMatrix::<f64, 3, 23>::zeros();
-        jacobian[(0, 0)] = 1.0;
-        jacobian[(1, 1)] = 2.0;
-        jacobian[(2, 2)] = 3.0;
-        let covariance = Mat3::from_diagonal(&Vec3::new(1.0, 4.0, 9.0));
-        let mut diagnostics = SurfelQueryDiagnostics::default();
-        let surfel = SurfelObservation {
-            surfel_id: SurfelID::default(),
-            mean_w: Vec3::zeros(),
-            covariance_w: covariance,
-            eigenvectors: Mat3::identity(),
-            eigenvalues: Vec3::new(1.0, 4.0, 9.0),
-            best_score: 0.0,
-            second_best_score: None,
-        };
-
-        diagnostics
-            .record_measurement_spectrum(
-                &covariance,
-                &jacobian,
-                &Vec3::new(1.0, 2.0, 3.0),
-                &surfel,
-                &Vec3::repeat(1.0),
-            )
-            .unwrap();
-
-        assert!((diagnostics.measurement_spectrum_rotation_trace - Vec3::repeat(1.0)).norm() < TOL);
-        assert!(
-            (diagnostics.measurement_spectrum_eigenvalue_sum - Vec3::new(1.0, 4.0, 9.0)).norm()
-                < TOL
-        );
-        assert!(
-            (diagnostics.measurement_spectrum_surfel_axis_alignment_sum - Vec3::repeat(1.0)).norm()
-                < TOL
-        );
-        assert!((diagnostics.measurement_spectrum_rotation_rhs + Mat3::identity()).norm() < TOL);
-    }
-
-    #[test]
-    fn hard_spectrum_truncation_discards_high_variance_rows() {
-        let covariance = Mat3::from_diagonal(&Vec3::new(1.0, 10.0, 20.0));
-        let residual = Vec3::new(1.0, 2.0, 3.0);
-        let mut jacobian = SMatrix::<f64, 3, 23>::zeros();
-        jacobian[(0, 0)] = 1.0;
-        jacobian[(1, 1)] = 1.0;
-        jacobian[(2, 2)] = 1.0;
-
-        let (whiten_residual, whiten_jacobian, attenuation) = whiten_surfel_measurement(
-            &covariance,
-            &residual,
-            &jacobian,
-            SurfelMeasurementSpectrumMode::HardTruncation {
-                max_variance_ratio: 5.0,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(attenuation, Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(whiten_residual, Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(whiten_jacobian[(0, 0)], 1.0);
-        assert_eq!(whiten_jacobian.fixed_rows::<2>(1).norm(), 0.0);
     }
 
     #[test]
@@ -1340,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn association_and_measurement_covariances_have_separate_effects() {
+    fn measurement_covariance_changes_whitened_residual() {
         let map_config = SurfelMapConfig {
             voxel_size: 1.0,
             search_radius: 2,
@@ -1387,62 +362,40 @@ mod tests {
             intensity: 0.0,
         }];
         let base = IekfConfig {
-            association_plane_normal_stddev: 0.15,
+            association_point_covariance_l: Mat3::identity() * 0.15_f64.powi(2),
             measurement_point_covariance_l: Mat3::identity() * 0.03_f64.powi(2),
             ..IekfConfig::default()
         };
 
-        let mut narrow_association = base;
-        narrow_association.association_plane_normal_stddev = 0.01;
-        let mut rejected = Vec::new();
-        let rejected_diagnostics = build_surfel_observation(
-            &state,
-            &points,
-            &map,
-            &extrinsic,
-            &narrow_association,
-            true,
-            &mut rejected,
-        )
-        .unwrap();
-        assert!(rejected.is_empty());
-        assert!(rejected_diagnostics.best_scores.is_empty());
-
         let mut narrow_measurement = Vec::new();
-        let narrow_diagnostics = build_surfel_observation(
+        build_surfel_observation(
             &state,
             &points,
             &map,
             &extrinsic,
             &base,
-            true,
             &mut narrow_measurement,
         )
         .unwrap();
-        assert_eq!(narrow_diagnostics.best_scores.len(), 1);
+        assert_eq!(narrow_measurement.len(), 1);
 
         let mut wide_measurement_config = base;
         wide_measurement_config.measurement_point_covariance_l =
             Mat3::identity() * 0.15_f64.powi(2);
         let mut wide_measurement = Vec::new();
-        let wide_diagnostics = build_surfel_observation(
+        build_surfel_observation(
             &state,
             &points,
             &map,
             &extrinsic,
             &wide_measurement_config,
-            true,
             &mut wide_measurement,
         )
         .unwrap();
-        assert_eq!(wide_diagnostics.best_scores.len(), 1);
+        assert_eq!(wide_measurement.len(), 1);
 
-        let LinearizedObservation::Surfel(narrow) = &narrow_measurement[0] else {
-            panic!("expected point-to-surfel observation");
-        };
-        let LinearizedObservation::Surfel(wide) = &wide_measurement[0] else {
-            panic!("expected point-to-surfel observation");
-        };
+        let LinearizedObservation::Surfel(narrow) = &narrow_measurement[0];
+        let LinearizedObservation::Surfel(wide) = &wide_measurement[0];
         assert!(wide.residual.norm() < narrow.residual.norm());
     }
 
@@ -1458,13 +411,12 @@ mod tests {
     }
 
     fn position_z_observation(residual: f64, variance: f64) -> LinearizedObservation {
-        // Jacobian selects only the position-z error state column (index 5).
-        let mut h = SVector::<f64, 23>::zeros();
-        h[5] = 1.0;
-        LinearizedObservation::Plane(PlaneLinearizedObservation {
-            residual,
-            jacobian: h,
-            variance,
+        let scale = variance.sqrt().recip();
+        let mut jacobian = SMatrix::<f64, 3, 23>::zeros();
+        jacobian[(0, 5)] = scale;
+        LinearizedObservation::Surfel(SurfelLinearizedObservation {
+            residual: Vec3::new(scale * residual, 0.0, 0.0),
+            jacobian,
         })
     }
 
@@ -1935,51 +887,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // 9. Non-positive measurement variance must be rejected (not silently
-    //    produce a non-sensical update).
-    // ---------------------------------------------------------------
-    #[test]
-    fn linear_update_rejects_zero_or_negative_variance() {
-        let state = make_state();
-        let state_iter = state.clone();
-        // Large prior variance so that a negative weight drives the information
-        // matrix indefinite.
-        let covariance = diagonal_covariance(1e-4, &[(5, 4.0)]);
-        let config = config_with_zero_damping();
-
-        let zero_var = vec![position_z_observation(0.5, 0.0)];
-        let negative_var = vec![position_z_observation(0.5, -1.0)];
-        let gravity_basis = fastlio_types::gravity_tangent_basis(&state.gravity);
-
-        assert!(
-            linear_update(
-                &state,
-                &gravity_basis,
-                &gravity_basis,
-                &state_iter,
-                &covariance,
-                &zero_var,
-                &config
-            )
-            .is_err(),
-            "zero measurement variance must be rejected"
-        );
-        assert!(
-            linear_update(
-                &state,
-                &gravity_basis,
-                &gravity_basis,
-                &state_iter,
-                &covariance,
-                &negative_var,
-                &config
-            )
-            .is_err(),
-            "negative measurement variance must be rejected"
-        );
-    }
-
-    // ---------------------------------------------------------------
     // 10. IEKF end-to-end: a pose error that is too large for a single
     //     linearized step must still converge because observations (residual
     //     and Jacobian) are rebuilt from the iterated state.
@@ -2043,7 +950,6 @@ mod tests {
         let config = IekfConfig {
             max_iterations: 1,
             damping: 1e-6,
-            measurement_variance_floor: 1e-4,
             // Test plane supplies only 16 body points; the pipeline default of
             // 400 observations can never be reached here.
             min_observations: 1,

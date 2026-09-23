@@ -1,10 +1,7 @@
 use anyhow::{Result, anyhow};
-use fastlio_estimator::{
-    iekf::IekfState,
-    optimizer::{IekfConfig, ObservationDiagnostics, SurfelMeasurementSpectrumMode},
-};
+use fastlio_estimator::{iekf::IekfState, optimizer::IekfConfig};
 use fastlio_imu::ImuIntegrator;
-use fastlio_map::surfel::{SurfelMap, SurfelRankMode};
+use fastlio_map::surfel::SurfelMap;
 use fastlio_pointcloud::preprocess::preprocess;
 use fastlio_types::{
     Config, ImuSample, LidarImuExtrinsic, MeasureGroup, PointXYZI, Vec3, gravity_tangent_basis,
@@ -102,25 +99,9 @@ impl ImuInitializer {
     }
 }
 
-// TODO(pipeline): report bootstrap/tracking-lost mode, effective observations,
-// map size, and per-stage timings.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineFrameSummary {
     pub tracking: bool,
-    pub iekf_iterations: usize,
-    pub iekf_observations_first: usize,
-    pub iekf_observations_last: usize,
-    pub iekf_mean_abs_residual: f64,
-    pub iekf_max_abs_residual: f64,
-    pub first_observation_diagnostics: ObservationDiagnostics,
-    pub observation_diagnostics: ObservationDiagnostics,
-    pub iekf_total_rotation_correction_imu: Vec3<f64>,
-    pub iekf_total_rotation_correction_world: Vec3<f64>,
-    pub iekf_final_rotation_delta_norm: f64,
-    pub iekf_final_position_delta_norm: f64,
-    pub iekf_final_velocity_delta_norm: f64,
-    pub iekf_final_accel_bias_delta_norm: f64,
-    pub iekf_final_gravity_delta_norm: f64,
 }
 
 /// Patch `group_imu` so that its first and last samples coincide with the
@@ -231,20 +212,6 @@ impl MainPipeline {
         }
     }
 
-    /// Overrides the scan-to-map candidate ranking policy for replay AB runs.
-    pub fn set_surfel_rank_mode(&mut self, rank_mode: SurfelRankMode) {
-        self.iekf_config.association_rank_mode = rank_mode;
-    }
-
-    /// Overrides only the measurement-rank policy after a surfel has already
-    /// been associated with a scan point.
-    pub fn set_surfel_measurement_spectrum_mode(
-        &mut self,
-        spectrum_mode: SurfelMeasurementSpectrumMode,
-    ) {
-        self.iekf_config.measurement_spectrum_mode = spectrum_mode;
-    }
-
     pub fn process_measure_group(
         &mut self,
         mut group: MeasureGroup,
@@ -320,25 +287,8 @@ impl MainPipeline {
         deskew(&mut group.lidar, &segments, &self.extrinsic)?;
         let pointcloud = preprocess(&self.config.preprocess, group.lidar)?;
 
-        let (
-            tracking,
-            iekf_iterations,
-            iekf_observations_first,
-            iekf_observations_last,
-            iekf_mean_abs_residual,
-            iekf_max_abs_residual,
-            first_observation_diagnostics,
-            observation_diagnostics,
-            iekf_total_rotation_correction_imu,
-            iekf_total_rotation_correction_world,
-            iekf_final_rotation_delta_norm,
-            iekf_final_position_delta_norm,
-            iekf_final_velocity_delta_norm,
-            iekf_final_accel_bias_delta_norm,
-            iekf_final_gravity_delta_norm,
-        ) = if !self.map.is_empty() {
-            let iekf_summary = self
-                .filter
+        let tracking = if !self.map.is_empty() {
+            self.filter
                 .update(
                     &pointcloud.point_cloud,
                     &self.extrinsic,
@@ -346,53 +296,9 @@ impl MainPipeline {
                     &self.iekf_config,
                 )
                 .map_err(|e| anyhow!("IekfUpdateError: {:?}", e))?;
-
-            if self.config.common.debug_mode {
-                eprintln!("{:?}", iekf_summary);
-            }
-            (
-                true,
-                iekf_summary.iterations,
-                iekf_summary.observations.first().copied().unwrap_or(0),
-                iekf_summary.observations.last().copied().unwrap_or(0),
-                iekf_summary.mean_abs_residual,
-                iekf_summary.max_abs_residual,
-                iekf_summary.first_observation_diagnostics,
-                iekf_summary.observation_diagnostics,
-                iekf_summary.total_rotation_correction_imu,
-                iekf_summary.total_rotation_correction_world,
-                iekf_summary.final_rotation_delta_norm,
-                iekf_summary.final_position_delta_norm,
-                iekf_summary.final_velocity_delta_norm,
-                iekf_summary.final_accel_bias_delta_norm,
-                iekf_summary.final_gravity_delta_norm,
-            )
+            true
         } else {
-            (
-                false,
-                0,
-                0,
-                0,
-                0.0,
-                0.0,
-                ObservationDiagnostics {
-                    input_points: pointcloud.point_cloud.len(),
-                    no_association: pointcloud.point_cloud.len(),
-                    ..ObservationDiagnostics::default()
-                },
-                ObservationDiagnostics {
-                    input_points: pointcloud.point_cloud.len(),
-                    no_association: pointcloud.point_cloud.len(),
-                    ..ObservationDiagnostics::default()
-                },
-                Vec3::zeros(),
-                Vec3::zeros(),
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            )
+            false
         };
 
         let map_points = pointcloud.point_cloud.iter().map(|p| {
@@ -408,23 +314,7 @@ impl MainPipeline {
 
         self.map.insert(map_points)?;
 
-        Ok(PipelineFrameSummary {
-            tracking,
-            iekf_iterations,
-            iekf_observations_first,
-            iekf_observations_last,
-            iekf_mean_abs_residual,
-            iekf_max_abs_residual,
-            first_observation_diagnostics,
-            observation_diagnostics,
-            iekf_total_rotation_correction_imu,
-            iekf_total_rotation_correction_world,
-            iekf_final_rotation_delta_norm,
-            iekf_final_position_delta_norm,
-            iekf_final_velocity_delta_norm,
-            iekf_final_accel_bias_delta_norm,
-            iekf_final_gravity_delta_norm,
-        })
+        Ok(PipelineFrameSummary { tracking })
     }
 }
 
@@ -648,8 +538,8 @@ mod tests {
                 1e-15
             ));
         }
-        assert!(approx_eq(covariance[(15, 15)], 1.0e-6, 1e-15));
-        assert!(approx_eq(covariance[(16, 16)], 1.0e-6, 1e-15));
+        assert!(approx_eq(covariance[(15, 15)], 1.0e-5, 1e-15));
+        assert!(approx_eq(covariance[(16, 16)], 1.0e-5, 1e-15));
 
         for index in 17..23 {
             assert!(approx_eq(covariance[(index, index)], 1.0e-5, 1e-15));
