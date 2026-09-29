@@ -123,7 +123,9 @@ impl Surfel {
 
     pub fn support_aabb_extent(&self, config: &SurfelConfig) -> Vec3<f64> {
         let support_sigma = config.max_mahalanobis_distance as f64;
-        let covariance_floor = config.covariance_eigenvalue_floor as f64;
+        let covariance_floor = config
+            .insertion_covariance_eigenvalue_floor
+            .unwrap_or(config.covariance_eigenvalue_floor) as f64;
         let lambda_0 = support_sigma * support_sigma * self.eigenvalues[0].max(covariance_floor);
         let lambda_1 = support_sigma * support_sigma * self.eigenvalues[1].max(covariance_floor);
         let lambda_2 = support_sigma * support_sigma * self.eigenvalues[2].max(covariance_floor);
@@ -140,22 +142,58 @@ impl Surfel {
     }
 
     pub fn mahalanobis_squared(&self, point: &PointXYZI, config: &SurfelConfig) -> f32 {
+        self.mahalanobis_squared_with_floor(point, config.covariance_eigenvalue_floor as f64) as f32
+    }
+
+    pub fn insertion_mahalanobis_squared(&self, point: &PointXYZI, config: &SurfelConfig) -> f32 {
+        self.mahalanobis_squared_with_floor(
+            point,
+            config
+                .insertion_covariance_eigenvalue_floor
+                .unwrap_or(config.covariance_eigenvalue_floor) as f64,
+        ) as f32
+    }
+
+    fn mahalanobis_squared_with_floor(&self, point: &PointXYZI, covariance_floor: f64) -> f64 {
         let delta = point.to_vec3().cast::<f64>() - self.mean_w;
         let d0 = self.eigenvectors.column(0).dot(&delta);
         let d1 = self.eigenvectors.column(1).dot(&delta);
         let d2 = self.eigenvectors.column(2).dot(&delta);
 
-        let covariance_floor = config.covariance_eigenvalue_floor as f64;
         let l0 = self.eigenvalues[0].max(covariance_floor);
         let l1 = self.eigenvalues[1].max(covariance_floor);
         let l2 = self.eigenvalues[2].max(covariance_floor);
 
-        (d0 * d0 / l0 + d1 * d1 / l1 + d2 * d2 / l2) as f32
+        d0 * d0 / l0 + d1 * d1 / l1 + d2 * d2 / l2
     }
 
     pub fn within_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
         let support_sigma = config.max_mahalanobis_distance;
         self.mahalanobis_squared(point, config) <= support_sigma * support_sigma
+    }
+
+    pub fn within_insertion_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {
+        let sigma = config.max_mahalanobis_distance;
+        self.insertion_mahalanobis_squared(point, config) <= sigma * sigma
+    }
+
+    pub(crate) fn surfel_rank_score(&self, point: &PointXYZI, _config: &SurfelConfig) -> f64 {
+        (point.to_vec3_f64() - self.mean_w).norm_squared()
+    }
+
+    pub(crate) fn surfel_gate_score(
+        &self,
+        point: &PointXYZI,
+        association_covariance_w: &Mat3<f64>,
+        config: &SurfelConfig,
+    ) -> Option<f64> {
+        let floor = config.association_covariance_eigenvalue_floor as f64;
+        let local = self.eigenvectors.transpose() * (point.to_vec3_f64() - self.mean_w);
+        let shape = Mat3::from_diagonal(&self.eigenvalues.map(|v| v.max(floor)));
+        let covariance =
+            shape + self.eigenvectors.transpose() * association_covariance_w * self.eigenvectors;
+        let solution = covariance.cholesky()?.solve(&local);
+        Some(local.dot(&solution))
     }
 
     pub fn within_tangent_support(&self, point: &PointXYZI, config: &SurfelConfig) -> bool {

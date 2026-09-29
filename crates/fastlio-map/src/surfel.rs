@@ -2,7 +2,7 @@ use crate::VoxelKey;
 use crate::types::{GeometryClass, Surfel};
 use anyhow::Result;
 use fastlio_types::{Mat3, PointXYZI, SurfelConfig, SurfelMapConfig, Vec3};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use slotmap::{SlotMap, new_key_type};
 use smallvec::SmallVec;
 
@@ -44,6 +44,18 @@ pub struct SurfelObservation {
     pub plane_distance: f64,
     pub planarity: f64,
     pub signed_residual: f64,
+}
+
+/// Mature surfel selected for a fallback observation in world frame.
+#[derive(Debug, Clone)]
+pub struct SurfelGaussianObservation {
+    pub surfel_id: SurfelID,
+    pub mean_w: Vec3<f64>,
+    pub covariance_w: Mat3<f64>,
+    pub eigenvectors: Mat3<f64>,
+    pub eigenvalues: Vec3<f64>,
+    pub best_score: f64,
+    pub second_best_score: Option<f64>,
 }
 
 impl SurfelObservation {
@@ -154,6 +166,85 @@ impl SurfelMap {
         }
     }
 
+    /// Query a mature surfel in `W`; prior uncertainty affects compatibility,
+    /// while the fixed surfel spectrum determines candidate ranking.
+    pub fn query_surfel(
+        &self,
+        point: &PointXYZI,
+        association_covariance_w: &Mat3<f64>,
+    ) -> Result<Option<SurfelGaussianObservation>> {
+        if !point.is_valid() {
+            return Ok(None);
+        }
+        // The fallback alone inspects neighboring voxels; the plane path keeps
+        // its configured search radius and the map index remains unchanged.
+        let radius = self.surfel_map_config.search_radius;
+        let center = VoxelKey::new(point, self.surfel_map_config.voxel_size)?;
+        let mut seen = (radius > 0).then(HashSet::new);
+        let mut best: Option<(SurfelID, f64)> = None;
+        let mut second: Option<f64> = None;
+        let threshold = (self.surfel_config.max_mahalanobis_distance as f64).powi(2);
+
+        for x in center.x - radius..=center.x + radius {
+            for y in center.y - radius..=center.y + radius {
+                for z in center.z - radius..=center.z + radius {
+                    let key = VoxelKey { x, y, z }.pack();
+                    let Some(bucket) = self.buckets.get(&key) else {
+                        continue;
+                    };
+                    for &id in bucket {
+                        if let Some(seen) = &mut seen
+                            && !seen.insert(id)
+                        {
+                            continue;
+                        }
+                        let Some(surfel) = self.surfels.get(id) else {
+                            continue;
+                        };
+                        if surfel.is_growing(self.surfel_config.min_mature_surfel_count)
+                            || surfel.count < 2
+                        {
+                            continue;
+                        }
+                        let Some(gate) = surfel.surfel_gate_score(
+                            point,
+                            association_covariance_w,
+                            &self.surfel_config,
+                        ) else {
+                            continue;
+                        };
+                        if !gate.is_finite() || gate > threshold {
+                            continue;
+                        }
+                        let score = surfel.surfel_rank_score(point, &self.surfel_config);
+                        if !score.is_finite() {
+                            continue;
+                        }
+                        if best.is_none_or(|(_, best_score)| score < best_score) {
+                            second = best.map(|(_, score)| score);
+                            best = Some((id, score));
+                        } else if second.is_none_or(|second_score| score < second_score) {
+                            second = Some(score);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(best.and_then(|(id, best_score)| {
+            let surfel = self.surfels.get(id)?;
+            Some(SurfelGaussianObservation {
+                surfel_id: id,
+                mean_w: surfel.mean_w,
+                covariance_w: surfel.m2 / (surfel.count - 1) as f64,
+                eigenvectors: surfel.eigenvectors,
+                eigenvalues: surfel.eigenvalues,
+                best_score,
+                second_best_score: second,
+            })
+        }))
+    }
+
     pub fn insert(&mut self, points: impl Iterator<Item = PointXYZI>) -> Result<()> {
         let radius = self.surfel_map_config.search_radius;
         for point in points {
@@ -182,7 +273,7 @@ impl SurfelMap {
                     if surfel.is_growing(self.surfel_config.min_mature_surfel_count) {
                         surfel.within_growing_radius(&point, &self.surfel_config)
                     } else {
-                        surfel.within_support(&point, &self.surfel_config)
+                        surfel.within_insertion_support(&point, &self.surfel_config)
                     }
                 });
             let mut best_mature: Option<(SurfelID, f64)> = None;

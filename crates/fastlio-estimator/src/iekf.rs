@@ -138,20 +138,20 @@ impl IekfState {
 
         for _ in 0..config.max_iterations {
             real_iterations += 1;
-            build_observations(
+            let matched_points = build_observations(
                 &state_iter,
                 points,
                 map,
                 extrinsic,
                 config,
+                &p_prior,
                 &mut observations,
             )?;
-            let observations_len = observations.len();
-            observations_len_vec.push(observations_len);
+            observations_len_vec.push(matched_points);
 
-            if observations_len < config.min_observations {
+            if matched_points < config.min_observations {
                 return Err(IekfUpdateError::NotEnoughObservations {
-                    actual: observations_len,
+                    actual: matched_points,
                     required: config.min_observations,
                 });
             }
@@ -174,7 +174,6 @@ impl IekfState {
             converged: converge_flag,
             final_delta: final_error,
         };
-
         self.state = state_iter;
         self.covariance = reset_covariance(&p_final, &final_error);
         // self.covariance = p_final;

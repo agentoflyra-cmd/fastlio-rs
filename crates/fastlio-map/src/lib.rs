@@ -1329,4 +1329,62 @@ mod surfel_test {
             );
         }
     }
+
+    #[test]
+    fn mature_line_absorbs_adjacent_scanline_across_voxel_boundary() {
+        let mut map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 0.4,
+                search_radius: 0,
+            },
+            surfel_config(|c| {
+                c.growing_radius = 0.4;
+                c.insertion_covariance_eigenvalue_floor = Some(0.01);
+            }),
+        );
+        map.insert((0..8).map(|i| pt(0.39, -0.21 + i as f32 * 0.06, 0.0)))
+            .unwrap();
+        assert!(matches!(
+            only_surfel(&map).geometry_class(map.surfel_config()),
+            GeometryClass::Line
+        ));
+        assert!(!only_surfel(&map).within_support(&pt(0.45, 0.0, 0.0), map.surfel_config()));
+
+        map.insert(std::iter::once(pt(0.45, 0.0, 0.0))).unwrap();
+        assert_eq!(only_surfel(&map).count, 9);
+    }
+
+    #[test]
+    fn insertion_support_inherits_query_floor_when_unset() {
+        let config = surfel_config(|c| c.covariance_eigenvalue_floor = 0.0025);
+        let surfel = axis_plane_surfel(0.0);
+        let point = pt(0.08, 0.0, 0.0);
+        assert_eq!(
+            surfel.within_insertion_support(&point, &config),
+            surfel.within_support(&point, &config)
+        );
+        assert!(surfel.within_insertion_support(&point, &config));
+    }
+
+    #[test]
+    fn query_surfel_finds_mature_line_without_changing_plane_query() {
+        let mut map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 0.4,
+                search_radius: 0,
+            },
+            surfel_config(|c| c.growing_radius = 0.4),
+        );
+        map.insert((0..8).map(|i| pt(0.39, -0.21 + i as f32 * 0.06, 0.0)))
+            .unwrap();
+        let point = pt(0.45, 0.0, 0.0);
+        assert!(map.query(&point).unwrap().is_none());
+        let obs = map
+            .query_surfel(&point, &(Mat3::identity() * 1e-4))
+            .unwrap()
+            .expect("mature line should be eligible for surfel fallback");
+        assert_eq!(obs.surfel_id, map.surfels.keys().next().unwrap());
+        assert!(obs.best_score.is_finite());
+        assert!(obs.covariance_w.iter().all(|v| v.is_finite()));
+    }
 }

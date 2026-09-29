@@ -93,12 +93,22 @@ pub struct SurfelConfig {
     pub min_plane_spread_eigenvalue: f32,
     #[serde(default = "default_covariance_eigenvalue_floor")]
     pub covariance_eigenvalue_floor: f32,
+    /// Optional variance floor in m^2 for mature surfel insertion support.
+    /// When omitted, insertion uses `covariance_eigenvalue_floor`.
+    #[serde(default)]
+    pub insertion_covariance_eigenvalue_floor: Option<f32>,
     pub min_linearity: f32,
     pub min_line_spread_eigenvalue: f32,
     pub min_scattering: f32,
     pub min_mature_surfel_count: usize,
     pub max_mahalanobis_distance: f32,
     pub growing_radius: f32,
+    /// Enable surfel-first association. Plane query is used when no surfel
+    /// matches; far points on planar support use only the normal constraint.
+    #[serde(alias = "query_surfel_fallback")]
+    pub query_surfel_first: bool,
+    /// Variance floor in m^2 for surfel association, not map insertion.
+    pub association_covariance_eigenvalue_floor: f32,
 }
 
 impl Default for SurfelConfig {
@@ -108,12 +118,15 @@ impl Default for SurfelConfig {
             max_planarity_ratio: 0.10,
             min_plane_spread_eigenvalue: 0.025,
             covariance_eigenvalue_floor: default_covariance_eigenvalue_floor(),
+            insertion_covariance_eigenvalue_floor: None,
             min_linearity: 0.70,
             min_line_spread_eigenvalue: 0.0025,
             min_scattering: 0.60,
             min_mature_surfel_count: 8,
             max_mahalanobis_distance: 2.0,
             growing_radius: 0.2,
+            query_surfel_first: false,
+            association_covariance_eigenvalue_floor: 0.25,
         }
     }
 }

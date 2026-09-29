@@ -1,308 +1,86 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Surfel Viewer</title>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FAST-LIO Offline Player</title>
   <style>
-    :root { color-scheme: dark; font: 14px system-ui, sans-serif; }
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #101214; }
-    #toolbar { position: fixed; z-index: 2; inset: 12px 12px auto 12px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    #file { max-width: 280px; }
-    #stats { color: #d8dee9; background: #20252b; padding: 7px 10px; border-radius: 5px; }
-    #class-filters { display: flex; gap: 8px; flex-wrap: wrap; color: #cbd5e1; }
-    .class-filter { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
-    .class-swatch { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
-    #help { color: #9ba7b4; }
-    #scene { width: 100%; height: 100%; }
-    label { color: #cbd5e1; }
-    input[type=range] { width: 100px; vertical-align: middle; }
+    :root{color-scheme:dark;font:13px system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;overflow:hidden;background:#101214;color:#d8dee9}#scene{position:fixed;inset:0}#panel{position:fixed;z-index:1;top:12px;left:12px;width:min(540px,calc(100vw - 24px));padding:12px;background:#1b2027ee;border:1px solid #39424e;border-radius:8px;backdrop-filter:blur(7px)}#panel[open]{max-height:calc(100vh - 24px);overflow:auto}summary{cursor:pointer;font-weight:650}section{margin-top:11px;padding-top:10px;border-top:1px solid #303944}label{display:inline-flex;align-items:center;gap:6px;margin:3px 10px 3px 0}input[type=file]{max-width:100%}input[type=range]{width:190px;vertical-align:middle}button{padding:4px 9px;color:inherit;background:#303944;border:1px solid #52606f;border-radius:4px;cursor:pointer}button:hover{background:#3d4a58}#frame-label,#stats{display:block;margin-top:6px;color:#9fb0c2;white-space:pre-wrap}.a{color:#45b8ff}.b{color:#ff9a4d}#help{position:fixed;z-index:1;right:12px;bottom:12px;background:#1b2027cc;padding:7px 10px;border-radius:5px;color:#b4c0ce}
   </style>
 </head>
 <body>
-  <div id="toolbar">
-    <input id="file" type="file" accept=".pcd">
-    <label>点大小 <input id="point-size" type="range" min="1" max="12" step="0.5" value="3"></label>
-    <label><input id="show-normals" type="checkbox" checked> 法向量</label>
-    <span id="class-filters"></span>
-    <span id="stats">请选择包含 class_id 的 Surfel PCD</span>
-    <span id="help">左键旋转 · 中键缩放 · 右键平移 · 滚轮缩放</span>
-  </div>
   <div id="scene"></div>
-
-  <script type="importmap">
-    {
-      "imports": {
-        "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
-        "three/": "https://unpkg.com/three@0.182.0/"
-      }
-    }
-  </script>
+  <details id="panel" open><summary>FAST-LIO 离线播放器</summary>
+    <section><strong>轨迹对比</strong><br>
+      <label class="a">轨迹 A CSV <input id="trajectory-a" type="file" accept=".csv,text/csv"></label>
+      <label class="b">轨迹 B CSV <input id="trajectory-b" type="file" accept=".csv,text/csv"></label><br>
+      <label>服务器轨迹 A <select id="server-trajectory-a"><option value="">加载清单中…</option></select></label>
+      <label>服务器轨迹 B <select id="server-trajectory-b"><option value="">加载清单中…</option></select></label><br>
+      <label><input id="show-a" type="checkbox" checked> 显示 A</label><label><input id="show-b" type="checkbox" checked> 显示 B</label><label><input id="follow" type="checkbox"> 相机跟随 A</label><br>
+      <input id="trajectory-time" type="range" min="0" max="0" value="0" step="0.001" disabled><span id="trajectory-label">尚未加载轨迹</span>
+    </section>
+    <section><strong>逐帧点云与 SurfelObservation</strong><br>
+      <label>选择离线包目录 <input id="directory" type="file" webkitdirectory directory multiple></label><br>
+      <label>服务器离线包 <select id="server-session"><option value="">加载清单中…</option></select></label><br>
+      <label><input id="show-map" type="checkbox" checked> 累积地图</label><label><input id="show-frame" type="checkbox" checked> 当前帧</label><label><input id="show-obs" type="checkbox" checked> 已选观测</label><br>
+      <button id="previous">上一帧</button><button id="play">播放</button><button id="next">下一帧</button>
+      <label>速度 <select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option></select></label><br>
+      <input id="frame" type="range" min="0" max="0" value="0" disabled><span id="frame-label">尚未加载离线包</span>
+    </section>
+    <section><label>点大小 <input id="point-size" type="range" min="0.05" max="2" step="0.05" value="0.15"></label><span id="stats">轨迹 CSV 只需要 timestamp_sec、px、py、pz；其它诊断列会被忽略。</span></section>
+  </details>
+  <div id="help">左键旋转 · 右键平移 · 滚轮缩放</div>
+  <script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.182.0/build/three.module.js","three/":"https://unpkg.com/three@0.182.0/"}}</script>
   <script type="module">
+    /*
+      选择的目录必须含 manifest.json：
+      {"version":1,"frame":"W","frames":[{"timestamp_sec":12.3,"point_cloud":"frames/000001.pcd","observations":"observations/000001.json"}]}
+      PCD（ASCII 或 binary）需含 x y z，且点在 W。observation JSON 为数组或
+      {"observations":[...]}; 每项为 {"point_w":[...],"mean_w":[...],"normal_w":[...],"residual":0.01,"accepted":true}。
+      point_w 是选中的扫描点，mean_w/normal_w 是被选 surfel（均在 W）。
+      服务器默认清单为 /output/player-index.json：
+      {"trajectories":["trajectory.csv"],"sessions":[{"name":"run 1","path":"session/manifest.json"}]}
+      可用 URL 参数 ?data_root=/another-output 更换服务器数据根目录。
+    */
     import * as THREE from "three";
     import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-
-    const CLASS_NAMES = ["Plane", "Line", "Scatter", "Degenerate", "Growing"];
-    const CLASS_COLORS = [0x35d06f, 0xf29b38, 0xf04444, 0xc05be8, 0x668cff];
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x101214);
-    const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100000);
-    camera.position.set(0, -20, 10);
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(devicePixelRatio);
-    renderer.setSize(innerWidth, innerHeight);
-    document.querySelector("#scene").appendChild(renderer.domElement);
-
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.mouseButtons = {
-      LEFT: THREE.MOUSE.ROTATE,
-      MIDDLE: THREE.MOUSE.PAN,
-      RIGHT: THREE.MOUSE.PAN,
-    };
-    renderer.domElement.addEventListener("contextmenu", event => event.preventDefault());
-    controls.touches.ONE = THREE.TOUCH.ROTATE;
-    controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
-
-    const root = new THREE.Group();
-    scene.add(root);
-    let pointMaterial;
-    let classVisibility = [true, true, true, true, true];
-    let normalLines;
-    let loadedPoints = 0;
-
-    document.querySelector("#file").addEventListener("change", async event => {
-      const file = event.target.files?.[0];
-      if (!file) return;
-      try {
-        await loadPcd(file.name, await file.arrayBuffer());
-      } catch (error) {
-        document.querySelector("#stats").textContent = `加载失败: ${error.message}`;
-      }
-    });
-
-    const defaultPcd = new URLSearchParams(location.search).get("pcd") ?? "surfel-map.pcd";
-    fetch(defaultPcd)
-      .then(response => {
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response.arrayBuffer();
-      })
-      .then(buffer => loadPcd(defaultPcd, buffer))
-      .catch(() => {
-        document.querySelector("#stats").textContent =
-          "请选择 PCD，或将 surfel-map.pcd 放到网页目录后刷新";
-      });
-
-    document.querySelector("#point-size").addEventListener("input", event => {
-      if (pointMaterial) pointMaterial.uniforms.uPointSize.value = Number(event.target.value);
-    });
-    document.querySelector("#show-normals").addEventListener("change", event => {
-      if (normalLines) normalLines.visible = event.target.checked;
-    });
-
-    function parsePcd(buffer) {
-      const bytes = new Uint8Array(buffer);
-      const marker = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 8192)));
-      const dataMatch = marker.match(/(?:^|\n)DATA\s+(\w+)\s*\n/i);
-      if (!dataMatch) throw new Error("PCD 缺少 DATA header");
-      if (dataMatch[1].toLowerCase() !== "binary") throw new Error("只支持 binary PCD");
-      const headerEnd = dataMatch.index + dataMatch[0].length;
-      const header = marker.slice(0, headerEnd);
-      const get = name => header.match(new RegExp(`(?:^|\\n)${name}\\s+([^\\n]+)`, "i"))?.[1].trim().split(/\s+/);
-      const fields = get("FIELDS");
-      const sizes = get("SIZE").map(Number);
-      const types = get("TYPE");
-      const counts = get("COUNT")?.map(Number) ?? fields.map(() => 1);
-      const points = Number(get("POINTS")?.[0] ?? get("WIDTH")?.[0]);
-      if (!fields || !sizes || !types || !Number.isFinite(points)) throw new Error("PCD header 不完整");
-      const index = name => fields.findIndex(field => field.toLowerCase() === name);
-      const x = index("x"), y = index("y"), z = index("z");
-      const nx = index("normal_x"), ny = index("normal_y"), nz = index("normal_z");
-      const classId = index("class_id");
-      if ([x, y, z].some(i => i < 0)) throw new Error("PCD 缺少 x/y/z");
-      if (classId < 0) throw new Error("PCD 缺少 class_id，请用新版 fastlio-surfel 重新生成");
-      const offsets = [];
-      let stride = 0;
-      for (let i = 0; i < fields.length; i++) {
-        offsets.push(stride);
-        stride += sizes[i] * counts[i];
-      }
-      const dataStart = headerEnd;
-      const view = new DataView(buffer, dataStart);
-      const value = (row, field) => {
-        const offset = row * stride + offsets[field];
-        if (types[field] === "F" && sizes[field] === 4) return view.getFloat32(offset, true);
-        if (types[field] === "F" && sizes[field] === 8) return view.getFloat64(offset, true);
-        if (types[field] === "U" && sizes[field] === 4) return view.getUint32(offset, true);
-        throw new Error(`不支持字段 ${fields[field]} 的类型`);
-      };
-      const positions = new Float32Array(points * 3);
-      const normals = new Float32Array(points * 3);
-      const classes = new Uint8Array(points);
-      const resultCounts = [0, 0, 0, 0, 0];
-      for (let row = 0; row < points; row++) {
-        positions[row * 3] = value(row, x);
-        positions[row * 3 + 1] = value(row, y);
-        positions[row * 3 + 2] = value(row, z);
-        normals[row * 3] = nx < 0 ? 0 : value(row, nx);
-        normals[row * 3 + 1] = ny < 0 ? 0 : value(row, ny);
-        normals[row * 3 + 2] = nz < 0 ? 1 : value(row, nz);
-        const id = Math.max(0, Math.min(4, Math.round(value(row, classId))));
-        classes[row] = id;
-        resultCounts[id]++;
-      }
-      return { positions, normals, classes, counts: resultCounts, count: points };
-    }
-
-    async function loadPcd(name, buffer) {
-      const result = parsePcd(buffer);
-      showSurfels(result);
-      renderClassFilters(result.counts);
-      document.querySelector("#stats").textContent =
-        `${name} | ${result.counts.map((n, i) => `${CLASS_NAMES[i]}: ${n}`).join("  ")}`;
-    }
-
-    function showSurfels(data) {
-      while (root.children.length) root.remove(root.children[0]);
-      const colors = new Float32Array(data.count * 3);
-      for (let i = 0; i < data.count; i++) {
-        const color = new THREE.Color(CLASS_COLORS[data.classes[i]]);
-        colors.set([color.r, color.g, color.b], i * 3);
-      }
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute("position", new THREE.BufferAttribute(data.positions, 3));
-      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      geometry.setAttribute("classId", new THREE.BufferAttribute(data.classes, 1));
-      pointMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-          uPointSize: { value: 3 },
-          uClassVisible: { value: classVisibility.map(value => value ? 1 : 0) },
-        },
-        vertexShader: `
-          attribute float classId;
-          attribute vec3 color;
-          varying vec3 vColor;
-          varying float vClassId;
-          uniform float uPointSize;
-          void main() {
-            vColor = color;
-            vClassId = classId;
-            gl_PointSize = uPointSize;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-          }
-        `,
-        fragmentShader: `
-          varying vec3 vColor;
-          varying float vClassId;
-          uniform float uClassVisible[5];
-          void main() {
-            int id = int(vClassId + 0.5);
-            if (uClassVisible[id] < 0.5) discard;
-            gl_FragColor = vec4(vColor, 1.0);
-          }
-        `,
-      });
-      root.add(new THREE.Points(geometry, pointMaterial));
-
-      const maxNormals = 100000;
-      const normalStep = Math.max(1, Math.ceil(data.count / maxNormals));
-      const normalCount = Math.ceil(data.count / normalStep);
-      const linePositions = new Float32Array(normalCount * 6);
-      const lineClasses = new Uint8Array(normalCount * 2);
-      let normalIndex = 0;
-      for (let i = 0; i < data.count; i += normalStep) {
-        const p = i * 3;
-        linePositions.set(data.positions.subarray(p, p + 3), normalIndex * 6);
-        linePositions.set([
-          data.positions[p] + data.normals[p] * 0.25,
-          data.positions[p + 1] + data.normals[p + 1] * 0.25,
-          data.positions[p + 2] + data.normals[p + 2] * 0.25,
-        ], normalIndex * 6 + 3);
-        lineClasses[normalIndex * 2] = data.classes[i];
-        lineClasses[normalIndex * 2 + 1] = data.classes[i];
-        normalIndex++;
-      }
-      const lineGeometry = new THREE.BufferGeometry();
-      lineGeometry.setAttribute("position", new THREE.BufferAttribute(linePositions, 3));
-      lineGeometry.setAttribute("classId", new THREE.BufferAttribute(lineClasses, 1));
-      normalLines = new THREE.LineSegments(lineGeometry, new THREE.ShaderMaterial({
-        uniforms: {
-          uClassVisible: { value: classVisibility.map(value => value ? 1 : 0) },
-        },
-        vertexShader: `
-          attribute float classId;
-          varying float vClassId;
-          void main() {
-            vClassId = classId;
-            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-          }
-        `,
-        fragmentShader: `
-          varying float vClassId;
-          uniform float uClassVisible[5];
-          void main() {
-            int id = int(vClassId + 0.5);
-            if (uClassVisible[id] < 0.5) discard;
-            gl_FragColor = vec4(1.0, 1.0, 1.0, 0.35);
-          }
-        `,
-        transparent: true,
-      }));
-      root.add(normalLines);
-      loadedPoints = data.count;
-      fitCamera(geometry);
-    }
-
-    function renderClassFilters(counts) {
-      const container = document.querySelector("#class-filters");
-      container.replaceChildren();
-      CLASS_NAMES.forEach((name, index) => {
-        const label = document.createElement("label");
-        label.className = "class-filter";
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.checked = classVisibility[index];
-        checkbox.addEventListener("change", () => {
-          classVisibility[index] = checkbox.checked;
-          updateClassVisibility();
-        });
-        const swatch = document.createElement("span");
-        swatch.className = "class-swatch";
-        swatch.style.background = `#${CLASS_COLORS[index].toString(16).padStart(6, "0")}`;
-        label.append(checkbox, swatch, `${name} (${counts[index]})`);
-        container.append(label);
-      });
-    }
-
-    function updateClassVisibility() {
-      const values = classVisibility.map(value => value ? 1 : 0);
-      if (pointMaterial) pointMaterial.uniforms.uClassVisible.value = values;
-      if (normalLines) normalLines.material.uniforms.uClassVisible.value = values;
-    }
-
-    function fitCamera(geometry) {
-      geometry.computeBoundingSphere();
-      const sphere = geometry.boundingSphere;
-      if (!sphere) return;
-      controls.target.copy(sphere.center);
-      camera.position.copy(sphere.center).add(new THREE.Vector3(0, -1.7, 1.1).normalize().multiplyScalar(Math.max(20, sphere.radius * 2.5)));
-      camera.near = Math.max(0.01, sphere.radius / 10000);
-      camera.far = Math.max(1000, sphere.radius * 20);
-      camera.updateProjectionMatrix();
-      controls.update();
-    }
-
-    addEventListener("resize", () => {
-      camera.aspect = innerWidth / innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(innerWidth, innerHeight);
-    });
-    function animate() {
-      requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    animate();
+    const $=s=>document.querySelector(s), scene=new THREE.Scene(); scene.background=new THREE.Color(0x101214);
+    const serverRoot=new URLSearchParams(location.search).get("data_root")??"/output";
+    const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,.01,100000);camera.position.set(0,-20,10);
+    const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setPixelRatio(devicePixelRatio);renderer.setSize(innerWidth,innerHeight);$("#scene").append(renderer.domElement);
+    const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;controls.mouseButtons={LEFT:THREE.MOUSE.ROTATE,MIDDLE:THREE.MOUSE.DOLLY,RIGHT:THREE.MOUSE.PAN};renderer.domElement.addEventListener("contextmenu",e=>e.preventDefault());
+    const tracksGroup=new THREE.Group(),cursorGroup=new THREE.Group(),mapGroup=new THREE.Group(),frameGroup=new THREE.Group(),obsGroup=new THREE.Group();scene.add(tracksGroup,cursorGroup,mapGroup,frameGroup,obsGroup);
+    const material=(color)=>new THREE.PointsMaterial({color,size:+$("#point-size").value,sizeAttenuation:true}),mapMaterial=material(0x7890a8),frameMaterial=material(0xf0d05a);
+    const state={tracks:[null,null],session:null,index:0,playing:false,last:0,points:new Map(),trajectoryStart:0,trajectoryEnd:0,trajectoryTime:0,frameLoading:false};
+    const status=text=>$("#stats").textContent=text;
+    function clear(group){while(group.children.length){const child=group.remove(group.children[0]);child.geometry?.dispose();if(child.material!==mapMaterial&&child.material!==frameMaterial)child.material?.dispose()}}
+    function csv(text){const lines=text.trim().split(/\r?\n/);if(lines.length<2)throw Error("CSV 没有数据行");const h=lines[0].split(",").map(x=>x.trim()), needed=["timestamp_sec","px","py","pz"];if(needed.some(x=>!h.includes(x)))throw Error(`CSV 缺少 ${needed.join(", ")}`);return lines.slice(1).map((line,n)=>{const values=line.split(","),row=Object.fromEntries(h.map((name,i)=>[name,+values[i]]));if(needed.some(x=>!Number.isFinite(row[x])))throw Error(`第 ${n+2} 行含无效位姿`);return row})}
+    function showTrack(index,rows){const old=tracksGroup.getObjectByName(`track-${index}`);if(old){tracksGroup.remove(old);old.geometry.dispose();old.material.dispose()}const g=new THREE.BufferGeometry().setFromPoints(rows.map(r=>new THREE.Vector3(r.px,r.py,r.pz)));const line=new THREE.Line(g,new THREE.LineBasicMaterial({color:index?0xff9a4d:0x45b8ff}));line.name=`track-${index}`;tracksGroup.add(line);state.tracks[index]=rows;updateTrajectoryRange();fit()}
+    async function loadTrack(index,file){if(!file)return;try{showTrack(index,csv(await file.text()));status(`${file.name}: ${state.tracks[index].length} poses`)}catch(e){status(`加载轨迹失败：${e.message}`)}}
+    async function loadServerTrack(index,path){if(!path)return;try{const response=await fetch(path);if(!response.ok)throw Error(`HTTP ${response.status}`);showTrack(index,csv(await response.text()));status(`${path}: ${state.tracks[index].length} poses`)}catch(e){status(`加载服务器轨迹失败：${e.message}`)}}
+    $("#trajectory-a").addEventListener("change",e=>loadTrack(0,e.target.files[0]));$("#trajectory-b").addEventListener("change",e=>loadTrack(1,e.target.files[0]));
+    $("#server-trajectory-a").addEventListener("change",e=>loadServerTrack(0,e.target.value));$("#server-trajectory-b").addEventListener("change",e=>loadServerTrack(1,e.target.value));
+    for(const [id,name] of [["#show-a","track-0"],["#show-b","track-1"]])$(id).addEventListener("change",e=>{const o=tracksGroup.getObjectByName(name);if(o)o.visible=e.target.checked});
+    function updateTrajectoryRange(){const rows=state.tracks.flatMap(x=>x??[]);if(!rows.length)return;state.trajectoryStart=Math.min(...rows.map(x=>x.timestamp_sec));state.trajectoryEnd=Math.max(...rows.map(x=>x.timestamp_sec));state.trajectoryTime=state.trajectoryStart;const input=$("#trajectory-time");input.min=state.trajectoryStart;input.max=state.trajectoryEnd;input.value=state.trajectoryStart;input.disabled=false;setTrajectoryTime(state.trajectoryStart)}
+    function nearest(rows,time){return rows.reduce((best,row)=>Math.abs(row.timestamp_sec-time)<Math.abs(best.timestamp_sec-time)?row:best)}
+    function setTrajectoryTime(time){if(!state.tracks.some(Boolean))return;state.trajectoryTime=Math.max(state.trajectoryStart,Math.min(time,state.trajectoryEnd));clear(cursorGroup);state.tracks.forEach((rows,index)=>{if(!rows)return;const row=nearest(rows,state.trajectoryTime),g=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(row.px,row.py,row.pz)]);cursorGroup.add(new THREE.Points(g,new THREE.PointsMaterial({color:index?0xff9a4d:0x45b8ff,size:7,sizeAttenuation:false})));if(index===0&&$("#follow").checked)controls.target.set(row.px,row.py,row.pz)});$("#trajectory-time").value=state.trajectoryTime;$("#trajectory-label").textContent=`t = ${state.trajectoryTime.toFixed(6)} s`}
+    $("#trajectory-time").addEventListener("input",e=>setTrajectoryTime(+e.target.value));
+    function parsePcd(buffer){const bytes=new Uint8Array(buffer),text=new TextDecoder().decode(bytes.subarray(0,Math.min(bytes.length,16384))),m=text.match(/(?:^|\n)DATA\s+(\w+)\s*\n/i);if(!m)throw Error("PCD 缺少 DATA header");const end=m.index+m[0].length,header=text.slice(0,end),get=name=>header.match(new RegExp(`(?:^|\\n)${name}\\s+([^\\n]+)`,"i"))?.[1].trim().split(/\s+/),fields=get("FIELDS"),sizes=get("SIZE")?.map(Number),types=get("TYPE"),counts=get("COUNT")?.map(Number)??fields?.map(()=>1),n=+(get("POINTS")?.[0]??get("WIDTH")?.[0]);if(!fields||!sizes||!types||!Number.isFinite(n))throw Error("PCD header 不完整");const xyz=["x","y","z"].map(x=>fields.findIndex(y=>y.toLowerCase()===x));if(xyz.some(i=>i<0))throw Error("PCD 缺少 x/y/z");const out=new Float32Array(n*3),kind=m[1].toLowerCase();if(kind==="ascii"){const data=new TextDecoder().decode(bytes.subarray(end)).trim().split(/\s+/),stride=counts.reduce((a,b)=>a+b,0);for(let i=0;i<n;i++)xyz.forEach((f,a)=>out[3*i+a]=+data[i*stride+counts.slice(0,f).reduce((x,y)=>x+y,0)])}else if(kind==="binary"){const offsets=[];let stride=0;for(let i=0;i<fields.length;i++){offsets.push(stride);stride+=sizes[i]*counts[i]}const view=new DataView(buffer,end),read=(o,f)=>types[f]==="F"&&sizes[f]===4?view.getFloat32(o,true):types[f]==="F"&&sizes[f]===8?view.getFloat64(o,true):(()=>{throw Error(`不支持字段 ${fields[f]} 的类型`)})();for(let i=0;i<n;i++)xyz.forEach((f,a)=>out[3*i+a]=read(i*stride+offsets[f],f))}else throw Error(`不支持 DATA ${m[1]}`);return out}
+    const clean=p=>p.replace(/^\.\//,"").replace(/\\/g,"/");
+    async function loadSession(files){try{const paths=new Map([...files].map(f=>[clean(f.webkitRelativePath||f.name),f])),entry=[...paths].find(([p])=>p==="manifest.json"||p.endsWith("/manifest.json"));if(!entry)throw Error("目录中找不到 manifest.json");const [manifestPath,file]=entry,manifest=JSON.parse(await file.text()),prefix=manifestPath.slice(0,-13),resolve=p=>paths.get(prefix+clean(p));if(manifest.version!==1||!Array.isArray(manifest.frames)||!manifest.frames.length)throw Error("只支持包含非空 frames 的 version: 1 manifest");for(const [i,f] of manifest.frames.entries()){if(!Number.isFinite(f.timestamp_sec)||typeof f.point_cloud!=="string")throw Error(`第 ${i} 帧缺少 timestamp_sec 或 point_cloud`);f.pointFile=resolve(f.point_cloud);f.obsFile=f.observations?resolve(f.observations):null;if(!f.pointFile)throw Error(`第 ${i} 帧 PCD 不在选择的目录中：${f.point_cloud}`)}state.session=manifest;state.index=0;state.points.clear();$("#frame").disabled=false;$("#frame").max=manifest.frames.length-1;await setFrame(0);status(`离线包：${manifest.frames.length} 帧；坐标系 ${manifest.frame??"未声明（应为 W）"}`)}catch(e){status(`加载离线包失败：${e.message}`)}}
+    async function loadServerSession(manifestUrl){if(!manifestUrl)return;try{const response=await fetch(manifestUrl);if(!response.ok)throw Error(`HTTP ${response.status}`);const manifest=await response.json(),base=new URL(".",new URL(manifestUrl,location.href));if(manifest.version!==1||!Array.isArray(manifest.frames)||!manifest.frames.length)throw Error("只支持包含非空 frames 的 version: 1 manifest");for(const [i,f] of manifest.frames.entries()){if(!Number.isFinite(f.timestamp_sec)||typeof f.point_cloud!=="string")throw Error(`第 ${i} 帧缺少 timestamp_sec 或 point_cloud`);f.pointFile={arrayBuffer:async()=>{const r=await fetch(new URL(f.point_cloud,base));if(!r.ok)throw Error(`PCD HTTP ${r.status}`);return r.arrayBuffer()}};f.obsFile=f.observations?{text:async()=>{const r=await fetch(new URL(f.observations,base));if(!r.ok)throw Error(`observation HTTP ${r.status}`);return r.text()}}:null}state.session=manifest;state.index=0;state.points.clear();$("#frame").disabled=false;$("#frame").max=manifest.frames.length-1;await setFrame(0);status(`服务器离线包：${manifest.frames.length} 帧；坐标系 ${manifest.frame??"未声明（应为 W）"}`)}catch(e){status(`加载服务器离线包失败：${e.message}`)}}
+    $("#directory").addEventListener("change",e=>loadSession(e.target.files));
+    $("#server-session").addEventListener("change",e=>loadServerSession(e.target.value));
+    function addOptions(select,items,label){select.replaceChildren(new Option(label,""));const base=new URL(`${serverRoot.replace(/\/$/,"")}/`,location.href);for(const item of items??[]){const path=typeof item==="string"?item:item.path;select.add(new Option(typeof item==="string"?item:item.name??item.path,new URL(path,base).href))}}
+    const indexUrl=`${serverRoot.replace(/\/$/,"")}/player-index.json`, directoryUrl=`${serverRoot.replace(/\/$/,"")}/`;
+    async function loadServerIndex(){let index={sessions:[]};try{const r=await fetch(indexUrl);if(r.ok)index=await r.json()}catch{}try{const r=await fetch(directoryUrl);if(!r.ok)throw Error(`HTTP ${r.status}`);const directoryBase=new URL(directoryUrl,location.href),html=await r.text(),hrefs=[...new DOMParser().parseFromString(html,"text/html").querySelectorAll("a")].map(a=>a.getAttribute("href")).filter(Boolean),tracks=hrefs.filter(x=>/\.csv$/i.test(x)),folders=hrefs.filter(x=>x!=="../"&&x.endsWith("/"));const discovered=(await Promise.all(folders.map(async folder=>{const manifestUrl=new URL("manifest.json",new URL(folder,directoryBase));try{const response=await fetch(manifestUrl);const manifest=response.ok?await response.json():null;return manifest?.version===1&&Array.isArray(manifest.frames)?{name:decodeURIComponent(folder.replace(/\/$/,"")),path:manifestUrl.href}:null}catch{return null}}))).filter(Boolean),sessions=[...discovered,...(index.sessions??[])];addOptions($("#server-trajectory-a"),tracks,"选择服务器轨迹");addOptions($("#server-trajectory-b"),tracks,"选择服务器轨迹");addOptions($("#server-session"),sessions,"选择服务器离线包");status(`已自动扫描服务器目录：${directoryUrl}（${tracks.length} 个 CSV，${discovered.length} 个离线包）`)}catch(directoryError){const tracks=index.trajectories??[];addOptions($("#server-trajectory-a"),tracks,"选择服务器轨迹");addOptions($("#server-trajectory-b"),tracks,"选择服务器轨迹");addOptions($("#server-session"),index.sessions,"选择服务器离线包");status(`无法扫描 ${directoryUrl}；使用清单 ${indexUrl}（${directoryError.message}）`)}}
+    loadServerIndex();
+    const vec=x=>Array.isArray(x)&&x.length===3&&x.every(Number.isFinite);
+    function showObservations(raw){const all=Array.isArray(raw)?raw:raw.observations;if(!Array.isArray(all))throw Error("observation JSON 必须为数组或 { observations: [...] }");const p=[],c=[];for(const o of all){if(!vec(o.point_w)||!vec(o.mean_w))continue;const col=new THREE.Color(o.accepted===false?0xf04444:0xf06cb6);p.push(...o.point_w,...o.mean_w);c.push(col.r,col.g,col.b,col.r,col.g,col.b);if(vec(o.normal_w)){const end=new THREE.Vector3(...o.mean_w).addScaledVector(new THREE.Vector3(...o.normal_w),.25);p.push(...o.mean_w,end.x,end.y,end.z);c.push(.8,.8,.8,.8,.8,.8)}}const g=new THREE.BufferGeometry();g.setAttribute("position",new THREE.Float32BufferAttribute(p,3));g.setAttribute("color",new THREE.Float32BufferAttribute(c,3));obsGroup.add(new THREE.LineSegments(g,new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:.85})))}
+    async function pointsAt(i){if(!state.points.has(i))state.points.set(i,parsePcd(await state.session.frames[i].pointFile.arrayBuffer()));return state.points.get(i)}
+    async function setFrame(index){if(!state.session||state.frameLoading)return;state.frameLoading=true;try{index=Math.max(0,Math.min(index,state.session.frames.length-1));state.index=index;const frame=state.session.frames[index];clear(mapGroup);clear(frameGroup);clear(obsGroup);for(let i=0;i<=index;i++){const g=new THREE.BufferGeometry();g.setAttribute("position",new THREE.BufferAttribute(await pointsAt(i),3));mapGroup.add(new THREE.Points(g,mapMaterial))}const current=await pointsAt(index),g=new THREE.BufferGeometry();g.setAttribute("position",new THREE.BufferAttribute(current,3));frameGroup.add(new THREE.Points(g,frameMaterial));if(frame.obsFile)showObservations(JSON.parse(await frame.obsFile.text()));$("#frame").value=index;$("#frame-label").textContent=`帧 ${index+1}/${state.session.frames.length}，t = ${frame.timestamp_sec.toFixed(6)} s，${current.length/3} 点`;if($("#follow").checked){const row=state.tracks[0]?.reduce((best,x)=>Math.abs(x.timestamp_sec-frame.timestamp_sec)<Math.abs(best.timestamp_sec-frame.timestamp_sec)?x:best)}}finally{state.frameLoading=false}}
+    $("#frame").addEventListener("input",e=>setFrame(+e.target.value));$("#previous").onclick=()=>setFrame(state.index-1);$("#next").onclick=()=>setFrame(state.index+1);$("#play").onclick=()=>{state.playing=!state.playing;$("#play").textContent=state.playing?"暂停":"播放";state.last=performance.now()};for(const [id,g] of [["#show-map",mapGroup],["#show-frame",frameGroup],["#show-obs",obsGroup]])$(id).addEventListener("change",e=>g.visible=e.target.checked);$("#point-size").addEventListener("input",e=>mapMaterial.size=frameMaterial.size=+e.target.value);
+    function fit(force=false){if(!force&&tracksGroup.children.length)return;const box=new THREE.Box3().setFromObject(tracksGroup.children.length?tracksGroup:mapGroup);if(box.isEmpty())return;const s=box.getBoundingSphere(new THREE.Sphere());controls.target.copy(s.center);camera.position.copy(s.center).add(new THREE.Vector3(0,-1.7,1.1).normalize().multiplyScalar(Math.max(20,s.radius*2.5)));camera.near=Math.max(.01,s.radius/10000);camera.far=Math.max(1000,s.radius*20);camera.updateProjectionMatrix();controls.update()}
+    addEventListener("resize",()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});function animate(now){requestAnimationFrame(animate);if(state.playing){if(state.session){const next=state.session.frames[state.index+1];if(!next){state.playing=false;$("#play").textContent="播放"}else{const current=state.session.frames[state.index],delayMs=Math.max(0,(next.timestamp_sec-current.timestamp_sec)*1000/+$("#speed").value);if(!state.frameLoading&&now-state.last>=delayMs){state.last=now;setFrame(state.index+1)}}}else if(now-state.last>1000/+$("#speed").value){state.last=now;if(state.trajectoryTime<state.trajectoryEnd)setTrajectoryTime(state.trajectoryTime+.05);else{state.playing=false;$("#play").textContent="播放"}}}controls.update();renderer.render(scene,camera)}animate();
   </script>
 </body>
 </html>

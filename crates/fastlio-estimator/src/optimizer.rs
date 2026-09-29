@@ -1,6 +1,6 @@
 use crate::{iekf::box_minus, linearize_point_to_plane_observation, skew};
-use fastlio_map::surfel::{SurfelMap, SurfelObservation};
-use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, Vec3};
+use fastlio_map::surfel::{SurfelGaussianObservation, SurfelMap, SurfelObservation};
+use fastlio_types::{LidarImuExtrinsic, Mat3, NavState, PointXYZI, SurfelConfig, Vec3};
 use nalgebra::{SMatrix, SVector};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +19,16 @@ pub struct LinearizedObservation {
     pub variance: f64,
 }
 
+// One tangent standard deviation marks the Gaussian-to-plane update switch.
+const FAR_SURFEL_PLANE_TANGENT_SCORE: f64 = 1.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfelUpdateModel {
+    Gaussian,
+    Plane,
+    Reject,
+}
+
 /// Configuration for the current 24D error-state IEKF update.
 #[derive(Debug, Clone, Copy)]
 pub struct IekfConfig {
@@ -30,6 +40,8 @@ pub struct IekfConfig {
     // or remove this from the public config before pipeline integration.
     pub huber_delta: Option<f64>,
     pub min_observations: usize,
+    /// Point measurement covariance in LiDAR frame, used by surfel observations.
+    pub measurement_point_covariance_l: Mat3<f64>,
 }
 
 impl Default for IekfConfig {
@@ -44,6 +56,7 @@ impl Default for IekfConfig {
             // pipeline can report low-observation frames as TrackingLost
             // without blocking bootstrap-map insertion.
             min_observations: 0,
+            measurement_point_covariance_l: Mat3::identity() * 0.03_f64.powi(2),
         }
     }
 }
@@ -54,48 +67,154 @@ pub(crate) fn build_observations(
     map: &SurfelMap,
     extrinsic: &LidarImuExtrinsic,
     config: &IekfConfig,
+    p_prior: &SMatrix<f64, 24, 24>,
     out: &mut Vec<LinearizedObservation>,
-) -> Result<(), IekfUpdateError> {
+) -> Result<usize, IekfUpdateError> {
     out.clear();
+    let mut matched_points = 0;
+    let point_covariance_w = map.surfel_config().query_surfel_first.then(|| {
+        let r_wl = state
+            .orientation
+            .to_rotation_matrix()
+            .matrix()
+            .clone_owned()
+            * extrinsic.rotation.to_rotation_matrix().matrix();
+        r_wl * config.measurement_point_covariance_l * r_wl.transpose()
+    });
 
     for point in points {
-        let point_i = extrinsic.transform_point(&point.to_vec3_f64());
-        let point_w = transform_point(state, &point_i);
+        let point_i_vec = extrinsic.transform_point(&point.to_vec3_f64());
+        let point_w_vec = transform_point(state, &point_i_vec);
         let point_w = PointXYZI {
-            x: point_w.x as f32,
-            y: point_w.y as f32,
-            z: point_w.z as f32,
+            x: point_w_vec.x as f32,
+            y: point_w_vec.y as f32,
+            z: point_w_vec.z as f32,
             intensity: point.intensity,
         };
         let point_i = PointXYZI {
-            x: point_i.x as f32,
-            y: point_i.y as f32,
-            z: point_i.z as f32,
+            x: point_i_vec.x as f32,
+            y: point_i_vec.y as f32,
+            z: point_i_vec.z as f32,
             intensity: point.intensity,
         };
 
-        let Some(obs) = map
+        if let Some(point_covariance_w) = point_covariance_w {
+            let jacobian = linearize_point_to_surfel_observation(state, &point_i_vec);
+            let pose_jacobian = jacobian.fixed_view::<3, 6>(0, 0);
+            let association_covariance =
+                pose_jacobian * p_prior.fixed_view::<6, 6>(0, 0) * pose_jacobian.transpose();
+            if let Some(obs) = map
+                .query_surfel(&point_w, &association_covariance)
+                .map_err(|e| IekfUpdateError::MapQueryFailed {
+                    context: e.to_string(),
+                })?
+            {
+                match surfel_update_model(&obs, &point_w_vec, map.surfel_config()) {
+                    SurfelUpdateModel::Reject => {
+                        continue;
+                    }
+                    SurfelUpdateModel::Plane => {
+                        let normal = obs.eigenvectors.column(0).into_owned();
+                        let covariance = obs.covariance_w + point_covariance_w;
+                        let variance = (normal.transpose() * covariance * normal)[0];
+                        if !variance.is_finite() || variance <= 0.0 {
+                            return Err(IekfUpdateError::InvalidObservation);
+                        }
+                        out.push(LinearizedObservation {
+                            residual: normal.dot(&(point_w_vec - obs.mean_w)),
+                            jacobian: normal.transpose() * jacobian,
+                            variance,
+                        });
+                    }
+                    SurfelUpdateModel::Gaussian => {
+                        let covariance = obs.covariance_w + point_covariance_w;
+                        let chol = covariance.cholesky().ok_or(IekfUpdateError::NotSpd)?;
+                        let l = chol.l();
+                        let residual = l
+                            .solve_lower_triangular(&(point_w_vec - obs.mean_w))
+                            .ok_or(IekfUpdateError::SolveFailed)?;
+                        let pose_jacobian = l
+                            .solve_lower_triangular(&pose_jacobian)
+                            .ok_or(IekfUpdateError::SolveFailed)?;
+                        if !residual.iter().all(|v| v.is_finite())
+                            || !pose_jacobian.iter().all(|v| v.is_finite())
+                        {
+                            return Err(IekfUpdateError::InvalidObservation);
+                        }
+                        for row in 0..3 {
+                            let mut jacobian = SMatrix::<f64, 1, 24>::zeros();
+                            jacobian
+                                .fixed_view_mut::<1, 6>(0, 0)
+                                .copy_from(&pose_jacobian.row(row));
+                            out.push(LinearizedObservation {
+                                residual: residual[row],
+                                jacobian,
+                                variance: 1.0,
+                            });
+                        }
+                    }
+                }
+                matched_points += 1;
+                continue;
+            }
+        }
+
+        if let Some(obs) = map
             .query(&point_w)
             .map_err(|e| IekfUpdateError::MapQueryFailed {
                 context: e.to_string(),
             })?
-        else {
-            continue;
-        };
-
-        let jacobian = linearize_point_to_plane_observation(state, &point_i, &obs);
-
-        let residual = obs.signed_residual;
-
-        let variance = build_variance(&obs, config);
-
-        out.push(LinearizedObservation {
-            jacobian,
-            residual,
-            variance,
-        });
+        {
+            out.push(LinearizedObservation {
+                jacobian: linearize_point_to_plane_observation(state, &point_i, &obs),
+                residual: obs.signed_residual,
+                variance: build_variance(&obs, config),
+            });
+            matched_points += 1;
+        }
     }
-    Ok(())
+    Ok(matched_points)
+}
+
+fn surfel_update_model(
+    obs: &SurfelGaussianObservation,
+    point_w: &Vec3<f64>,
+    config: &SurfelConfig,
+) -> SurfelUpdateModel {
+    let lambda_1 = obs.eigenvalues[1];
+    if lambda_1 < config.min_plane_spread_eigenvalue as f64
+        || obs.eigenvalues[0] / lambda_1 > config.max_planarity_ratio as f64
+    {
+        return SurfelUpdateModel::Gaussian;
+    }
+
+    let local = obs.eigenvectors.transpose() * (point_w - obs.mean_w);
+    let floor = config.covariance_eigenvalue_floor as f64;
+    let tangent_score =
+        local[1].powi(2) / lambda_1.max(floor) + local[2].powi(2) / obs.eigenvalues[2].max(floor);
+    let max_support_score = (config.max_mahalanobis_distance as f64).powi(2);
+    if local[0].abs() > config.max_plane_distance as f64
+        || !tangent_score.is_finite()
+        || tangent_score > max_support_score
+    {
+        SurfelUpdateModel::Reject
+    } else if tangent_score >= FAR_SURFEL_PLANE_TANGENT_SCORE {
+        SurfelUpdateModel::Plane
+    } else {
+        SurfelUpdateModel::Gaussian
+    }
+}
+
+fn linearize_point_to_surfel_observation(
+    state: &NavState,
+    point_i: &Vec3<f64>,
+) -> SMatrix<f64, 3, 24> {
+    let mut h = SMatrix::<f64, 3, 24>::zeros();
+    let r_wi = state.orientation.to_rotation_matrix();
+    h.fixed_view_mut::<3, 3>(0, 0)
+        .copy_from(&(-r_wi.matrix() * skew(point_i)));
+    h.fixed_view_mut::<3, 3>(0, 3).copy_from(&Mat3::identity());
+    h
 }
 
 pub(crate) fn build_variance(obs: &SurfelObservation, config: &IekfConfig) -> f64 {
@@ -700,5 +819,220 @@ mod tests {
         } else {
             total / count as f64
         }
+    }
+
+    #[test]
+    fn point_to_surfel_pose_jacobian_matches_finite_difference() {
+        let state = make_state();
+        let point_i = Vec3::new(-1.2, 0.8, 2.1);
+        let h = linearize_point_to_surfel_observation(&state, &point_i);
+        let eps = 1e-7;
+        for column in 0..6 {
+            let mut plus = state.clone();
+            let mut minus = state.clone();
+            let mut delta = Vec3::zeros();
+            delta[column % 3] = eps;
+            if column < 3 {
+                plus.orientation *= UnitQuaternion::from_scaled_axis(delta);
+                minus.orientation *= UnitQuaternion::from_scaled_axis(-delta);
+            } else {
+                plus.position += delta;
+                minus.position -= delta;
+            }
+            let numeric = (transform_point(&plus, &point_i) - transform_point(&minus, &point_i))
+                / (2.0 * eps);
+            assert!(
+                (numeric - h.column(column)).norm() < 1e-7,
+                "column {column}"
+            );
+        }
+        assert!(h.fixed_columns::<18>(6).iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn surfel_has_priority_and_plane_query_remains_fallback() {
+        let point = |x, y, z| PointXYZI {
+            x,
+            y,
+            z,
+            intensity: 0.0,
+        };
+        let mut plane_map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 1.0,
+                search_radius: 2,
+            },
+            SurfelConfig {
+                growing_radius: 3.5,
+                query_surfel_first: true,
+                ..SurfelConfig::default()
+            },
+        );
+        plane_map
+            .insert([-0.5, 0.5].into_iter().flat_map(|x| {
+                [-0.75, -0.25, 0.25, 0.75]
+                    .into_iter()
+                    .map(move |y| point(x, y, 0.0))
+            }))
+            .unwrap();
+        let mut line_map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 0.4,
+                search_radius: 0,
+            },
+            SurfelConfig {
+                growing_radius: 0.4,
+                query_surfel_first: true,
+                ..SurfelConfig::default()
+            },
+        );
+        line_map
+            .insert((0..8).map(|i| point(0.39, -0.21 + i as f32 * 0.06, 0.0)))
+            .unwrap();
+
+        let mut state = make_state();
+        state.position = Vec3::zeros();
+        state.orientation = UnitQuaternion::identity();
+        let extrinsic = LidarImuExtrinsic::new(UnitQuaternion::identity(), Vec3::zeros());
+        let prior = SMatrix::<f64, 24, 24>::identity() * 1e-6;
+        let config = IekfConfig::default();
+        let mut rows = Vec::new();
+
+        let plane_count = build_observations(
+            &state,
+            &[point(0.0, 0.0, 0.0)],
+            &plane_map,
+            &extrinsic,
+            &config,
+            &prior,
+            &mut rows,
+        )
+        .unwrap();
+        assert_eq!(plane_count, 1);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.variance == 1.0));
+
+        let mut strict_surfel_map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 1.0,
+                search_radius: 2,
+            },
+            SurfelConfig {
+                growing_radius: 3.5,
+                query_surfel_first: true,
+                association_covariance_eigenvalue_floor: 1e-6,
+                ..SurfelConfig::default()
+            },
+        );
+        strict_surfel_map
+            .insert([-0.5, 0.5].into_iter().flat_map(|x| {
+                [-0.75, -0.25, 0.25, 0.75]
+                    .into_iter()
+                    .map(move |y| point(x, y, 0.0))
+            }))
+            .unwrap();
+        let fallback_point = point(0.0, 0.0, 0.1);
+        assert!(strict_surfel_map.query(&fallback_point).unwrap().is_some());
+        assert!(
+            strict_surfel_map
+                .query_surfel(&fallback_point, &(Mat3::identity() * 1e-6))
+                .unwrap()
+                .is_none()
+        );
+        let fallback_count = build_observations(
+            &state,
+            std::slice::from_ref(&fallback_point),
+            &strict_surfel_map,
+            &extrinsic,
+            &config,
+            &prior,
+            &mut rows,
+        )
+        .unwrap();
+        assert_eq!(fallback_count, 1);
+        assert_eq!(rows.len(), 1);
+
+        let surfel_count = build_observations(
+            &state,
+            &[point(0.45, 0.0, 0.0)],
+            &line_map,
+            &extrinsic,
+            &config,
+            &prior,
+            &mut rows,
+        )
+        .unwrap();
+        assert_eq!(surfel_count, 1);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.variance == 1.0));
+
+        let mut boundary_plane_map = SurfelMap::new(
+            SurfelMapConfig {
+                voxel_size: 0.4,
+                search_radius: 0,
+            },
+            SurfelConfig {
+                growing_radius: 0.8,
+                query_surfel_first: true,
+                ..SurfelConfig::default()
+            },
+        );
+        boundary_plane_map
+            .insert(
+                [
+                    point(0.39, -0.31, 0.0),
+                    point(0.39, 0.31, 0.0),
+                    point(0.39, 0.0, -0.31),
+                    point(0.39, 0.0, 0.31),
+                    point(0.39, -0.22, -0.22),
+                    point(0.39, -0.22, 0.22),
+                    point(0.39, 0.22, -0.22),
+                    point(0.39, 0.22, 0.22),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
+        let boundary_point = point(0.41, 0.29, 0.0);
+        assert!(boundary_plane_map.query(&boundary_point).unwrap().is_none());
+        let count = build_observations(
+            &state,
+            std::slice::from_ref(&boundary_point),
+            &boundary_plane_map,
+            &extrinsic,
+            &config,
+            &prior,
+            &mut rows,
+        )
+        .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows.len(),
+            1,
+            "far planar surfel should retain only its normal row"
+        );
+        assert!(rows[0].variance > 0.0);
+
+        let obs = boundary_plane_map
+            .query_surfel(&boundary_point, &(Mat3::identity() * 1e-6))
+            .unwrap()
+            .unwrap();
+        let tangent = obs.eigenvectors.column(1).into_owned();
+        let normal = obs.eigenvectors.column(0).into_owned();
+        let near = obs.mean_w + tangent * (0.5 * obs.eigenvalues[1].sqrt());
+        let outside_tangent = obs.mean_w + tangent * (3.0 * obs.eigenvalues[1].sqrt());
+        let outside_normal = obs.mean_w
+            + normal * (boundary_plane_map.surfel_config().max_plane_distance as f64 + 0.01);
+        assert_eq!(
+            surfel_update_model(&obs, &near, boundary_plane_map.surfel_config()),
+            SurfelUpdateModel::Gaussian
+        );
+        assert_eq!(
+            surfel_update_model(&obs, &outside_tangent, boundary_plane_map.surfel_config()),
+            SurfelUpdateModel::Reject
+        );
+        assert_eq!(
+            surfel_update_model(&obs, &outside_normal, boundary_plane_map.surfel_config()),
+            SurfelUpdateModel::Reject
+        );
     }
 }
