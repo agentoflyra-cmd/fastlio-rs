@@ -135,6 +135,68 @@ fn default_covariance_eigenvalue_floor() -> f32 {
     1e-6
 }
 
+/// Iterated-EKF solver knobs, read from the `iekf:` section of the YAML config.
+///
+/// `min_delta_norm` is the convergence threshold on the norm of the 24-dim
+/// error-state correction `dx`. That norm mixes units (rotation in rad,
+/// position in m, velocity in m/s, biases, gravity in m/s^2), so the value is
+/// only meaningful as an order-of-magnitude stopping rule, not as a physical
+/// tolerance. FAST-LIO uses `max_iteration = 4` with a per-component
+/// `|dx_j| < 1e-3` check; the default here is a `|dx| < 1e-3` norm check.
+///
+/// Measured on the yuanqu bag: the previous `1e-6` threshold left 57% of
+/// frames hitting the iteration cap without converging (mean 8.51 iterations,
+/// 60138 map queries/frame) and cost ~1.8x wall time, while the trajectory
+/// stayed within 2.1 cm median / 8.3 cm max of the `1e-6` result.
+#[derive(Deserialize, Clone, Copy, Debug)]
+#[serde(default)]
+pub struct IekfConfigSection {
+    /// Maximum relinearization/association iterations per LiDAR frame.
+    pub max_iterations: usize,
+    /// Convergence threshold on `|dx|`; see the type-level docs for units.
+    pub min_delta_norm: f64,
+    /// Lower bound on the point-to-plane measurement variance (variance floor).
+    pub measurement_variance_floor: f64,
+    /// Minimum number of matched observations required to accept an update.
+    pub min_observations: usize,
+}
+
+impl Default for IekfConfigSection {
+    fn default() -> Self {
+        Self {
+            max_iterations: 10,
+            min_delta_norm: 1.0e-3,
+            measurement_variance_floor: 1.0e-6,
+            min_observations: 0,
+        }
+    }
+}
+
+impl IekfConfigSection {
+    /// Rejects values that would make the filter loop forever or stagnate.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_iterations < 1 {
+            anyhow::bail!(
+                "iekf.max_iterations must be >= 1, got {}",
+                self.max_iterations
+            );
+        }
+        if !self.min_delta_norm.is_finite() || self.min_delta_norm <= 0.0 {
+            anyhow::bail!(
+                "iekf.min_delta_norm must be finite and > 0, got {}",
+                self.min_delta_norm
+            );
+        }
+        if !self.measurement_variance_floor.is_finite() || self.measurement_variance_floor <= 0.0 {
+            anyhow::bail!(
+                "iekf.measurement_variance_floor must be finite and > 0, got {}",
+                self.measurement_variance_floor
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PreprocessConfig {
     pub lidar_type: LidarType,
@@ -163,6 +225,10 @@ pub struct Config {
     pub common: CommonConfig,
     pub preprocess: PreprocessConfig,
     pub mapping: MappingConfig,
+    /// Solver parameters for the iterated EKF update. Omitted fields fall back
+    /// to [`IekfConfigSection::default`].
+    #[serde(default)]
+    pub iekf: IekfConfigSection,
     #[serde(default)]
     pub surfel_config: Option<SurfelConfig>,
     #[serde(default)]
@@ -171,7 +237,8 @@ pub struct Config {
 
 pub fn read_from_config_path<P: AsRef<Path>>(path: P) -> Result<Config> {
     let text = fs::read_to_string(path)?;
-    let config = serde_yaml::from_str(&text)?;
+    let config: Config = serde_yaml::from_str(&text)?;
+    config.iekf.validate()?;
     Ok(config)
 }
 
@@ -184,6 +251,85 @@ mod test {
     use nalgebra::UnitQuaternion;
 
     use crate::{PointXYZI, Pose3, Vec3, transfer_from_header};
+
+    /// The shipped default must stay on the FAST-LIO-style convergence rule:
+    /// a loose `|dx|` threshold that lets the loop exit once the correction is
+    /// sub-millimetre instead of grinding to `1e-6` for four extra iterations.
+    #[test]
+    fn iekf_section_defaults_use_fastlio_convergence_threshold() {
+        let config = crate::IekfConfigSection::default();
+        assert_eq!(config.max_iterations, 10);
+        assert_eq!(config.min_delta_norm, 1.0e-3);
+        assert_eq!(config.measurement_variance_floor, 1.0e-6);
+        assert_eq!(config.min_observations, 0);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn iekf_section_rejects_degenerate_values() {
+        let zero_iterations = crate::IekfConfigSection {
+            max_iterations: 0,
+            ..Default::default()
+        };
+        assert!(zero_iterations.validate().is_err());
+
+        let non_finite = crate::IekfConfigSection {
+            min_delta_norm: f64::NAN,
+            ..Default::default()
+        };
+        assert!(non_finite.validate().is_err());
+
+        let negative = crate::IekfConfigSection {
+            min_delta_norm: -1.0,
+            ..Default::default()
+        };
+        assert!(negative.validate().is_err());
+
+        let zero_variance = crate::IekfConfigSection {
+            measurement_variance_floor: 0.0,
+            ..Default::default()
+        };
+        assert!(zero_variance.validate().is_err());
+    }
+
+    /// A partial `iekf:` section must override only the listed fields, and a
+    /// config without the section must fall back to the documented default.
+    #[test]
+    fn iekf_yaml_section_overrides_only_listed_fields() {
+        let yaml = r#"
+common:
+  debug_mode: false
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+preprocess:
+  lidar_type: 1
+  blind: 0.5
+mapping:
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  extrinsic_est_en: false
+  extrinsic_T: [0.0, 0.0, 0.0]
+  extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+iekf:
+  min_delta_norm: 5.0e-4
+"#;
+        let config: crate::Config = serde_yaml::from_str(yaml).unwrap();
+        config.iekf.validate().unwrap();
+        assert_eq!(config.iekf.min_delta_norm, 5.0e-4);
+        assert_eq!(
+            config.iekf.max_iterations,
+            crate::IekfConfigSection::default().max_iterations
+        );
+
+        let without_section = yaml.replace("iekf:\n  min_delta_norm: 5.0e-4\n", "");
+        let config: crate::Config = serde_yaml::from_str(&without_section).unwrap();
+        assert_eq!(
+            config.iekf.min_delta_norm,
+            crate::IekfConfigSection::default().min_delta_norm
+        );
+    }
 
     #[test]
     fn test_transfer_time() {

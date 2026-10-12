@@ -130,6 +130,13 @@ struct ReplayStats {
     first_lidar_time_sec: Option<f64>,
     last_lidar_time_sec: Option<f64>,
     first_pipeline_error: Option<String>,
+    /// Frames in which the IEKF update actually ran (excludes initialization).
+    iekf_updated_frames: usize,
+    iekf_total_iterations: usize,
+    iekf_converged_frames: usize,
+    iekf_total_matched_observations: usize,
+    iekf_max_iterations: usize,
+    total_inserted_points: usize,
     trajectory: Vec<TrajectoryRow>,
 }
 
@@ -251,8 +258,18 @@ fn process_ready_groups(
             .filter(|pair| pair[1].offset_time_sec < pair[0].offset_time_sec)
             .count();
         match pipeline.process_measure_group(group) {
-            Ok(_) => {
+            Ok(frame) => {
                 stats.processed_frames += 1;
+                stats.total_inserted_points += frame.inserted_points;
+                if frame.updated {
+                    stats.iekf_updated_frames += 1;
+                    stats.iekf_total_iterations += frame.iterations;
+                    stats.iekf_total_matched_observations += frame.matched_observations;
+                    stats.iekf_max_iterations = stats.iekf_max_iterations.max(frame.iterations);
+                    if frame.converged {
+                        stats.iekf_converged_frames += 1;
+                    }
+                }
                 stats.trajectory.push(TrajectoryRow {
                     timestamp_sec,
                     state: pipeline.filter.state.clone(),
@@ -402,7 +419,7 @@ fn write_surfel_map(path: &Utf8PathBuf, map: &SurfelMap) -> Result<()> {
     Ok(())
 }
 
-fn print_summary(stats: &ReplayStats, config: &ReplayConfig) {
+fn print_summary(stats: &ReplayStats, config: &ReplayConfig, map_surfels: usize) {
     println!("replay complete");
     println!("  total messages: {}", stats.read.total_messages);
     println!("  emitted events: {}", stats.read.emitted_events);
@@ -415,6 +432,26 @@ fn print_summary(stats: &ReplayStats, config: &ReplayConfig) {
         stats.dropped_lidar_before_first_imu
     );
     println!("  pending lidar at eof: {}", stats.pending_lidar_at_eof);
+    println!("  iekf updated frames: {}", stats.iekf_updated_frames);
+    if stats.iekf_updated_frames > 0 {
+        let updated = stats.iekf_updated_frames as f64;
+        println!(
+            "  iekf iterations mean/max: {:.2} / {}",
+            stats.iekf_total_iterations as f64 / updated,
+            stats.iekf_max_iterations
+        );
+        println!(
+            "  iekf converged frames: {} ({:.1}%)",
+            stats.iekf_converged_frames,
+            100.0 * stats.iekf_converged_frames as f64 / updated
+        );
+        println!(
+            "  iekf matched observations mean: {:.0}",
+            stats.iekf_total_matched_observations as f64 / updated
+        );
+    }
+    println!("  map surfels: {}", map_surfels);
+    println!("  map inserted points: {}", stats.total_inserted_points);
     println!("  storm mode: {}", config.storm_mode);
     println!(
         "  time offset lidar-to-imu: {:.9} s (t_imu_sync = t_imu_raw - offset)",
@@ -462,7 +499,7 @@ fn main() -> Result<()> {
     if let Some(path) = &args.surfel_map_path {
         write_surfel_map(path, &pipeline.map)?;
     }
-    print_summary(&stats, &replay_config);
+    print_summary(&stats, &replay_config, pipeline.map.surfels().count());
     Ok(())
 }
 

@@ -36,7 +36,24 @@ surfel_config:
     query_surfel_first: true
     association_covariance_eigenvalue_floor: 0.25
     max_mahalanobis_distance: 2.0
-                   
+
+# Iterated-EKF solver. `min_delta_norm` is the norm of the 24-dim error-state
+# correction dx (mixed units: rad, m, m/s, bias, m/s^2), i.e. an
+# order-of-magnitude stopping rule rather than a physical tolerance.
+# Measured on yuanqu (7288 frames): 1e-6 left 57% of frames hitting
+# max_iterations without converging (mean 8.51 iterations, 60138 map
+# queries/frame, wall 580.8 s); 1e-3 exits after 4.91 iterations
+# (wall 318.1 s = 2.29x realtime) and moves the trajectory by 2.1 cm median /
+# 8.3 cm max. ATE against the FAST-LIO-SAM reference: 0.1168 -> 0.1206 m on
+# yuanqu, 0.0589 -> 0.0697 m on upstairs (3.31 iterations there, 99.9%
+# converged). FAST-LIO itself uses max_iteration = 4 with a per-component
+# |dx_j| < 1e-3 check.
+iekf:
+    max_iterations: 10
+    min_delta_norm: 1.0e-3
+    measurement_variance_floor: 1.0e-6
+    min_observations: 0         # TODO(tracking): raise once low-observation frames are reported as TrackingLost
+
 # publish:
     # path_en:  false
     # scan_publish_en:  true       # false: close all the point cloud output

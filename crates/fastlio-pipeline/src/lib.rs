@@ -97,9 +97,25 @@ impl ImuInitializer {
     }
 }
 
-// TODO(pipeline): report initializing/bootstrap/tracking/tracking-lost mode,
-// effective observations, IEKF iterations, map size, and per-stage timings.
-pub struct PipelineFrameSummary {}
+// TODO(pipeline): expose the initializing/bootstrap/tracking/tracking-lost
+// mode state and per-stage timings. Effective observations, IEKF iterations
+// and map size are already reported through `PipelineFrameSummary` and the
+// replay summary.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct PipelineFrameSummary {
+    /// `false` for frames that only accumulate IMU initialization samples or
+    /// only seed the bootstrap map; no IEKF update ran on those.
+    pub updated: bool,
+    /// Relinearization iterations actually executed by the IEKF.
+    pub iterations: usize,
+    /// Matched observations at the final iteration (surfel or plane rows).
+    pub matched_observations: usize,
+    /// `true` when the loop stopped on the convergence threshold rather than
+    /// the iteration cap.
+    pub converged: bool,
+    /// Points handed to the local map as a result of this frame.
+    pub inserted_points: usize,
+}
 
 /// Patch `group_imu` so that its first and last samples coincide with the
 /// LiDAR scan begin/end times, and return the IMU sample to carry into the
@@ -175,6 +191,9 @@ pub struct MainPipeline {
     pub filter: IekfState,
     pub imu_integrator: ImuIntegrator,
     pub config: Config,
+    /// Solver knobs resolved once from `config.iekf` so the update loop does not
+    /// rebuild them per frame.
+    pub iekf_config: IekfConfig,
     pub extrinsic: LidarImuExtrinsic,
     pub initialized: bool,
     pub inital_group_count: usize,
@@ -196,6 +215,7 @@ impl MainPipeline {
                 config.mapping.b_acc_cov,
             ),
             filter: IekfState::default(),
+            iekf_config: config.iekf.into(),
             extrinsic: build_extrinsic_from_config(&config),
             config,
             initialized: false,
@@ -221,7 +241,7 @@ impl MainPipeline {
         if !self.initialized {
             self.initializer.accumulate(&imu_for_initialize);
             if self.initializer.group_count < self.inital_group_count {
-                return Ok(PipelineFrameSummary {});
+                return Ok(PipelineFrameSummary::default());
             }
 
             let initialization = self.initializer.finish()?;
@@ -248,7 +268,7 @@ impl MainPipeline {
             self.filter.state.gyro_bias = initialization.gyro_bias;
             self.imu_integrator
                 .set_accel_scale(initialization.accel_scale)?;
-            return Ok(PipelineFrameSummary {});
+            return Ok(PipelineFrameSummary::default());
         }
 
         let previous_state = self.filter.state.clone();
@@ -276,6 +296,8 @@ impl MainPipeline {
         deskew(&mut group.lidar, &segments, &self.extrinsic)?;
         let pointcloud = preprocess(&self.config.preprocess, group.lidar)?;
 
+        let mut summary = PipelineFrameSummary::default();
+
         if !self.map.is_empty() {
             let iekf_summary = self
                 .filter
@@ -283,15 +305,21 @@ impl MainPipeline {
                     &pointcloud.point_cloud,
                     &self.extrinsic,
                     &self.map,
-                    &IekfConfig::default(),
+                    &self.iekf_config,
                 )
                 .map_err(|e| anyhow!("IekfUpdateError: {:?}", e))?;
+
+            summary.updated = true;
+            summary.iterations = iekf_summary.iterations;
+            summary.matched_observations = iekf_summary.observations.last().copied().unwrap_or(0);
+            summary.converged = iekf_summary.converged;
 
             if self.config.common.debug_mode {
                 eprintln!("{:?}", iekf_summary);
             }
         }
 
+        let inserted_points = pointcloud.point_cloud.len();
         let map_points = pointcloud.point_cloud.iter().map(|p| {
             let point_i = self.extrinsic.transform_point(&p.to_vec3_f64());
             let point_w = self.filter.state.orientation * point_i + self.filter.state.position;
@@ -304,8 +332,9 @@ impl MainPipeline {
         });
 
         self.map.insert(map_points)?;
+        summary.inserted_points = inserted_points;
 
-        Ok(PipelineFrameSummary {})
+        Ok(summary)
     }
 }
 

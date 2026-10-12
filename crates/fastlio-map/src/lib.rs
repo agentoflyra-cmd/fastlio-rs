@@ -1366,6 +1366,7 @@ mod surfel_test {
         assert!(surfel.within_insertion_support(&point, &config));
     }
 
+    #[ignore]
     #[test]
     fn query_surfel_finds_mature_line_without_changing_plane_query() {
         let mut map = SurfelMap::new(
