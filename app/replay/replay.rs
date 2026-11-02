@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use camino::Utf8PathBuf;
-use fastlio_dataset::{ReadStats, SensorEvent, read_mcap_events};
+use fastlio_dataset::{ReadStats, SensorEvent, read_mcap_events_on_topics};
 use fastlio_map::{surfel::SurfelMap, types::GeometryClass};
 use fastlio_pipeline::{MainPipeline, synchronizer::MeasurementSynchronizer};
 use fastlio_types::{NavState, read_from_config_path};
@@ -167,10 +167,12 @@ fn push_blocking<T>(
 
 fn produce_events(
     path: Utf8PathBuf,
+    lidar_topic: String,
+    imu_topic: String,
     producer: &mut RingBufferWriter<ReplayMessage>,
     consumer_alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let result = read_mcap_events(path, |event| {
+    let result = read_mcap_events_on_topics(path, &lidar_topic, &imu_topic, |event| {
         push_blocking(producer, ReplayMessage::Event(event), &consumer_alive)
     })
     .map_err(|error| format!("{error:#}"));
@@ -334,6 +336,8 @@ fn run_spsc(
     pipeline: &mut MainPipeline,
     config: ReplayConfig,
 ) -> Result<ReplayStats> {
+    let lidar_topic = pipeline.config.common.lid_topic.clone();
+    let imu_topic = pipeline.config.common.imu_topic.clone();
     let (mut producer, mut consumer) = ringbuffer(config.channel_capacity);
     let producer_alive = Arc::new(AtomicBool::new(true));
     let consumer_alive = Arc::new(AtomicBool::new(true));
@@ -341,7 +345,13 @@ fn run_spsc(
     let producer_consumer_alive = consumer_alive.clone();
     let handle = thread::spawn(move || {
         let _guard = producer_guard;
-        produce_events(path, &mut producer, producer_consumer_alive)
+        produce_events(
+            path,
+            lidar_topic,
+            imu_topic,
+            &mut producer,
+            producer_consumer_alive,
+        )
     });
     let mut synchronizer = MeasurementSynchronizer::new();
     let result = receive_events(
@@ -423,6 +433,10 @@ fn print_summary(stats: &ReplayStats, config: &ReplayConfig, map_surfels: usize)
     println!("replay complete");
     println!("  total messages: {}", stats.read.total_messages);
     println!("  emitted events: {}", stats.read.emitted_events);
+    println!(
+        "  reordered imu events: {} (max arrival regression: {:.6} s)",
+        stats.read.reordered_imu_events, stats.read.max_imu_arrival_regression_sec
+    );
     println!("  synchronized groups: {}", stats.synchronized_groups);
     println!("  processed frames: {}", stats.processed_frames);
     println!("  failed groups: {}", stats.failed_groups);

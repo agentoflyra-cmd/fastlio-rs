@@ -1,11 +1,11 @@
 #[allow(unused_imports)]
+pub use cdr_runtime::{decode_from_bytes, CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32};
+#[allow(unused_imports)]
+use crate::action::*;
+#[allow(unused_imports)]
 use crate::msg::*;
 #[allow(unused_imports)]
 use crate::srv::*;
-#[allow(unused_imports)]
-pub use cdr_runtime::{
-    CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32, decode_from_bytes,
-};
 
 impl DecodeCdr for Accel {
     fn decode_cdr(decoder: &mut CdrDecoder<'_>) -> CdrResult<Self> {

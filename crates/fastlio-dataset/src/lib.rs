@@ -70,6 +70,7 @@ impl SensorEvent {
                 };
                 Ok(Self::Imu(msg))
             }
+            ros2_dispatch::DecodedMessageBorrowed::SensorMsgsPointCloud2(_) => todo!(),
         }
     }
 }
@@ -84,10 +85,79 @@ pub struct ReadStats {
     pub lidar_messages: usize,
     pub emitted_events: usize,
     pub emitted_lidar_events: usize,
+    pub reordered_imu_events: usize,
+    pub max_imu_arrival_regression_sec: f64,
     pub skipped_missing_schema: usize,
     pub skipped_unsupported_schema: usize,
     pub skipped_unsupported_topic: usize,
     pub last_timestamp_sec: Option<u64>,
+}
+
+// Xsens samples in KA-Urban-East arrive up to 8 ms out of header-time order.
+// Delay only IMU emission; LiDAR remains in bag order and the synchronizer
+// still rejects any timestamp regression that exceeds this bounded window.
+const IMU_REORDER_WINDOW_SEC: f64 = 0.02;
+
+#[derive(Default)]
+struct ImuReorderBuffer {
+    pending: Vec<ImuSample>,
+    max_seen_time_sec: Option<f64>,
+    last_emitted_time_sec: Option<f64>,
+}
+
+impl ImuReorderBuffer {
+    fn push<F>(&mut self, imu: ImuSample, stats: &mut ReadStats, on_event: &mut F) -> Result<()>
+    where
+        F: FnMut(SensorEvent) -> Result<()>,
+    {
+        let time = imu.time_stamp_sec;
+        if !time.is_finite() {
+            anyhow::bail!("non-finite IMU header timestamp: {time}");
+        }
+        if let Some(last_emitted) = self.last_emitted_time_sec
+            && time < last_emitted
+        {
+            anyhow::bail!(
+                "IMU header timestamp {time:.9} arrived after {last_emitted:.9} was emitted; disorder exceeds {IMU_REORDER_WINDOW_SEC:.3} s window"
+            );
+        }
+        if let Some(max_seen) = self.max_seen_time_sec
+            && time < max_seen
+        {
+            stats.reordered_imu_events += 1;
+            stats.max_imu_arrival_regression_sec =
+                stats.max_imu_arrival_regression_sec.max(max_seen - time);
+        }
+        let max_seen = self.max_seen_time_sec.map_or(time, |seen| seen.max(time));
+        self.max_seen_time_sec = Some(max_seen);
+        let index = self
+            .pending
+            .partition_point(|sample| sample.time_stamp_sec <= time);
+        self.pending.insert(index, imu);
+        self.flush_until(max_seen - IMU_REORDER_WINDOW_SEC, stats, on_event)
+    }
+
+    fn flush_until<F>(
+        &mut self,
+        cutoff_sec: f64,
+        stats: &mut ReadStats,
+        on_event: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(SensorEvent) -> Result<()>,
+    {
+        while self
+            .pending
+            .first()
+            .is_some_and(|sample| sample.time_stamp_sec <= cutoff_sec)
+        {
+            let imu = self.pending.remove(0);
+            self.last_emitted_time_sec = Some(imu.time_stamp_sec);
+            on_event(SensorEvent::Imu(imu))?;
+            stats.emitted_events += 1;
+        }
+        Ok(())
+    }
 }
 
 fn map_mcap<P: AsRef<Utf8Path>>(p: P) -> Result<Mmap> {
@@ -98,12 +168,10 @@ fn map_mcap<P: AsRef<Utf8Path>>(p: P) -> Result<Mmap> {
 fn is_supported_sensor_schema(schema_name: &str) -> bool {
     matches!(
         schema_name,
-        "livox_ros_driver2/msg/CustomMsg" | "sensor_msgs/msg/Imu"
+        "livox_ros_driver2/msg/CustomMsg"
+            | "livox_ros_driver/msg/CustomMsg"
+            | "sensor_msgs/msg/Imu"
     )
-}
-
-fn is_supported_topic(topic_name: &str) -> bool {
-    matches!(topic_name, "/livox/lidar" | "/livox/imu")
 }
 
 pub fn read_mcap_events<P, F>(p: P, mut on_event: F) -> Result<ReadStats>
@@ -111,18 +179,38 @@ where
     P: AsRef<Utf8Path>,
     F: FnMut(SensorEvent) -> Result<()>,
 {
+    read_mcap_events_on_topics(p, "/livox/lidar", "/livox/imu", &mut on_event)
+}
+
+/// Decode only the configured LiDAR and IMU topics from an MCAP bag.
+/// Sensor timestamps come from each message; MCAP log time is used only to
+/// check that the input stream does not regress.
+pub fn read_mcap_events_on_topics<P, F>(
+    p: P,
+    lidar_topic: &str,
+    imu_topic: &str,
+    mut on_event: F,
+) -> Result<ReadStats>
+where
+    P: AsRef<Utf8Path>,
+    F: FnMut(SensorEvent) -> Result<()>,
+{
+    if lidar_topic.is_empty() || imu_topic.is_empty() || lidar_topic == imu_topic {
+        anyhow::bail!("LiDAR and IMU topics must be nonempty and distinct");
+    }
     let mapped = map_mcap(p)?;
     let mut stats = ReadStats::default();
+    let mut imu_reorder = ImuReorderBuffer::default();
 
     for message in mcap::MessageStream::new(&mapped)? {
         let message = message?;
         let current = message.log_time;
         stats.total_messages += 1;
-        if &message.channel.topic == "/livox/lidar" {
+        if message.channel.topic == lidar_topic {
             stats.lidar_messages += 1;
         }
 
-        if !is_supported_topic(&message.channel.topic) {
+        if message.channel.topic != lidar_topic && message.channel.topic != imu_topic {
             stats.skipped_unsupported_topic += 1;
             continue;
         }
@@ -144,10 +232,6 @@ where
                     message.channel.topic, schema.name
                 )
             })?;
-        match &sensor_source {
-            SensorEvent::Lidar(_) => stats.emitted_lidar_events += 1,
-            SensorEvent::Imu(_) => (),
-        }
         if let Some(last_publish_timestamp) = stats.last_timestamp_sec
             && last_publish_timestamp > current
         {
@@ -156,8 +240,24 @@ where
             )
         }
         stats.last_timestamp_sec = Some(current);
-        on_event(sensor_source)?;
-        stats.emitted_events += 1;
+        match sensor_source {
+            SensorEvent::Imu(imu) => imu_reorder.push(imu, &mut stats, &mut on_event)?,
+            SensorEvent::Lidar(lidar) => {
+                on_event(SensorEvent::Lidar(lidar))?;
+                stats.emitted_lidar_events += 1;
+                stats.emitted_events += 1;
+            }
+        }
+    }
+
+    imu_reorder.flush_until(f64::INFINITY, &mut stats, &mut on_event)?;
+
+    if stats.emitted_lidar_events == 0 || stats.emitted_events == stats.emitted_lidar_events {
+        anyhow::bail!(
+            "no decodable LiDAR/IMU pair for topics lidar=`{lidar_topic}`, imu=`{imu_topic}` (emitted lidar={}, emitted imu={})",
+            stats.emitted_lidar_events,
+            stats.emitted_events - stats.emitted_lidar_events
+        );
     }
 
     Ok(stats)
@@ -165,7 +265,62 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::read_mcap_events;
+    use crate::{
+        ImuReorderBuffer, ReadStats, SensorEvent, read_mcap_events, read_mcap_events_on_topics,
+    };
+    use fastlio_types::Vec3;
+
+    fn imu(time_stamp_sec: f64) -> fastlio_types::ImuSample {
+        fastlio_types::ImuSample {
+            time_stamp_sec,
+            gyro: Vec3::zeros(),
+            accel: Vec3::zeros(),
+        }
+    }
+
+    #[test]
+    fn reorders_bounded_imu_arrival_regression_without_losing_samples() {
+        let mut buffer = ImuReorderBuffer::default();
+        let mut stats = ReadStats::default();
+        let mut emitted = Vec::new();
+        let mut collect = |event| {
+            if let SensorEvent::Imu(sample) = event {
+                emitted.push(sample.time_stamp_sec);
+            }
+            Ok(())
+        };
+        for time in [1.0, 1.01, 1.03, 1.022, 1.04, 1.06] {
+            buffer.push(imu(time), &mut stats, &mut collect).unwrap();
+        }
+        buffer
+            .flush_until(f64::INFINITY, &mut stats, &mut collect)
+            .unwrap();
+        assert_eq!(emitted, [1.0, 1.01, 1.022, 1.03, 1.04, 1.06]);
+        assert_eq!(stats.emitted_events, emitted.len());
+        assert_eq!(stats.reordered_imu_events, 1);
+        assert!((stats.max_imu_arrival_regression_sec - 0.008).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejects_imu_arriving_after_reorder_window() {
+        let mut buffer = ImuReorderBuffer::default();
+        let mut stats = ReadStats::default();
+        let mut collect = |_| Ok(());
+        buffer.push(imu(1.0), &mut stats, &mut collect).unwrap();
+        buffer.push(imu(1.03), &mut stats, &mut collect).unwrap();
+        let error = buffer
+            .push(imu(0.99), &mut stats, &mut collect)
+            .unwrap_err();
+        assert!(error.to_string().contains("disorder exceeds"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_topic_selection() {
+        let result =
+            read_mcap_events_on_topics("missing.mcap", "/imu/data", "/imu/data", |_| Ok(()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("distinct"));
+    }
 
     #[test]
     #[ignore]

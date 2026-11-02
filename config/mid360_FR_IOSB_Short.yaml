@@ -1,0 +1,68 @@
+common:
+    debug_mode: false
+    lid_topic:  "/livox/lidar"
+    imu_topic:  "/imu/data"
+    time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+    time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                  # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+preprocess:
+    voxel_size: 0.2
+    lidar_type: 1                # Livox Horizon CustomMsg
+    scan_line: 6                 # Horizon points in this bag use lines 0..5
+    blind: 0.5
+
+mapping:
+    acc_cov: 0.1
+    gyr_cov: 0.1
+    b_acc_cov: 0.0001
+    b_gyr_cov: 0.0001
+    # fov_degree:    360
+    # det_range:     100.0
+    extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+    # T_IL: p_I = R_IL * p_L + t_IL. Inverse of LiLi-OM's external
+    # Xsens IMU-to-LiDAR q_lb=(0,0,0,1), t_lb=(-0.0265,0.0202,0.05309).
+    extrinsic_T: [ -0.0265, 0.0202, -0.05309 ]
+    extrinsic_R: [ -1, 0, 0,
+                   0, -1, 0,
+                   0, 0, 1]
+surfel_map_config:
+    voxel_size: 0.4
+    search_radius: 0
+
+surfel_config:
+    growing_radius: 0.4
+    min_mature_surfel_count: 8
+    max_planarity_ratio: 0.10
+    min_plane_spread_eigenvalue: 0.025
+    query_surfel_first: true
+    association_covariance_eigenvalue_floor: 0.25
+    max_mahalanobis_distance: 2.0
+
+# Iterated-EKF solver. `min_delta_norm` is the norm of the 24-dim error-state
+# correction dx (mixed units: rad, m, m/s, bias, m/s^2), i.e. an
+# order-of-magnitude stopping rule rather than a physical tolerance.
+# Measured on yuanqu (7288 frames): 1e-6 left 57% of frames hitting
+# max_iterations without converging (mean 8.51 iterations, 60138 map
+# queries/frame, wall 580.8 s); 1e-3 exits after 4.91 iterations
+# (wall 318.1 s = 2.29x realtime) and moves the trajectory by 2.1 cm median /
+# 8.3 cm max. ATE against the FAST-LIO-SAM reference: 0.1168 -> 0.1206 m on
+# yuanqu, 0.0589 -> 0.0697 m on upstairs (3.31 iterations there, 99.9%
+# converged). FAST-LIO itself uses max_iteration = 4 with a per-component
+# |dx_j| < 1e-3 check.
+iekf:
+    max_iterations: 10
+    min_delta_norm: 1.0e-3
+    measurement_variance_floor: 1.0e-6
+    min_observations: 0         # TODO(tracking): raise once low-observation frames are reported as TrackingLost
+
+# publish:
+    # path_en:  false
+    # scan_publish_en:  true       # false: close all the point cloud output
+    # dense_publish_en: true       # false: low down the points number in a global-frame point clouds scan.
+    # scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+# pcd_save:
+    # pcd_save_en: true
+    # interval: -1                 # how many LiDAR frames saved in each pcd file; 
+                                 # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

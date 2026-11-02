@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use crate::action::*;
 use crate::msg::*;
 use crate::srv::*;
 
@@ -12,7 +13,9 @@ pub struct Bool<'a> {
 
 impl<'a> Bool<'a> {
     pub fn to_owned(&self) -> crate::msg::Bool {
-        crate::msg::Bool { data: self.data }
+        crate::msg::Bool {
+            data: self.data,
+        }
     }
 }
 
@@ -26,7 +29,9 @@ pub struct Byte<'a> {
 
 impl<'a> Byte<'a> {
     pub fn to_owned(&self) -> crate::msg::Byte {
-        crate::msg::Byte { data: self.data }
+        crate::msg::Byte {
+            data: self.data,
+        }
     }
 }
 
@@ -57,7 +62,9 @@ pub struct Char<'a> {
 
 impl<'a> Char<'a> {
     pub fn to_owned(&self) -> crate::msg::Char {
-        crate::msg::Char { data: self.data }
+        crate::msg::Char {
+            data: self.data,
+        }
     }
 }
 
@@ -94,7 +101,8 @@ pub struct Empty<'a> {
 
 impl<'a> Empty<'a> {
     pub fn to_owned(&self) -> crate::msg::Empty {
-        crate::msg::Empty {}
+        crate::msg::Empty {
+        }
     }
 }
 
@@ -108,7 +116,9 @@ pub struct Float32<'a> {
 
 impl<'a> Float32<'a> {
     pub fn to_owned(&self) -> crate::msg::Float32 {
-        crate::msg::Float32 { data: self.data }
+        crate::msg::Float32 {
+            data: self.data,
+        }
     }
 }
 
@@ -139,7 +149,9 @@ pub struct Float64<'a> {
 
 impl<'a> Float64<'a> {
     pub fn to_owned(&self) -> crate::msg::Float64 {
-        crate::msg::Float64 { data: self.data }
+        crate::msg::Float64 {
+            data: self.data,
+        }
     }
 }
 
@@ -187,7 +199,9 @@ pub struct Int16<'a> {
 
 impl<'a> Int16<'a> {
     pub fn to_owned(&self) -> crate::msg::Int16 {
-        crate::msg::Int16 { data: self.data }
+        crate::msg::Int16 {
+            data: self.data,
+        }
     }
 }
 
@@ -218,7 +232,9 @@ pub struct Int32<'a> {
 
 impl<'a> Int32<'a> {
     pub fn to_owned(&self) -> crate::msg::Int32 {
-        crate::msg::Int32 { data: self.data }
+        crate::msg::Int32 {
+            data: self.data,
+        }
     }
 }
 
@@ -249,7 +265,9 @@ pub struct Int64<'a> {
 
 impl<'a> Int64<'a> {
     pub fn to_owned(&self) -> crate::msg::Int64 {
-        crate::msg::Int64 { data: self.data }
+        crate::msg::Int64 {
+            data: self.data,
+        }
     }
 }
 
@@ -280,7 +298,9 @@ pub struct Int8<'a> {
 
 impl<'a> Int8<'a> {
     pub fn to_owned(&self) -> crate::msg::Int8 {
-        crate::msg::Int8 { data: self.data }
+        crate::msg::Int8 {
+            data: self.data,
+        }
     }
 }
 
@@ -362,7 +382,9 @@ pub struct UInt16<'a> {
 
 impl<'a> UInt16<'a> {
     pub fn to_owned(&self) -> crate::msg::UInt16 {
-        crate::msg::UInt16 { data: self.data }
+        crate::msg::UInt16 {
+            data: self.data,
+        }
     }
 }
 
@@ -393,7 +415,9 @@ pub struct UInt32<'a> {
 
 impl<'a> UInt32<'a> {
     pub fn to_owned(&self) -> crate::msg::UInt32 {
-        crate::msg::UInt32 { data: self.data }
+        crate::msg::UInt32 {
+            data: self.data,
+        }
     }
 }
 
@@ -424,7 +448,9 @@ pub struct UInt64<'a> {
 
 impl<'a> UInt64<'a> {
     pub fn to_owned(&self) -> crate::msg::UInt64 {
-        crate::msg::UInt64 { data: self.data }
+        crate::msg::UInt64 {
+            data: self.data,
+        }
     }
 }
 
@@ -455,7 +481,9 @@ pub struct UInt8<'a> {
 
 impl<'a> UInt8<'a> {
     pub fn to_owned(&self) -> crate::msg::UInt8 {
-        crate::msg::UInt8 { data: self.data }
+        crate::msg::UInt8 {
+            data: self.data,
+        }
     }
 }
 
@@ -475,3 +503,4 @@ impl<'a> UInt8MultiArray<'a> {
         }
     }
 }
+

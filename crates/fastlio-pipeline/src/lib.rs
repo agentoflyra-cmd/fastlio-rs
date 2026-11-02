@@ -69,7 +69,9 @@ impl ImuInitializer {
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
-        if acc_cov_max <= 0.02 {
+        // Compare variance relative to mean gravity so that IMUs reporting
+        // acceleration in g and m/s² get the same stationary decision.
+        if acc_cov_max / acc_norm.powi(2) <= 0.02 {
             let rotation_between =
                 Rotation3::rotation_between(&acc_unit, &Vec3::new(0.0, 0.0, 1.0))
                     .expect("mean_acc is non-zero by construction.");
@@ -365,6 +367,45 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn gravity_alignment_is_invariant_to_acceleration_units() {
+        let samples = [
+            imu(0.0, (0.0, 0.0, 0.0), (0.05, 0.02, 1.00)),
+            imu(0.01, (0.0, 0.0, 0.0), (-0.04, -0.01, 0.98)),
+            imu(0.02, (0.0, 0.0, 0.0), (0.02, 0.01, 1.02)),
+        ];
+        let mut in_g = ImuInitializer::default();
+        in_g.accumulate(&samples);
+        let in_g = in_g.finish().unwrap();
+
+        let scaled: Vec<_> = samples
+            .iter()
+            .cloned()
+            .map(|mut sample| {
+                sample.accel *= 9.81;
+                sample
+            })
+            .collect();
+        let mut in_meters_per_second_squared = ImuInitializer::default();
+        in_meters_per_second_squared.accumulate(&scaled);
+        let in_meters_per_second_squared = in_meters_per_second_squared.finish().unwrap();
+
+        assert!(in_g.gravity_aligned);
+        assert!(in_meters_per_second_squared.gravity_aligned);
+        assert!(approx_eq(in_g.accel_scale, 9.81, 0.1));
+        assert!(approx_eq(
+            in_meters_per_second_squared.accel_scale,
+            1.0,
+            0.01
+        ));
+        assert!(approx_eq(
+            in_g.orientation
+                .angle_to(&in_meters_per_second_squared.orientation),
+            0.0,
+            1e-10
+        ));
     }
 
     /// Two consecutive frames. In each frame the group's last IMU arrives

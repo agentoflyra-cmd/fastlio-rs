@@ -306,13 +306,14 @@ mod test {
         sync.pend_lidar(lidar(0.5, 1.5)).unwrap();
         assert!(sync.drain_ready().is_empty());
         sync.pend_imu(imu(0.0)).unwrap();
+        assert!(sync.imu_buffer.len() == 1);
         sync.pend_imu(imu(0.3)).unwrap();
         sync.pend_imu(imu(0.8)).unwrap();
         sync.pend_imu(imu(1.2)).unwrap();
         assert!(sync.drain_ready().is_empty());
         sync.pend_imu(imu(2.0)).unwrap();
         let group = sync.pop_ready_group().unwrap();
-        assert_eq!(group.imu.len(), 4);
+        assert_eq!(group.imu.len(), 5);
         assert!(group.imu.last().unwrap().time_stamp_sec >= 1.5);
     }
 

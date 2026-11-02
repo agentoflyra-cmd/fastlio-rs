@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
-pub use crate::msg::*;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+pub use crate::msg::*;
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]

@@ -1,17 +1,12 @@
 #[allow(unused_imports)]
-use crate::borrowed::*;
+pub use cdr_runtime::{borrow_decode_from_bytes, BorrowDecodeCdr, CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32};
 #[allow(unused_imports)]
-pub use cdr_runtime::{
-    BorrowDecodeCdr, CdrDecoder, CdrError, CdrResult, DecodeCdr, Endianness, WChar16, WChar32,
-    borrow_decode_from_bytes,
-};
+use crate::borrowed::*;
 
 impl<'a> BorrowDecodeCdr<'a> for BatteryState<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             voltage: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             temperature: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             current: <f32 as DecodeCdr>::decode_cdr(decoder)?,
@@ -34,9 +29,7 @@ impl<'a> BorrowDecodeCdr<'a> for BatteryState<'a> {
 impl<'a> BorrowDecodeCdr<'a> for CameraInfo<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             height: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             width: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             distortion_model: decoder.read_str()?,
@@ -63,9 +56,7 @@ impl<'a> BorrowDecodeCdr<'a> for ChannelFloat32<'a> {
 impl<'a> BorrowDecodeCdr<'a> for CompressedImage<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             format: decoder.read_str()?,
             data: decoder.read_octet_slice()?,
         })
@@ -75,9 +66,7 @@ impl<'a> BorrowDecodeCdr<'a> for CompressedImage<'a> {
 impl<'a> BorrowDecodeCdr<'a> for FluidPressure<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             fluid_pressure: <f64 as DecodeCdr>::decode_cdr(decoder)?,
             variance: <f64 as DecodeCdr>::decode_cdr(decoder)?,
         })
@@ -87,9 +76,7 @@ impl<'a> BorrowDecodeCdr<'a> for FluidPressure<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Illuminance<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             illuminance: <f64 as DecodeCdr>::decode_cdr(decoder)?,
             variance: <f64 as DecodeCdr>::decode_cdr(decoder)?,
         })
@@ -99,9 +86,7 @@ impl<'a> BorrowDecodeCdr<'a> for Illuminance<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Image<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             height: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             width: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             encoding: decoder.read_str()?,
@@ -115,23 +100,12 @@ impl<'a> BorrowDecodeCdr<'a> for Image<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Imu<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
-            orientation:
-                <geometry_msgs::borrowed::Quaternion<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                    decoder,
-                )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
+            orientation: <geometry_msgs::borrowed::Quaternion<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             orientation_covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,
-            angular_velocity:
-                <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                    decoder,
-                )?,
+            angular_velocity: <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             angular_velocity_covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,
-            linear_acceleration:
-                <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                    decoder,
-                )?,
+            linear_acceleration: <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             linear_acceleration_covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,
         })
     }
@@ -140,9 +114,7 @@ impl<'a> BorrowDecodeCdr<'a> for Imu<'a> {
 impl<'a> BorrowDecodeCdr<'a> for JointState<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             name: decoder.read_seq::<std::string::String>()?,
             position: decoder.read_primitive_seq_borrowed::<f64>()?,
             velocity: decoder.read_primitive_seq_borrowed::<f64>()?,
@@ -154,9 +126,7 @@ impl<'a> BorrowDecodeCdr<'a> for JointState<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Joy<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             axes: decoder.read_primitive_seq_borrowed::<f32>()?,
             buttons: decoder.read_primitive_seq_borrowed::<i32>()?,
         })
@@ -193,9 +163,7 @@ impl<'a> BorrowDecodeCdr<'a> for LaserEcho<'a> {
 impl<'a> BorrowDecodeCdr<'a> for LaserScan<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             angle_min: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             angle_max: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             angle_increment: <f32 as DecodeCdr>::decode_cdr(decoder)?,
@@ -212,13 +180,8 @@ impl<'a> BorrowDecodeCdr<'a> for LaserScan<'a> {
 impl<'a> BorrowDecodeCdr<'a> for MagneticField<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
-            magnetic_field:
-                <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                    decoder,
-                )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
+            magnetic_field: <geometry_msgs::borrowed::Vector3<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             magnetic_field_covariance: decoder.read_primitive_array_borrowed::<f64, 9>()?,
         })
     }
@@ -227,9 +190,7 @@ impl<'a> BorrowDecodeCdr<'a> for MagneticField<'a> {
 impl<'a> BorrowDecodeCdr<'a> for MultiDOFJointState<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             joint_names: decoder.read_seq::<std::string::String>()?,
             transforms: decoder.read_borrow_seq::<geometry_msgs::borrowed::Transform<'a>>()?,
             twist: decoder.read_borrow_seq::<geometry_msgs::borrowed::Twist<'a>>()?,
@@ -241,9 +202,7 @@ impl<'a> BorrowDecodeCdr<'a> for MultiDOFJointState<'a> {
 impl<'a> BorrowDecodeCdr<'a> for MultiEchoLaserScan<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             angle_min: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             angle_max: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             angle_increment: <f32 as DecodeCdr>::decode_cdr(decoder)?,
@@ -260,9 +219,7 @@ impl<'a> BorrowDecodeCdr<'a> for MultiEchoLaserScan<'a> {
 impl<'a> BorrowDecodeCdr<'a> for NavSatFix<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             status: <NavSatStatus<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             latitude: <f64 as DecodeCdr>::decode_cdr(decoder)?,
             longitude: <f64 as DecodeCdr>::decode_cdr(decoder)?,
@@ -286,9 +243,7 @@ impl<'a> BorrowDecodeCdr<'a> for NavSatStatus<'a> {
 impl<'a> BorrowDecodeCdr<'a> for PointCloud<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             points: decoder.read_borrow_seq::<geometry_msgs::borrowed::Point32<'a>>()?,
             channels: decoder.read_borrow_seq::<ChannelFloat32<'a>>()?,
         })
@@ -298,9 +253,7 @@ impl<'a> BorrowDecodeCdr<'a> for PointCloud<'a> {
 impl<'a> BorrowDecodeCdr<'a> for PointCloud2<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             height: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             width: <u32 as DecodeCdr>::decode_cdr(decoder)?,
             fields: decoder.read_borrow_seq::<PointField<'a>>()?,
@@ -327,9 +280,7 @@ impl<'a> BorrowDecodeCdr<'a> for PointField<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Range<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             radiation_type: <u8 as DecodeCdr>::decode_cdr(decoder)?,
             field_of_view: <f32 as DecodeCdr>::decode_cdr(decoder)?,
             min_range: <f32 as DecodeCdr>::decode_cdr(decoder)?,
@@ -356,9 +307,7 @@ impl<'a> BorrowDecodeCdr<'a> for RegionOfInterest<'a> {
 impl<'a> BorrowDecodeCdr<'a> for RelativeHumidity<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             relative_humidity: <f64 as DecodeCdr>::decode_cdr(decoder)?,
             variance: <f64 as DecodeCdr>::decode_cdr(decoder)?,
         })
@@ -368,9 +317,7 @@ impl<'a> BorrowDecodeCdr<'a> for RelativeHumidity<'a> {
 impl<'a> BorrowDecodeCdr<'a> for Temperature<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             temperature: <f64 as DecodeCdr>::decode_cdr(decoder)?,
             variance: <f64 as DecodeCdr>::decode_cdr(decoder)?,
         })
@@ -380,13 +327,8 @@ impl<'a> BorrowDecodeCdr<'a> for Temperature<'a> {
 impl<'a> BorrowDecodeCdr<'a> for TimeReference<'a> {
     fn borrow_decode_cdr(decoder: &mut CdrDecoder<'a>) -> CdrResult<Self> {
         Ok(Self {
-            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                decoder,
-            )?,
-            time_ref:
-                <builtin_interfaces::borrowed::Time<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(
-                    decoder,
-                )?,
+            header: <std_msgs::borrowed::Header<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
+            time_ref: <builtin_interfaces::borrowed::Time<'a> as BorrowDecodeCdr<'a>>::borrow_decode_cdr(decoder)?,
             source: decoder.read_str()?,
         })
     }
@@ -408,3 +350,4 @@ impl<'a> BorrowDecodeCdr<'a> for SetCameraInfoResponse<'a> {
         })
     }
 }
+

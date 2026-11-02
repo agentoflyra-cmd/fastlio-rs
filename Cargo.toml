@@ -4,7 +4,7 @@ members = [
     "crates/*",
     "app/replay",
     "app/surfel-map-test",
-    "app/surfel-viewer"
+    "app/surfel-viewer",
 ]
 resolver = "3"
 exclude = ["vendor/*"]

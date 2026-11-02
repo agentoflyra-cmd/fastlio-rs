@@ -1,8 +1,8 @@
 use std::char;
 use std::fmt;
+use std::mem::size_of;
 use std::mem::ManuallyDrop;
 use std::mem::MaybeUninit;
-use std::mem::size_of;
 use std::ptr;
 use std::slice;
 
@@ -238,17 +238,23 @@ impl<'a, T: PrimitiveValue, const N: usize> PrimitiveArray<'a, T, N> {
 
     pub fn to_array(&self) -> [T; N] {
         let byte_len = self.bytes.len();
-        // let mut items = Vec::<T>::with_capacity(N);
-        let mut items: [MaybeUninit<T>; N] = std::array::from_fn(|_| MaybeUninit::uninit());
+        let mut items = MaybeUninit::<[T; N]>::uninit();
+
         unsafe {
-            copy_bytes_into_simd(self.bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+            copy_bytes_into_simd(
+                self.bytes.as_ptr(),
+                items.as_mut_ptr().cast::<u8>(),
+                byte_len,
+            );
+
+            if !native_endianness_matches(self.endianness) {
+                let bytes =
+                    std::slice::from_raw_parts_mut(items.as_mut_ptr().cast::<u8>(), byte_len);
+                swap_endian_in_place(bytes, size_of::<T>());
+            }
+
+            items.assume_init()
         }
-        if !native_endianness_matches(self.endianness) {
-            let bytes =
-                unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr() as *mut u8, byte_len) };
-            swap_endian_in_place(bytes, size_of::<T>());
-        }
-        unsafe { items.map(|item| item.assume_init()) }
     }
 }
 
@@ -488,11 +494,12 @@ impl<'a> CdrDecoder<'a> {
                 context: "CdrDecoder::read_native_primitive_array",
             })?;
         let bytes = self.read_bytes_raw(byte_len)?;
-        let mut items: [MaybeUninit<T>; N] = std::array::from_fn(|_| MaybeUninit::uninit());
+        let mut items = MaybeUninit::<[T; N]>::uninit();
+
         unsafe {
-            copy_bytes_into_simd(bytes.as_ptr(), items.as_mut_ptr() as *mut u8, byte_len);
+            copy_bytes_into_simd(bytes.as_ptr(), items.as_mut_ptr().cast::<u8>(), byte_len);
+            Ok(items.assume_init())
         }
-        Ok(unsafe { items.map(|item| item.assume_init()) })
     }
 
     fn read_swapped_primitive_array<T: Copy, const N: usize>(&mut self) -> CdrResult<[T; N]> {
@@ -505,19 +512,17 @@ impl<'a> CdrDecoder<'a> {
             })?;
 
         let bytes = self.read_bytes_raw(byte_len)?;
-
-        let mut items: [MaybeUninit<T>; N] = std::array::from_fn(|_| MaybeUninit::uninit());
-
-        let item_bytes =
-            unsafe { std::slice::from_raw_parts_mut(items.as_mut_ptr().cast::<u8>(), byte_len) };
+        let mut items = MaybeUninit::<[T; N]>::uninit();
 
         unsafe {
+            let item_bytes =
+                std::slice::from_raw_parts_mut(items.as_mut_ptr().cast::<u8>(), byte_len);
+
             copy_bytes_into_simd(bytes.as_ptr(), item_bytes.as_mut_ptr(), byte_len);
+            swap_endian_in_place(item_bytes, size_of::<T>());
+
+            Ok(items.assume_init())
         }
-
-        swap_endian_in_place(item_bytes, size_of::<T>());
-
-        Ok(unsafe { items.map(|item| item.assume_init()) })
     }
 
     pub fn read_bytes(&mut self, length: usize) -> CdrResult<Vec<u8>> {
@@ -823,6 +828,20 @@ impl<'a> CdrDecoder<'a> {
         T: DecodeCdr,
     {
         let length = self.read_u32()? as usize;
+        // 2026-10-17: the element count comes straight from the wire, so vet it before
+        // allocating. Every element needs at least one byte, so a count larger than the
+        // remaining payload can never be decoded. Without this, a corrupt or desynced
+        // length (e.g. ~4.19e9 x 8-byte elements = 33.5 GB) made Vec::with_capacity
+        // abort the consuming process ("memory allocation of N bytes failed", SIGABRT
+        // in robot-edge-runtime 2026-10-17 08:53:36).
+        let remaining = self.payload.len().saturating_sub(self.pos);
+        if length > remaining {
+            return Err(CdrError::NotEnoughBytes {
+                context: "CdrDecoder::read_seq",
+                requested: length,
+                remaining,
+            });
+        }
         let mut items = Vec::with_capacity(length);
         for _ in 0..length {
             items.push(T::decode_cdr(self)?);
@@ -835,6 +854,20 @@ impl<'a> CdrDecoder<'a> {
         T: BorrowDecodeCdr<'a>,
     {
         let length = self.read_u32()? as usize;
+        // 2026-10-17: the element count comes straight from the wire, so vet it before
+        // allocating. Every element needs at least one byte, so a count larger than the
+        // remaining payload can never be decoded. Without this, a corrupt or desynced
+        // length (e.g. ~4.19e9 x 8-byte elements = 33.5 GB) made Vec::with_capacity
+        // abort the consuming process ("memory allocation of N bytes failed", SIGABRT
+        // in robot-edge-runtime 2026-10-17 08:53:36).
+        let remaining = self.payload.len().saturating_sub(self.pos);
+        if length > remaining {
+            return Err(CdrError::NotEnoughBytes {
+                context: "CdrDecoder::read_borrow_seq",
+                requested: length,
+                remaining,
+            });
+        }
         let mut items = Vec::with_capacity(length);
         for _ in 0..length {
             items.push(T::borrow_decode_cdr(self)?);
@@ -1374,9 +1407,9 @@ fn swap_endian_in_place(bytes: &mut [u8], elem_size: usize) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         swap_endian_in_place_neon(bytes, elem_size);
-        return;
     }
 
+    #[cfg(not(target_arch = "aarch64"))]
     for chunk in bytes.chunks_exact_mut(elem_size) {
         chunk.reverse();
     }
@@ -1769,8 +1802,8 @@ impl EncodeCdr for WChar32 {
 #[cfg(test)]
 mod test {
     use super::{
-        CdrDecoder, CdrEncoder, CdrEncoding, CdrRepresentation, EncodeCdr, Endianness, WChar16,
-        WChar32, decode_from_bytes, encode_to_vec,
+        decode_from_bytes, encode_to_vec, CdrDecoder, CdrEncoder, CdrEncoding, CdrError,
+        CdrRepresentation, EncodeCdr, Endianness, WChar16, WChar32,
     };
 
     fn little_endian_message(payload: &[u8]) -> Vec<u8> {
@@ -1847,6 +1880,20 @@ mod test {
             decoder.read_seq::<u8>().expect("sequence should decode"),
             vec![0x11, 0x22, 0x33]
         );
+    }
+
+    #[test]
+    fn read_seq_rejects_an_implausible_length_without_allocating() {
+        // A u32 element count read from the wire must never drive Vec::with_capacity
+        // directly: 0xffff_ffff elements cannot fit in the remaining payload, and
+        // reserving room for them (~34 GB with 8-byte elements) used to abort the whole
+        // process with "memory allocation of N bytes failed".
+        let bytes = little_endian_message(&[0xff, 0xff, 0xff, 0xff]);
+        let mut decoder = CdrDecoder::new(&bytes).expect("decoder should be created");
+        match decoder.read_seq::<u8>() {
+            Err(CdrError::NotEnoughBytes { .. }) => {}
+            other => panic!("expected NotEnoughBytes, got {other:?}"),
+        }
     }
 
     #[test]

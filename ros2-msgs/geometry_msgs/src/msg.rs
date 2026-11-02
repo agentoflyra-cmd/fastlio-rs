@@ -26,7 +26,6 @@ pub struct AccelWithCovariance {
     #[allow(missing_docs)]
     pub accel: Accel,
     #[allow(missing_docs)]
-    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub covariance: [f64; 36],
 }
 
@@ -167,7 +166,6 @@ pub struct PoseWithCovariance {
     #[allow(missing_docs)]
     pub pose: Pose,
     #[allow(missing_docs)]
-    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub covariance: [f64; 36],
 }
 
@@ -246,7 +244,6 @@ pub struct TwistWithCovariance {
     #[allow(missing_docs)]
     pub twist: Twist,
     #[allow(missing_docs)]
-    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub covariance: [f64; 36],
 }
 

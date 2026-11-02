@@ -1,11 +1,11 @@
 #[allow(unused_imports)]
+use crate::action::*;
+#[allow(unused_imports)]
 use crate::msg::*;
 #[allow(unused_imports)]
 use crate::srv::*;
 #[allow(unused_imports)]
-pub use cdr_runtime::{
-    CdrEncoder, CdrError, CdrResult, EncodeCdr, Endianness, WChar16, WChar32, encode_to_vec,
-};
+pub use cdr_runtime::{encode_to_vec, CdrEncoder, CdrError, CdrResult, EncodeCdr, Endianness, WChar16, WChar32};
 
 impl EncodeCdr for Duration {
     fn encode_cdr(&self, encoder: &mut CdrEncoder) -> CdrResult<()> {
